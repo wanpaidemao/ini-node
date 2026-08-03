@@ -12,6 +12,39 @@ import (
 	"github.com/btcsuite/btcd/chainhash/v2"
 )
 
+// SugarShield-N510 constants
+const (
+	// SugarPowAveragingWindow is the number of blocks used for difficulty averaging
+	SugarPowAveragingWindow = 510
+
+	// SugarPowTargetSpacing is the target block time in seconds (5 seconds)
+	SugarPowTargetSpacing = 5
+
+	// SugarPowMaxAdjustDown is the maximum percentage difficulty can decrease
+	SugarPowMaxAdjustDown = 32
+
+	// SugarPowMaxAdjustUp is the maximum percentage difficulty can increase
+	SugarPowMaxAdjustUp = 16
+)
+
+// SugarAveragingWindowTimespan returns the total time span of the averaging window
+// = 510 * 5 = 2550 seconds
+func SugarAveragingWindowTimespan() int64 {
+	return int64(SugarPowAveragingWindow * SugarPowTargetSpacing)
+}
+
+// SugarMinActualTimespan returns the minimum allowed actual timespan
+// = 2550 * (100 - 16) / 100 = 2142 seconds
+func SugarMinActualTimespan() int64 {
+	return SugarAveragingWindowTimespan() * (100 - SugarPowMaxAdjustUp) / 100
+}
+
+// SugarMaxActualTimespan returns the maximum allowed actual timespan
+// = 2550 * (100 + 32) / 100 = 3366 seconds
+func SugarMaxActualTimespan() int64 {
+	return SugarAveragingWindowTimespan() * (100 + SugarPowMaxAdjustDown) / 100
+}
+
 // HashToBig converts a chainhash.Hash into a big.Int that can be used to
 // perform math comparisons.
 func HashToBig(hash *chainhash.Hash) *big.Int {
@@ -133,6 +166,8 @@ func findPrevTestNetDifficulty(startNode HeaderCtx, c ChainCtx) uint32 {
 // the exported version uses the current best chain as the previous HeaderCtx
 // while this function accepts any block node. This function accepts a ChainCtx
 // parameter that gives the necessary difficulty context variables.
+//
+// Sugarchain: Uses SugarShield-N510 algorithm (recalculates at every block)
 func calcNextRequiredDifficulty(lastNode HeaderCtx, newBlockTime time.Time,
 	c ChainCtx) (uint32, error) {
 
@@ -147,86 +182,55 @@ func calcNextRequiredDifficulty(lastNode HeaderCtx, newBlockTime time.Time,
 		return c.ChainParams().PowLimitBits, nil
 	}
 
-	// Return the previous block's difficulty requirements if this block
-	// is not at a difficulty retarget interval.
-	if (lastNode.Height()+1)%c.BlocksPerRetarget() != 0 {
-		// For networks that support it, allow special reduction of the
-		// required difficulty once too much time has elapsed without
-		// mining a block.
-		if c.ChainParams().ReduceMinDifficulty {
-			// Return minimum difficulty when more than the desired
-			// amount of time has elapsed without mining a block.
-			reductionTime := int64(c.ChainParams().MinDiffReductionTime /
-				time.Second)
-			allowMinTime := lastNode.Timestamp() + reductionTime
-			if newBlockTime.Unix() > allowMinTime {
-				return c.ChainParams().PowLimitBits, nil
-			}
-
-			// The block was mined within the desired timeframe, so
-			// return the difficulty for the last block which did
-			// not have the special minimum difficulty rule applied.
-			return findPrevTestNetDifficulty(lastNode, c), nil
-		}
-
-		// For the main network (or any unrecognized networks), simply
-		// return the previous block's difficulty requirements.
-		return lastNode.Bits(), nil
+	// SugarShield-N510: Recalculate difficulty at every block
+	// Collect the last 510 blocks' nBits
+	var bnTot big.Int
+	pindexFirst := lastNode
+	for i := 0; pindexFirst != nil && i < SugarPowAveragingWindow; i++ {
+		bnTmp := CompactToBig(pindexFirst.Bits())
+		bnTot.Add(&bnTot, bnTmp)
+		pindexFirst = pindexFirst.Parent()
 	}
 
-	// Get the block node at the previous retarget (targetTimespan days
-	// worth of blocks).
-	firstNode := lastNode.RelativeAncestorCtx(c.BlocksPerRetarget() - 1)
-	if firstNode == nil {
-		return 0, AssertError("unable to obtain previous retarget block")
+	// Check we have enough blocks (if not, use PoW limit)
+	if pindexFirst == nil {
+		return c.ChainParams().PowLimitBits, nil
 	}
 
-	// Limit the amount of adjustment that can occur to the previous
-	// difficulty.
-	actualTimespan := lastNode.Timestamp() - firstNode.Timestamp()
-	adjustedTimespan := actualTimespan
-	if actualTimespan < c.MinRetargetTimespan() {
-		adjustedTimespan = c.MinRetargetTimespan()
-	} else if actualTimespan > c.MaxRetargetTimespan() {
-		adjustedTimespan = c.MaxRetargetTimespan()
+	// Calculate average target
+	bnAvg := new(big.Int).Div(&bnTot, big.NewInt(int64(SugarPowAveragingWindow)))
+
+	// Get median time past for last and first blocks
+	lastMTP := CalcPastMedianTime(lastNode).Unix()
+	firstMTP := CalcPastMedianTime(pindexFirst).Unix()
+
+	// Calculate actual timespan
+	nActualTimespan := lastMTP - firstMTP
+
+	// Apply damping: only apply 25% of the deviation
+	// new = 2550 + (actual - 2550) / 4
+	nActualTimespan = SugarAveragingWindowTimespan() + (nActualTimespan-SugarAveragingWindowTimespan())/4
+
+	// Clamp to allowed range
+	if nActualTimespan < SugarMinActualTimespan() {
+		nActualTimespan = SugarMinActualTimespan()
+	}
+	if nActualTimespan > SugarMaxActualTimespan() {
+		nActualTimespan = SugarMaxActualTimespan()
 	}
 
-	// Special difficulty rule for Testnet4
-	oldTarget := CompactToBig(lastNode.Bits())
-	if c.ChainParams().EnforceBIP94 {
-		// Here we use the first block of the difficulty period. This way
-		// the real difficulty is always preserved in the first block as
-		// it is not allowed to use the min-difficulty exception.
-		oldTarget = CompactToBig(firstNode.Bits())
-	}
+	// Calculate new target: bnNew = bnAvg / 2550 * nActualTimespan
+	// (same operation order as C++ CalculateNextWorkRequired: divide, then multiply)
+	newTarget := new(big.Int).Set(bnAvg)
+	newTarget.Div(newTarget, big.NewInt(SugarAveragingWindowTimespan()))
+	newTarget.Mul(newTarget, big.NewInt(nActualTimespan))
 
-	// Calculate new target difficulty as:
-	//  currentDifficulty * (adjustedTimespan / targetTimespan)
-	// The result uses integer division which means it will be slightly
-	// rounded down.  Bitcoind also uses integer division to calculate this
-	// result.
-	newTarget := new(big.Int).Mul(oldTarget, big.NewInt(adjustedTimespan))
-	targetTimeSpan := int64(c.ChainParams().TargetTimespan / time.Second)
-	newTarget.Div(newTarget, big.NewInt(targetTimeSpan))
-
-	// Limit new value to the proof of work limit.
+	// Limit to powLimit
 	if newTarget.Cmp(c.ChainParams().PowLimit) > 0 {
 		newTarget.Set(c.ChainParams().PowLimit)
 	}
 
-	// Log new target difficulty and return it.  The new target logging is
-	// intentionally converting the bits back to a number instead of using
-	// newTarget since conversion to the compact representation loses
-	// precision.
 	newTargetBits := BigToCompact(newTarget)
-	log.Debugf("Difficulty retarget at block height %d", lastNode.Height()+1)
-	log.Debugf("Old target %08x (%064x)", lastNode.Bits(), oldTarget)
-	log.Debugf("New target %08x (%064x)", newTargetBits, CompactToBig(newTargetBits))
-	log.Debugf("Actual timespan %v, adjusted timespan %v, target timespan %v",
-		time.Duration(actualTimespan)*time.Second,
-		time.Duration(adjustedTimespan)*time.Second,
-		c.ChainParams().TargetTimespan)
-
 	return newTargetBits, nil
 }
 

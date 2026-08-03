@@ -43,7 +43,7 @@ type BlockHeader struct {
 // header.
 const blockHeaderLen = 80
 
-// BlockHash computes the block identifier hash for the given block header.
+// BlockHash computes the block identifier hash using SHA256d (fast).
 func (h *BlockHeader) BlockHash() chainhash.Hash {
 	return chainhash.DoubleHashRaw(func(w io.Writer) error {
 		return writeBlockHeader(w, 0, h)

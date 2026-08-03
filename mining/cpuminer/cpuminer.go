@@ -18,6 +18,7 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/mining"
+	"github.com/btcsuite/btcd/pow"
 	"github.com/btcsuite/btcd/wire/v2"
 )
 
@@ -275,7 +276,7 @@ func (m *CPUMiner) solveBlock(msgBlock *wire.MsgBlock, blockHeight int32,
 			// increment the number of hashes completed for each
 			// attempt accordingly.
 			header.Nonce = i
-			hash := header.BlockHash()
+			hash := pow.BlockPoWHash(header)
 			hashesCompleted += 2
 
 			// The block is solved when the new block hash is less

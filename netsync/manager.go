@@ -968,14 +968,23 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		return
 	}
 
+	// Mirror the reference umami behavior (sugarchain PR #122): during
+	// initial block download the expensive PoW check is skipped when
+	// processing headers.  Full PoW validation happens later when the
+	// corresponding blocks are downloaded and processed.
+	headerFlags := blockchain.BFNoPoWCheck
+	if !sm.ibdMode {
+		headerFlags = blockchain.BFNone
+	}
+
 	for _, blockHeader := range msg.Headers {
 		_, err := sm.chain.ProcessBlockHeader(
-			blockHeader, blockchain.BFNone, false,
+			blockHeader, headerFlags, false,
 		)
 		if err != nil {
 			log.Warnf("Received block header from peer %v "+
-				"failed header verification -- disconnecting",
-				peer.Addr())
+				"failed header verification -- disconnecting: %v",
+				peer.Addr(), err)
 			peer.Disconnect()
 			return
 		}
