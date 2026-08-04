@@ -1282,3 +1282,292 @@ func TestIsSyncCandidateRegtest(t *testing.T) {
 		})
 	}
 }
+
+// makeTestHeaderChain builds n block headers (heights 1..n) chained onto the
+// provided params' genesis block with monotonically increasing timestamps and
+// an easy (regtest-style) difficulty so they pass header validation.
+func makeTestHeaderChain(t *testing.T, params *chaincfg.Params,
+	n int) []*wire.BlockHeader {
+
+	headers := make([]*wire.BlockHeader, 0, n)
+	prevHash := *params.GenesisHash
+	prevTime := params.GenesisBlock.Header.Timestamp
+	for i := 0; i < n; i++ {
+		header := &wire.BlockHeader{
+			Version:   4,
+			PrevBlock: prevHash,
+			Bits:      params.PowLimitBits,
+			Timestamp: prevTime.Add(time.Duration(i+1) * time.Second),
+		}
+		prevHash = header.BlockHash()
+		prevTime = header.Timestamp
+		headers = append(headers, header)
+	}
+	return headers
+}
+
+// headerMsgFor wraps the given headers in a headers message from the peer.
+func headerMsgFor(peer *peer.Peer, headers []*wire.BlockHeader) *headersMsg {
+	msg := wire.NewMsgHeaders()
+	for _, h := range headers {
+		msg.AddBlockHeader(h)
+	}
+	return &headersMsg{headers: msg, peer: peer}
+}
+
+// newHeaderSyncPeers registers n peers that advertise the given last block
+// height and returns them.
+func newHeaderSyncPeers(t *testing.T, sm *SyncManager,
+	n int, lastBlock int32) []*peer.Peer {
+
+	peers := make([]*peer.Peer, 0, n)
+	for i := 0; i < n; i++ {
+		p := peer.NewInboundPeer(&peer.Config{})
+		p.UpdateLastBlockHeight(lastBlock)
+		sm.peerStates[p] = &peerSyncState{
+			syncCandidate:   true,
+			requestedTxns:   make(map[chainhash.Hash]struct{}),
+			requestedBlocks: make(map[chainhash.Hash]struct{}),
+		}
+		peers = append(peers, p)
+	}
+	return peers
+}
+
+// startParallelHeaderSync installs a parallel header download over the given
+// peers with a small slice size so the test only needs a handful of headers.
+func startParallelHeaderSync(t *testing.T, sm *SyncManager,
+	peers []*peer.Peer, target int32, sliceLen int32) {
+
+	sm.ibdMode = true
+	sm.headerSync = &headerSyncState{
+		peers:      append([]*peer.Peer(nil), peers...),
+		target:     target,
+		nextHeight: 1,
+		nextAssign: 1,
+		ranges:     make(map[int32]*headerRange),
+		peerRange:  make(map[*peer.Peer]*headerRange),
+		sliceLen:   sliceLen,
+	}
+	for _, p := range peers {
+		require.True(t, sm.assignHeaderRange(p))
+	}
+}
+
+// TestParallelHeaderSync verifies the multi-peer header download applies
+// slices in chain order even when the responses arrive out of order, hands the
+// freed peers the next slice, and hands off to the block download once it has
+// caught up.
+func TestParallelHeaderSync(t *testing.T) {
+	params := chaincfg.RegressionNetParams
+	params.Checkpoints = nil
+	sm, tearDown := makeMockSyncManager(t, &params)
+	defer tearDown()
+
+	const numHeaders = 20
+	const sliceLen = 5
+	headers := makeTestHeaderChain(t, &params, numHeaders)
+
+	peers := newHeaderSyncPeers(t, sm, 3, numHeaders)
+	sm.syncPeer = peers[0]
+	startParallelHeaderSync(t, sm, peers, numHeaders, sliceLen)
+
+	// The first round assigns three disjoint slices: [1,6), [6,11), [11,16).
+	hs := sm.headerSync
+	require.Equal(t, int32(16), hs.nextAssign)
+	require.Equal(t, 3, len(hs.ranges))
+	require.NotNil(t, hs.ranges[1])
+	require.NotNil(t, hs.ranges[6])
+	require.NotNil(t, hs.ranges[11])
+
+	// Deliver the back slices first (out of order).
+	sm.handleHeadersMsg(headerMsgFor(peers[1], headers[5:10]))
+	sm.handleHeadersMsg(headerMsgFor(peers[2], headers[10:15]))
+
+	// Nothing may be applied yet since the front slice [1,6) is still
+	// outstanding; the back slices are buffered.
+	_, bestHeaderHeight := sm.chain.BestHeader()
+	require.Equal(t, int32(0), bestHeaderHeight)
+	require.Equal(t, 3, len(sm.headerSync.ranges))
+
+	// Deliver the front slice; this lets the buffered slices be applied in
+	// order and hands a freed peer the remaining [16,21) slice.
+	sm.handleHeadersMsg(headerMsgFor(peers[0], headers[0:5]))
+
+	hs = sm.headerSync
+	require.NotNil(t, hs)
+	require.NotNil(t, hs.ranges[16])
+
+	// Deliver the final slice to complete the download.
+	sm.handleHeadersMsg(headerMsgFor(peers[0], headers[15:20]))
+
+	// All headers must be applied and the download handed off to blocks.
+	_, bestHeaderHeight = sm.chain.BestHeader()
+	require.Equal(t, int32(numHeaders), bestHeaderHeight)
+	require.Nil(t, sm.headerSync)
+	require.True(t, sm.ibdMode)
+}
+
+// TestParallelHeaderSyncDropFrontPeer verifies that when the peer holding the
+// front slice disconnects while every remaining peer is busy with a back slice,
+// the front slice is re-issued immediately instead of stalling the download.
+func TestParallelHeaderSyncDropFrontPeer(t *testing.T) {
+	params := chaincfg.RegressionNetParams
+	params.Checkpoints = nil
+	sm, tearDown := makeMockSyncManager(t, &params)
+	defer tearDown()
+
+	const numHeaders = 20
+	const sliceLen = 5
+	headers := makeTestHeaderChain(t, &params, numHeaders)
+
+	peers := newHeaderSyncPeers(t, sm, 3, numHeaders)
+	sm.syncPeer = peers[1]
+	startParallelHeaderSync(t, sm, peers, numHeaders, sliceLen)
+
+	// peers[0] holds the front [1,6).  Drop it while peers[1] and peers[2]
+	// are still busy with [6,11) and [11,16).
+	sm.dropHeaderPeer(peers[0])
+
+	hs := sm.headerSync
+	require.NotNil(t, hs)
+
+	// The front must be covered again by a remaining peer.
+	require.NotNil(t, hs.ranges[1])
+	require.NotEqual(t, peers[0], hs.ranges[1].peer)
+
+	// Deliver all slices in order (whatever peer currently holds each one)
+	// and verify the download completes.
+	front := hs.ranges[1]
+	sm.handleHeadersMsg(headerMsgFor(front.peer, headers[0:5]))
+	if rng := hs.ranges[6]; rng != nil {
+		sm.handleHeadersMsg(headerMsgFor(rng.peer, headers[5:10]))
+	}
+	if rng := hs.ranges[11]; rng != nil {
+		sm.handleHeadersMsg(headerMsgFor(rng.peer, headers[10:15]))
+	}
+	if rng := hs.ranges[16]; rng != nil {
+		sm.handleHeadersMsg(headerMsgFor(rng.peer, headers[15:20]))
+	}
+
+	// Drain any remaining slices until the download finishes.
+	bestHeight := int32(0)
+	for i := 0; i < 10 && sm.headerSync != nil; i++ {
+		hs = sm.headerSync
+		_, bestHeight = sm.chain.BestHeader()
+		rng := hs.ranges[hs.nextHeight]
+		if rng == nil {
+			break
+		}
+		lo := int(rng.start - 1)
+		sm.handleHeadersMsg(headerMsgFor(rng.peer, headers[lo:lo+sliceLen]))
+	}
+
+	_, bestHeight = sm.chain.BestHeader()
+	require.Equal(t, int32(numHeaders), bestHeight)
+	require.Nil(t, sm.headerSync)
+}
+
+// TestParallelHeaderSyncShortResponse verifies that a peer which advertises a
+// taller chain than it can actually serve does not stall the download: its
+// short response simply advances the front to where its chain ends.
+func TestParallelHeaderSyncShortResponse(t *testing.T) {
+	params := chaincfg.RegressionNetParams
+	params.Checkpoints = nil
+	sm, tearDown := makeMockSyncManager(t, &params)
+	defer tearDown()
+
+	const numHeaders = 20
+	const sliceLen = 5
+	headers := makeTestHeaderChain(t, &params, numHeaders)
+
+	// peers[0] advertises the full chain but actually only has the first
+	// 8 headers (its LastBlock stays 20, but it will serve fewer).
+	peers := newHeaderSyncPeers(t, sm, 3, numHeaders)
+	sm.syncPeer = peers[1]
+	startParallelHeaderSync(t, sm, peers, numHeaders, sliceLen)
+
+	// Deliver peers[0]'s front slice [1,6) normally, then peers[1]'s slice
+	// [6,11) shortened to 3 headers (a peer whose chain ends at 8).
+	sm.handleHeadersMsg(headerMsgFor(peers[0], headers[0:5]))
+	sm.handleHeadersMsg(headerMsgFor(peers[1], headers[5:8]))
+
+	hs := sm.headerSync
+	require.NotNil(t, hs)
+
+	// Headers 1..8 should have been applied, and the missing [9,11) hole
+	// must have been handed out (capped so it does not overlap [11,16)).
+	_, bestHeaderHeight := sm.chain.BestHeader()
+	require.Equal(t, int32(8), bestHeaderHeight)
+	require.Equal(t, int32(9), hs.nextHeight)
+	require.NotNil(t, hs.ranges[9])
+	require.NotNil(t, hs.ranges[11])
+}
+
+// TestParallelHeaderSyncAddPeer verifies that a peer arriving after the parallel
+// header download has started is folded in (granted a slice) when it is admissible,
+// is rejected once the peer cap is reached, and is ignored when it cannot serve
+// headers we don't already have.
+func TestParallelHeaderSyncAddPeer(t *testing.T) {
+	params := chaincfg.RegressionNetParams
+	params.Checkpoints = nil
+	sm, tearDown := makeMockSyncManager(t, &params)
+	defer tearDown()
+
+	const numHeaders = 20
+	const sliceLen = 5
+	makeTestHeaderChain(t, &params, numHeaders)
+
+	peers := newHeaderSyncPeers(t, sm, 3, numHeaders)
+	sm.syncPeer = peers[0]
+
+	// Use a large slice length so only one peer is busy per round and the
+	// download is guaranteed to still be in progress (headerSync non-nil).
+	sm.ibdMode = true
+	sm.headerSync = &headerSyncState{
+		peers:      []*peer.Peer{peers[0], peers[1]},
+		target:     numHeaders,
+		nextHeight: 1,
+		nextAssign: 1,
+		ranges:     make(map[int32]*headerRange),
+		peerRange:  make(map[*peer.Peer]*headerRange),
+		sliceLen:   sliceLen,
+	}
+	require.True(t, sm.assignHeaderRange(peers[0]))
+	require.True(t, sm.assignHeaderRange(peers[1]))
+
+	// A taller peer is admitted and handed a slice.
+	sm.headerSyncAddPeer(peers[2])
+	hs := sm.headerSync
+	require.Len(t, hs.peers, 3)
+	require.NotNil(t, hs.peerRange[peers[2]])
+
+	// A peer that cannot contribute past our (still genesis) header height is
+	// not admitted.
+	stalePeer := peer.NewInboundPeer(&peer.Config{})
+	stalePeer.UpdateLastBlockHeight(0)
+	sm.peerStates[stalePeer] = &peerSyncState{
+		syncCandidate:   true,
+		requestedTxns:   make(map[chainhash.Hash]struct{}),
+		requestedBlocks: make(map[chainhash.Hash]struct{}),
+	}
+	sm.headerSyncAddPeer(stalePeer)
+	require.Len(t, hs.peers, 3)
+
+	// A duplicate peer is not admitted twice.
+	sm.headerSyncAddPeer(peers[0])
+	require.Len(t, hs.peers, 3)
+
+	// Once the cap is reached, extra peers are rejected.
+	for i := 0; i < 10; i++ {
+		p := peer.NewInboundPeer(&peer.Config{})
+		p.UpdateLastBlockHeight(numHeaders)
+		sm.peerStates[p] = &peerSyncState{
+			syncCandidate:   true,
+			requestedTxns:   make(map[chainhash.Hash]struct{}),
+			requestedBlocks: make(map[chainhash.Hash]struct{}),
+		}
+		sm.headerSyncAddPeer(p)
+	}
+	require.Len(t, hs.peers, maxHeaderSyncPeers)
+}

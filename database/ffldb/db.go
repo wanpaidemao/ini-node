@@ -2113,6 +2113,21 @@ func initDB(ldb *leveldb.DB) error {
 	return nil
 }
 
+// defaultCompactionTableSize is the maximum size of a leveldb sorted table
+// file (.ldb) produced during compaction.  btcd ships with the upstream
+// goleveldb default of 2 MiB, which yields a very large number of small files
+// for the append-heavy block index written during a full header sync.  Raising
+// it substantially reduces the file count and the compaction churn (and
+// therefore the write amplification) at the cost of somewhat larger compaction
+// buffers and longer individual compaction pauses.
+const defaultCompactionTableSize = 16 * 1024 * 1024 // 16 MB
+
+// defaultWriteBuffer is the maximum size of a leveldb memtable before it is
+// flushed to a level-0 table.  It is raised alongside the compaction table
+// size so the initial sorted tables are also large instead of only growing
+// during later compactions.
+const defaultWriteBuffer = 8 * 1024 * 1024 // 8 MB
+
 // openDB opens the database at the provided path.  database.ErrDbDoesNotExist
 // is returned if the database doesn't exist and the create flag is not set.
 func openDB(dbPath string, network wire.BitcoinNet, create bool) (database.DB, error) {
@@ -2134,10 +2149,12 @@ func openDB(dbPath string, network wire.BitcoinNet, create bool) (database.DB, e
 
 	// Open the metadata database (will create it if needed).
 	opts := opt.Options{
-		ErrorIfExist: create,
-		Strict:       opt.DefaultStrict,
-		Compression:  opt.NoCompression,
-		Filter:       filter.NewBloomFilter(10),
+		ErrorIfExist:        create,
+		Strict:              opt.DefaultStrict,
+		Compression:         opt.NoCompression,
+		Filter:              filter.NewBloomFilter(10),
+		WriteBuffer:         defaultWriteBuffer,
+		CompactionTableSize: defaultCompactionTableSize,
 	}
 	ldb, err := leveldb.OpenFile(metadataDbPath, &opts)
 	if err != nil {

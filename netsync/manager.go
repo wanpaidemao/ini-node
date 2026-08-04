@@ -45,6 +45,20 @@ const (
 	// stallSampleInterval the interval at which we will check to see if our
 	// sync has stalled.
 	stallSampleInterval = 30 * time.Second
+
+	// maxHeaderSyncPeers is the maximum number of peers that will be used in
+	// parallel when downloading headers during the initial block download.
+	maxHeaderSyncPeers = 8
+
+	// headerRangeStallTimeout is the amount of time an in-flight header
+	// range is allowed to remain outstanding before it is re-issued to a
+	// different peer.  This lets a slow or unresponsive peer be bypassed
+	// without relying on the (much longer) overall sync stall timeout.
+	// The timeout is kept short because every response is verified to
+	// connect to the exact height it was asked for, so re-issuing a slice
+	// to another peer is always safe even while the previous request for it
+	// is still in flight.
+	headerRangeStallTimeout = 6 * time.Second
 )
 
 // zeroHash is the zero value hash (all zeros).  It is defined as a convenience.
@@ -152,6 +166,33 @@ type peerSyncState struct {
 	requestedBlocks map[chainhash.Hash]struct{}
 }
 
+// headerRange represents a contiguous slice of block headers that has been
+// requested from a single peer during the initial header download.  Ranges are
+// applied to the header chain in order, so a range that has been received but
+// is not yet the front of the download is buffered until all preceding ranges
+// have been processed.
+type headerRange struct {
+	start      int32
+	peer       *peerpkg.Peer
+	headers    []*wire.BlockHeader
+	received   bool
+	assignedAt time.Time
+}
+
+// headerSyncState tracks a parallel (multi-peer) initial header download.  It
+// is only accessed from the blockHandler goroutine and is non-nil while header
+// headers are being fetched from several peers simultaneously.
+type headerSyncState struct {
+	peers       []*peerpkg.Peer                // participating peers, capped
+	target      int32                          // highest advertised tip to reach
+	nextHeight  int32                          // next header height we need to apply
+	nextAssign  int32                          // next height to hand out to a peer
+	ranges      map[int32]*headerRange         // in-flight/received ranges by start
+	peerRange   map[*peerpkg.Peer]*headerRange // single range assigned per peer
+	sliceLen    int32                          // max headers per getheaders batch
+	lastReissue time.Time                      // last time a stale range was reissued
+}
+
 // limitAdd is a helper function for maps that require a maximum limit by
 // evicting a random value if adding the new value would cause it to
 // overflow the maximum allowed.
@@ -195,6 +236,11 @@ type SyncManager struct {
 	syncPeer         *peerpkg.Peer
 	peerStates       map[*peerpkg.Peer]*peerSyncState
 	lastProgressTime time.Time
+
+	// headerSync is non-nil while the initial header download is being
+	// performed across several peers in parallel.  It is only touched from
+	// the blockHandler goroutine.
+	headerSync *headerSyncState
 
 	// The following fields are used for the initial block download mode.
 	ibdMode bool
@@ -263,8 +309,10 @@ func (sm *SyncManager) isInIBDMode() bool {
 	return true
 }
 
-// fetchHeaders randomly picks a peer that has a higher advertised header
-// and pushes a get headers message to it.
+// fetchHeaders starts the initial header download across several peers in
+// parallel.  Each participating peer is handed a disjoint, contiguous slice of
+// the header chain, and the slices are applied in order once they arrive.  The
+// number of peers is capped by maxHeaderSyncPeers.
 func (sm *SyncManager) fetchHeaders() {
 	_, height := sm.chain.BestHeader()
 	higherPeers := sm.fetchHigherPeers(height)
@@ -272,23 +320,183 @@ func (sm *SyncManager) fetchHeaders() {
 		log.Warnf("No sync peer candidates available")
 		return
 	}
-	bestPeer := higherPeers[rand.Intn(len(higherPeers))]
 
-	locator, err := sm.chain.LatestBlockLocatorByHeader()
-	if err != nil {
-		log.Errorf("Failed to get block locator for the "+
-			"latest block header: %v", err)
+	// Randomize the candidate order so we don't always favor the same peers
+	// and cap the number of peers that take part in the parallel download.
+	shuffled := make([]*peerpkg.Peer, len(higherPeers))
+	for i, j := range rand.Perm(len(higherPeers)) {
+		shuffled[i] = higherPeers[j]
+	}
+	if len(shuffled) > maxHeaderSyncPeers {
+		shuffled = shuffled[:maxHeaderSyncPeers]
+	}
+
+	// The download is complete once every header up to the tallest
+	// participating peer has been applied to the header chain.
+	target := int32(0)
+	for _, p := range shuffled {
+		if lastBlock := p.LastBlock(); lastBlock > target {
+			target = lastBlock
+		}
+	}
+	if target <= height {
+		log.Warnf("No sync peer candidates available")
 		return
 	}
 
-	log.Infof("Downloading headers for blocks %d to "+
-		"%d from peer %s", height+1,
-		bestPeer.LastBlock(), bestPeer.Addr())
-
-	bestPeer.PushGetHeadersMsg(locator, &zeroHash)
-
 	sm.ibdMode = true
-	sm.syncPeer = bestPeer
+	sm.syncPeer = shuffled[0]
+	sm.headerSync = &headerSyncState{
+		peers:      shuffled,
+		target:     target,
+		nextHeight: height + 1,
+		nextAssign: height + 1,
+		ranges:     make(map[int32]*headerRange),
+		peerRange:  make(map[*peerpkg.Peer]*headerRange),
+		sliceLen:   wire.MaxBlockHeadersPerMsg,
+	}
+
+	log.Infof("Downloading headers for blocks %d to %d in parallel "+
+		"from %d peers", height+1, target, len(shuffled))
+
+	for _, p := range shuffled {
+		sm.assignHeaderRange(p)
+	}
+}
+
+// headerLocator returns a single-hash block locator rooted at the passed
+// height so that a getheaders request asks the peer for the headers immediately
+// after it.  A nil locator (request the whole chain) is only returned for a
+// negative height, which never happens during the normal initial block download.
+func (sm *SyncManager) headerLocator(height int32) blockchain.BlockLocator {
+	if height < 0 {
+		return nil
+	}
+	hash, err := sm.chain.HeaderHashByHeight(height)
+	if err != nil {
+		return nil
+	}
+	return blockchain.BlockLocator([]*chainhash.Hash{hash})
+}
+
+// launchHeaderRange records a new per-peer header range and issues the
+// getheaders request for it.  It is a low-level helper; the caller is
+// responsible for choosing non-overlapping start/end heights.
+func (sm *SyncManager) launchHeaderRange(peer *peerpkg.Peer, start int32) {
+	hs := sm.headerSync
+	rng := &headerRange{
+		start:      start,
+		peer:       peer,
+		assignedAt: time.Now(),
+	}
+	hs.ranges[start] = rng
+	hs.peerRange[peer] = rng
+
+	peer.PushGetHeadersMsg(sm.headerLocator(start-1), &zeroHash)
+}
+
+// assignHeaderRange hands the next unassigned, non-overlapping slice of the
+// header chain to the given peer.  It prefers to fill a hole at the front of
+// the download (left by a peer that served fewer headers than expected) and
+// otherwise extends the contiguous frontier.  The slice is capped by the peer's
+// advertised tip and the per-message header limit.  It returns true if a range
+// was assigned.
+func (sm *SyncManager) assignHeaderRange(peer *peerpkg.Peer) bool {
+	hs := sm.headerSync
+	if hs == nil {
+		return false
+	}
+
+	// A peer only ever has a single range in flight.
+	if _, ok := hs.peerRange[peer]; ok {
+		return false
+	}
+
+	// Fill a front hole first; otherwise extend the frontier.
+	start := hs.nextAssign
+	if _, ok := hs.ranges[hs.nextHeight]; !ok && hs.nextHeight <= hs.target {
+		start = hs.nextHeight
+	}
+	if start > hs.target {
+		return false
+	}
+
+	end := start + hs.sliceLen
+	if peerLastBlock := peer.LastBlock(); end > peerLastBlock+1 {
+		end = peerLastBlock + 1
+	}
+	// Never overlap a slice already handed out beyond the start (this can
+	// happen when a hole at the front is filled while back slices are still
+	// in flight).
+	if rng, ok := hs.nextRangeBeyond(start); ok {
+		if nextStart := rng.start; nextStart < end {
+			end = nextStart
+		}
+	}
+	if end <= start {
+		return false
+	}
+
+	sm.launchHeaderRange(peer, start)
+
+	// Only advance the contiguous frontier for fresh (non hole-filling)
+	// assignments.
+	if start == hs.nextAssign {
+		hs.nextAssign = end
+	}
+	return true
+}
+
+// reissueHeaderRange re-issues a specific slice to a peer that can serve it
+// after a slow or unresponsive peer has stalled on it.  The frontier is not
+// modified so a re-issue never duplicates or overlaps other ranges.
+func (sm *SyncManager) reissueHeaderRange(peer *peerpkg.Peer, start int32) {
+	hs := sm.headerSync
+	if hs == nil {
+		return
+	}
+	if _, ok := hs.peerRange[peer]; ok {
+		return
+	}
+	if start > hs.target {
+		return
+	}
+
+	end := start + hs.sliceLen
+	if peerLastBlock := peer.LastBlock(); end > peerLastBlock+1 {
+		end = peerLastBlock + 1
+	}
+	if end <= start {
+		return
+	}
+
+	// Cap the re-issued slice at the next already-assigned range so it never
+	// overlaps ranges handed out beyond it.
+	if rng, ok := hs.nextRangeBeyond(start); ok {
+		if nextStart := rng.start; nextStart < end {
+			end = nextStart
+		}
+	}
+	if end <= start {
+		return
+	}
+
+	sm.launchHeaderRange(peer, start)
+}
+
+// nextRangeBeyond returns the already-assigned header range with the smallest
+// start height greater than the passed start, if any.
+func (hs *headerSyncState) nextRangeBeyond(start int32) (*headerRange, bool) {
+	var best *headerRange
+	for s, rng := range hs.ranges {
+		if s <= start {
+			continue
+		}
+		if best == nil || s < best.start {
+			best = rng
+		}
+	}
+	return best, best != nil
 }
 
 // startSync will choose the best peer among the available candidate peers to
@@ -443,6 +651,52 @@ func (sm *SyncManager) handleNewPeerMsg(peer *peerpkg.Peer) {
 	if isSyncCandidate && sm.syncPeer == nil {
 		sm.startSync()
 	}
+
+	// If a parallel header download is already running, fold this new peer in
+	// as soon as it connects so the download ramps up to the maximum number of
+	// participating peers rather than waiting for the next header round.
+	if isSyncCandidate && sm.headerSync != nil {
+		sm.headerSyncAddPeer(peer)
+	}
+}
+
+// headerSyncAddPeer folds a newly-connected sync candidate into an in-progress
+// parallel header download, granting it a slice of the header chain to serve.
+// The set of participating peers grows toward maxHeaderSyncPeers as peers
+// connect, and a peer that is taller than the current frontier widens the target
+// the download is working toward.
+func (sm *SyncManager) headerSyncAddPeer(peer *peerpkg.Peer) {
+	hs := sm.headerSync
+	if hs == nil {
+		return
+	}
+
+	// Only accept peers that advertise headers we don't already have.
+	_, bestHeaderHeight := sm.chain.BestHeader()
+	if peer.LastBlock() <= bestHeaderHeight {
+		return
+	}
+
+	// Don't exceed the parallel-download limit or admit a peer twice.
+	if len(hs.peers) >= maxHeaderSyncPeers {
+		return
+	}
+	for _, p := range hs.peers {
+		if p == peer {
+			return
+		}
+	}
+
+	// Widen the target if this peer is taller than the current one.
+	if lastBlock := peer.LastBlock(); lastBlock > hs.target {
+		hs.target = lastBlock
+	}
+
+	hs.peers = append(hs.peers, peer)
+	sm.assignHeaderRange(peer)
+
+	log.Infof("Added peer %v to the parallel header download (%d peers active)",
+		peer.Addr(), len(hs.peers))
 }
 
 // handleStallSample will switch to a new sync peer if the current one has
@@ -452,6 +706,12 @@ func (sm *SyncManager) handleNewPeerMsg(peer *peerpkg.Peer) {
 func (sm *SyncManager) handleStallSample() {
 	if atomic.LoadInt32(&sm.shutdown) != 0 {
 		return
+	}
+
+	// First re-issue any header range that has been in flight too long so a
+	// slow peer cannot stall the parallel header download.
+	if sm.headerSync != nil {
+		sm.reissueStaleHeaderRanges()
 	}
 
 	// If we don't have an active sync peer, exit early.
@@ -515,6 +775,13 @@ func (sm *SyncManager) handleDonePeerMsg(peer *peerpkg.Peer) {
 	log.Infof("Lost peer %s", peer)
 
 	sm.clearRequestedState(state)
+
+	// If the peer was taking part in a parallel header download, free its
+	// range and remove it from the set of participating peers so its slice
+	// can be re-issued to a remaining peer.
+	if sm.headerSync != nil {
+		sm.dropHeaderPeer(peer)
+	}
 
 	if peer == sm.syncPeer {
 		// Update the sync peer. The server has already disconnected the
@@ -964,6 +1231,15 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	// Nothing to do for an empty headers message.
 	msg := hmsg.headers
 	numHeaders := len(msg.Headers)
+
+	// During a parallel (multi-peer) header download, route responses to the
+	// per-range handler which reorders and applies them in chain order.
+	if sm.headerSync != nil {
+		sm.handleParallelHeadersMsg(peer, msg.Headers)
+		return
+	}
+
+	// Nothing to do for an empty headers message.
 	if numHeaders == 0 {
 		return
 	}
@@ -1017,6 +1293,310 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		"-- now fetching blocks",
 		bestHeaderHash, bestHeaderHeight, hmsg.peer.String())
 	sm.fetchHeaderBlocks(peer)
+}
+
+// handleParallelHeadersMsg handles a headers message that arrives while the
+// initial header download is being performed across several peers.  The
+// response is matched to the sending peer's assigned range and, once the front
+// of the download becomes contiguous, the headers are applied to the chain in
+// order.
+func (sm *SyncManager) handleParallelHeadersMsg(peer *peerpkg.Peer,
+	headers []*wire.BlockHeader) {
+
+	hs := sm.headerSync
+	if hs == nil {
+		return
+	}
+
+	rng := hs.peerRange[peer]
+	if rng == nil {
+		// The peer is no longer assigned a range (its range was consumed,
+		// reassigned, or the peer is not part of the download).  Ignore
+		// stray or duplicate responses.
+		return
+	}
+
+	// Ignore duplicate responses for a range that has already been served.
+	if rng.received {
+		return
+	}
+
+	// An empty response means the peer cannot serve the requested slice (its
+	// actual tip is below the requested height).  Drop it from the download
+	// so the slice can be re-issued to a peer that can serve it.
+	if len(headers) == 0 {
+		log.Warnf("Peer %v returned no headers for the range starting "+
+			"at %d -- removing it from the header download",
+			peer.Addr(), rng.start)
+		sm.dropHeaderPeer(peer)
+		return
+	}
+
+	// Verify the response actually extends the exact height this range began
+	// at.  A peer can legitimately respond to an earlier request it was
+	// issued before its range was reassigned, in which case (with the short
+	// stall timeout and aggressive re-issuing) the response is a stale
+	// duplicate that must be ignored rather than attributed to the new range.
+	if expected, err := sm.chain.HeaderHashByHeight(rng.start - 1); err == nil {
+		if !headers[0].PrevBlock.IsEqual(expected) {
+			log.Warnf("Peer %v returned headers that do not extend the "+
+				"range starting at %d -- ignoring stale response",
+				peer.Addr(), rng.start)
+			return
+		}
+	}
+
+	rng.headers = headers
+	rng.received = true
+
+	sm.processReadyHeaderRanges()
+}
+
+// processReadyHeaderRanges applies every completed header range at the front of
+// the download to the header chain, frees the sending peers, and hands them the
+// next slice.  Once the download reaches the tallest participating peer, it
+// hands off to the initial block download.
+func (sm *SyncManager) processReadyHeaderRanges() {
+	hs := sm.headerSync
+	if hs == nil {
+		return
+	}
+
+	for {
+		front := hs.ranges[hs.nextHeight]
+		if front == nil || !front.received {
+			break
+		}
+
+		// Mirror the reference umami behavior (sugarchain PR #122): during
+		// initial block download the expensive PoW check is skipped when
+		// processing headers.  Full PoW validation happens later when the
+		// corresponding blocks are downloaded and processed.
+		headerFlags := blockchain.BFNoPoWCheck
+		if !sm.ibdMode {
+			headerFlags = blockchain.BFNone
+		}
+
+		for _, blockHeader := range front.headers {
+			_, err := sm.chain.ProcessBlockHeader(
+				blockHeader, headerFlags, false)
+			if err != nil {
+				log.Warnf("Received block header from peer %v "+
+					"failed header verification -- disconnecting: %v",
+					front.peer.Addr(), err)
+				front.peer.Disconnect()
+				sm.abortHeaderSync()
+				return
+			}
+			sm.progressLogger.SetLastLogTime(time.Now())
+		}
+
+		delete(hs.ranges, front.start)
+		delete(hs.peerRange, front.peer)
+		hs.nextHeight = front.start + int32(len(front.headers))
+		sm.lastProgressTime = time.Now()
+
+		// The peer whose slice we consumed picks up the next slice.
+		sm.assignHeaderRange(front.peer)
+	}
+
+	// Top up any idle peers so the download continues in parallel.
+	for _, p := range hs.peers {
+		sm.assignHeaderRange(p)
+	}
+
+	// Guard against a hole or stalled slice at the front of the download.
+	sm.reissueFrontRange()
+
+	// Hand off to the block download once every header through the tallest
+	// participating peer has been applied.
+	if hs.nextHeight > hs.target {
+		sm.finishHeaderSync()
+	}
+}
+
+// finishHeaderSync signals that the parallel header download has caught up to
+// the connected peers' tips and the initial block download can proceed with
+// fetching the blocks themselves.
+func (sm *SyncManager) finishHeaderSync() {
+	hs := sm.headerSync
+	if hs == nil {
+		return
+	}
+	sm.headerSync = nil
+
+	bestHash, bestHeight := sm.chain.BestHeader()
+	log.Infof("downloaded headers to %v(%v) in %d parallel "+
+		"slices -- now fetching blocks", bestHash, bestHeight, len(hs.peers))
+
+	// Hand the block download off to the sync peer.  If we no longer have a
+	// sync peer the normal new-peer/stall handling will restart the sync.
+	sm.ibdMode = true
+	if sm.syncPeer != nil {
+		sm.fetchHeaderBlocks(sm.syncPeer)
+	}
+}
+
+// dropHeaderPeer removes a peer from an in-progress parallel header download,
+// freeing any range it owned so the slice can be re-issued to another peer.  If
+// no peers remain, the header download is aborted so it can be restarted when a
+// suitable peer arrives.
+func (sm *SyncManager) dropHeaderPeer(peer *peerpkg.Peer) {
+	hs := sm.headerSync
+	if hs == nil {
+		return
+	}
+
+	if rng := hs.peerRange[peer]; rng != nil {
+		delete(hs.ranges, rng.start)
+		delete(hs.peerRange, peer)
+	}
+
+	for i, p := range hs.peers {
+		if p == peer {
+			hs.peers = append(hs.peers[:i], hs.peers[i+1:]...)
+			break
+		}
+	}
+
+	// The download only needs to reach the tallest remaining peer.
+	target := int32(0)
+	for _, p := range hs.peers {
+		if lastBlock := p.LastBlock(); lastBlock > target {
+			target = lastBlock
+		}
+	}
+	hs.target = target
+
+	// If nobody is left to serve headers, tear the download down and let the
+	// normal flow restart it (e.g. when a new peer connects).
+	if len(hs.peers) == 0 {
+		sm.headerSync = nil
+		return
+	}
+
+	// Hand the freed slot to a remaining peer and make sure the front of the
+	// download is covered even if every remaining peer is busy.
+	for _, p := range hs.peers {
+		sm.assignHeaderRange(p)
+	}
+	sm.reissueFrontRange()
+}
+
+// abortHeaderSync tears down the parallel header download (the offending peer
+// has already been disconnected) and restarts a fresh header download from the
+// current best header height using the remaining peers.
+func (sm *SyncManager) abortHeaderSync() {
+	if sm.headerSync == nil {
+		return
+	}
+	sm.headerSync = nil
+	sm.ibdMode = true
+
+	_, bestHeaderHeight := sm.chain.BestHeader()
+	if len(sm.fetchHigherPeers(bestHeaderHeight)) > 0 {
+		sm.fetchHeaders()
+	}
+}
+
+// reissueStaleHeaderRanges reassigns any in-flight header range that has not
+// completed within headerRangeStallTimeout to a different idle peer so a slow
+// or unresponsive peer cannot stall the parallel header download.
+func (sm *SyncManager) reissueStaleHeaderRanges() {
+	hs := sm.headerSync
+	if hs == nil {
+		return
+	}
+
+	// Always try to keep the front of the download moving first.
+	sm.reissueFrontRange()
+
+	now := time.Now()
+	for start, rng := range hs.ranges {
+		if rng.received || now.Sub(rng.assignedAt) < headerRangeStallTimeout {
+			continue
+		}
+
+		for _, p := range hs.peers {
+			if p == rng.peer {
+				continue
+			}
+			if _, ok := hs.peerRange[p]; ok {
+				continue
+			}
+
+			log.Warnf("Re-issuing header range at height %d from peer %v "+
+				"to peer %v after it stalled", start, rng.peer.Addr(),
+				p.Addr())
+			delete(hs.ranges, start)
+			sm.reissueHeaderRange(p, start)
+			break
+		}
+	}
+}
+
+// reissueFrontRange makes sure the front of the parallel header download is
+// covered by an in-flight request.  When the front slice is missing (left by a
+// dropped peer) or has been in flight for longer than headerRangeStallTimeout,
+// it is handed to another peer.  An idle peer is preferred; if every peer is
+// busy with a back slice, the slice from the peer holding the range with the
+// greatest start is re-issued instead (its own range is re-fetched later as the
+// download advances).
+func (sm *SyncManager) reissueFrontRange() {
+	hs := sm.headerSync
+	if hs == nil || hs.nextHeight > hs.target {
+		return
+	}
+
+	front := hs.ranges[hs.nextHeight]
+	switch {
+	case front == nil:
+		// The front is a hole; hand it out again.
+	case front.received:
+		// Already in hand; it will be applied momentarily.
+		return
+	case time.Since(front.assignedAt) < headerRangeStallTimeout:
+		// Still fresh in flight.
+		return
+	default:
+		// The front has been in flight too long; disown its holder so the
+		// slice can be re-issued to a peer that will actually respond.
+		log.Warnf("Header range at height %d from peer %v has stalled",
+			front.start, front.peer.Addr())
+		delete(hs.ranges, front.start)
+		delete(hs.peerRange, front.peer)
+	}
+
+	// Prefer an idle peer; otherwise steal the slice from the peer holding
+	// the range with the greatest start.
+	var target *peerpkg.Peer
+	for _, p := range hs.peers {
+		if _, ok := hs.peerRange[p]; !ok {
+			target = p
+			break
+		}
+	}
+	if target == nil {
+		for _, p := range hs.peers {
+			rng := hs.peerRange[p]
+			if target == nil || rng.start > hs.peerRange[target].start {
+				target = p
+			}
+		}
+		if target != nil {
+			rng := hs.peerRange[target]
+			log.Warnf("Re-issuing header range at height %d to peer %v "+
+				"by taking over its range at height %d", hs.nextHeight,
+				target.Addr(), rng.start)
+			delete(hs.ranges, rng.start)
+			delete(hs.peerRange, target)
+		}
+	}
+	if target == nil {
+		return
+	}
+
+	sm.reissueHeaderRange(target, hs.nextHeight)
 }
 
 // handleNotFoundMsg handles notfound messages from all peers.
