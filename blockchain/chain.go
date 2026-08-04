@@ -135,6 +135,24 @@ type BlockChain struct {
 	bestChain  *chainView
 	bestHeader *chainView
 
+	// coldCache stores temporarily-materialized block nodes for heights that
+	// fall outside the in-memory header window.  Entries are rebuilt lazily
+	// from the database via the two-hop block index and evicted in FIFO order
+	// to keep the working set bounded.  Protected by its own mutex.
+	coldCache coldNodeCache
+
+	// headerFlushCount tracks the number of headers added to the block index
+	// since the last database flush.  It is used to batch header index writes
+	// during header sync so a write transaction isn't opened per header.
+	// Protected by chainLock.
+	headerFlushCount int32
+
+	// headerWindow is the number of recent headers/blocks kept in memory at
+	// the tips of the best chain and best header chain.  When zero, the full
+	// block index is retained in memory (historical behavior).  Protected by
+	// chainLock.
+	headerWindow int32
+
 	// The UTXO state holds a cached view of the UTXO state of the chain.
 	// It is protected by the chain lock.
 	utxoCache *utxoCache
@@ -516,6 +534,11 @@ func (b *BlockChain) getReorganizeNodes(node *blockNode) (*list.List, *list.List
 	// Do not reorganize to a known invalid chain. Ancestors deeper than the
 	// direct parent are checked below but this is a quick check before doing
 	// more unnecessary work.
+	if node.parent == nil {
+		log.Warnf("Rejecting reorganize to node %v with a severed parent "+
+			"(below the in-memory header window)", node.hash)
+		return detachNodes, attachNodes
+	}
 	if b.index.NodeStatus(node.parent).KnownInvalid() {
 		b.index.SetStatusFlags(node, statusInvalidAncestor)
 		return detachNodes, attachNodes
@@ -526,6 +549,11 @@ func (b *BlockChain) getReorganizeNodes(node *blockNode) (*list.List, *list.List
 	// so they are attached in the appropriate order when iterating the list
 	// later.
 	forkNode := b.bestChain.FindFork(node)
+	if forkNode == nil {
+		log.Warnf("Rejecting reorganize to node %v without an in-window "+
+			"fork point", node.hash)
+		return detachNodes, attachNodes
+	}
 	invalidChain := false
 	for n := node; n != nil && n != forkNode; n = n.parent {
 		if b.index.NodeStatus(n).KnownInvalid() {
@@ -1172,6 +1200,31 @@ func (b *BlockChain) connectBestChain(node *blockNode, block *btcutil.Block, fla
 		}
 	}
 
+	// The lowest height a reorganization may touch.  When the in-memory
+	// header window is enabled, a reorganize that would detach or attach
+	// nodes below the best chain's window boundary is impossible because
+	// those nodes are not materialized in memory, so it is rejected instead.
+	reorgWindowBoundary := func() int32 {
+		if b.headerWindow <= 0 {
+			return 0
+		}
+		return b.index.windowBoundary(b.bestChain.Height())
+	}
+
+	// verifyForkInWindow returns an error if the provided node forks the
+	// chain below the in-memory header window boundary.  Such a fork cannot
+	// be resolved (or even recognized) without the materialized ancestors,
+	// so it is rejected rather than risk a walk off the end of the window.
+	verifyForkInWindow := func() error {
+		fork := b.bestChain.FindFork(node)
+		if fork == nil || (b.headerWindow > 0 && fork.height < reorgWindowBoundary()) {
+			return ruleError(ErrForkTooOld, fmt.Sprintf(
+				"block %v forks the chain below the in-memory header "+
+					"window boundary and is not supported", node.hash))
+		}
+		return nil
+	}
+	
 	// We are extending the main (best) chain with a new block.  This is the
 	// most common case.
 	parentHash := &block.MsgBlock().Header.PrevBlock
@@ -1255,6 +1308,12 @@ func (b *BlockChain) connectBestChain(node *blockNode, block *btcutil.Block, fla
 	// We're extending (or creating) a side chain, but the cumulative
 	// work for this new side chain is not enough to make it the new chain.
 	if node.workSum.Cmp(b.bestChain.Tip().workSum) <= 0 {
+		// A fork below the in-memory header window cannot be resolved, so
+		// reject it instead of attempting to walk past the window.
+		if err := verifyForkInWindow(); err != nil {
+			return false, err
+		}
+
 		// Log information about how the block is forking the chain.
 		fork := b.bestChain.FindFork(node)
 		if fork.hash.IsEqual(parentHash) {
@@ -1277,6 +1336,13 @@ func (b *BlockChain) connectBestChain(node *blockNode, block *btcutil.Block, fla
 	// blocks that form the (now) old fork from the main chain, and attach
 	// the blocks that form the new chain to the main chain starting at the
 	// common ancenstor (the point where the chain forked).
+	//
+	// A reorganize that forks below the in-memory header window boundary is
+	// impossible to perform since the reorganized nodes are not materialized
+	// in memory, so reject it.
+	if err := verifyForkInWindow(); err != nil {
+		return false, err
+	}
 	detachNodes, attachNodes := b.getReorganizeNodes(node)
 
 	// Reorganize the chain.
@@ -1351,6 +1417,17 @@ func (b *BlockChain) BestHeader() (chainhash.Hash, int32) {
 
 	best := b.bestHeader.Tip()
 	return best.hash, best.height
+}
+
+// FlushBlockIndex writes any pending block index updates to the database.
+// It is used during shutdown so the final batch of headers accumulated by
+// the periodic header flush is persisted and a restart can resume the header
+// sync from the last written header.
+func (b *BlockChain) FlushBlockIndex() error {
+	b.chainLock.Lock()
+	defer b.chainLock.Unlock()
+
+	return b.index.flushToDB()
 }
 
 // BestChainHeaderForkHeight returns the height of the fork point between the
@@ -1468,10 +1545,22 @@ func (b *BlockChain) ChainTips() []ChainTip {
 			status = StatusValidFork
 		}
 
+		// The fork point may have been evicted below the in-memory header
+		// window.  In that case FindFork returns nil because the in-memory
+		// ancestors do not reach the best chain, so the tip is a fully
+		// detached side branch and its branch length is its full height.
+		fork := b.bestChain.FindFork(tip)
+		branchLen := int32(0)
+		if fork != nil {
+			branchLen = tip.height - fork.height
+		} else {
+			branchLen = tip.height
+		}
+
 		chainTip := ChainTip{
 			Height:    tip.height,
 			BlockHash: tip.hash,
-			BranchLen: tip.height - b.bestChain.FindFork(tip).height,
+			BranchLen: branchLen,
 			Status:    status,
 		}
 
@@ -1536,7 +1625,10 @@ func (b *BlockChain) LatestBlockLocator() (BlockLocator, error) {
 // This function is safe for concurrent access.
 func (b *BlockChain) BlockHeightByHash(hash *chainhash.Hash) (int32, error) {
 	node := b.index.LookupNode(hash)
-	if node == nil || !b.bestChain.Contains(node) {
+	if node == nil {
+		node = b.materializeColdNode(hash)
+	}
+	if node == nil || !(b.bestChain.Contains(node) || b.isMainChainHash(&node.hash)) {
 		str := fmt.Sprintf("block %s is not in the main chain", hash)
 		return 0, errNotInMainChain(str)
 	}
@@ -1549,7 +1641,7 @@ func (b *BlockChain) BlockHeightByHash(hash *chainhash.Hash) (int32, error) {
 //
 // This function is safe for concurrent access.
 func (b *BlockChain) BlockHashByHeight(blockHeight int32) (*chainhash.Hash, error) {
-	node := b.bestChain.NodeByHeight(blockHeight)
+	node := b.nodeAtHeight(blockHeight)
 	if node == nil {
 		str := fmt.Sprintf("no block at height %d exists", blockHeight)
 		return nil, errNotInMainChain(str)
@@ -1563,7 +1655,17 @@ func (b *BlockChain) BlockHashByHeight(blockHeight int32) (*chainhash.Hash, erro
 // chain of best headers and did not receive an invalid state.
 func (b *BlockChain) IsValidHeader(blockHash *chainhash.Hash) bool {
 	node := b.index.LookupNode(blockHash)
-	if node == nil || !b.bestHeader.Contains(node) {
+	if node == nil {
+		// The header has been evicted from the in-memory header window.
+		// Validate it via the status persisted in the two-hop block index.
+		node = b.materializeColdNode(blockHash)
+		if node == nil {
+			return false
+		}
+
+		return !node.status.KnownInvalid()
+	}
+	if !b.bestHeader.Contains(node) {
 		return false
 	}
 
@@ -1589,22 +1691,37 @@ func (b *BlockChain) LatestBlockLocatorByHeader() (BlockLocator, error) {
 func (b *BlockChain) HeaderHashByHeight(blockHeight int32) (
 	*chainhash.Hash, error) {
 
-	node := b.bestHeader.NodeByHeight(blockHeight)
-	if node == nil || !b.bestHeader.Contains(node) {
-		return nil, fmt.Errorf("blockheight %v not found", blockHeight)
+	// Serve from the in-memory header window when the height is retained,
+	// otherwise fall back to the main-chain height index for heights that
+	// have been evicted.
+	if node := b.bestHeader.NodeByHeight(blockHeight); node != nil {
+		return &node.hash, nil
+	}
+	if node := b.coldNodeAtHeight(blockHeight); node != nil {
+		return &node.hash, nil
 	}
 
-	return &node.hash, nil
+	return nil, fmt.Errorf("blockheight %v not found", blockHeight)
 }
 
 // HeaderHeightByHash returns the height of the header given its hash.
 func (b *BlockChain) HeaderHeightByHash(blockHash chainhash.Hash) (int32, error) {
-	node := b.index.LookupNode(&blockHash)
-	if node == nil || !b.bestHeader.Contains(node) {
-		return -1, fmt.Errorf("blockhash %v not found", blockHash)
+	if node := b.index.LookupNode(&blockHash); node != nil &&
+		b.bestHeader.Contains(node) {
+
+		return node.height, nil
 	}
 
-	return node.height, nil
+	// Fall back to the two-hop block index for headers that have been
+	// evicted from the in-memory header window, verifying the hash is still
+	// on the main chain.
+	if node := b.materializeColdNode(&blockHash); node != nil &&
+		b.isMainChainHash(&blockHash) {
+
+		return node.height, nil
+	}
+
+	return -1, fmt.Errorf("blockhash %v not found", blockHash)
 }
 
 // HeightRange returns a range of block hashes for the given start and end
@@ -1630,14 +1747,9 @@ func (b *BlockChain) HeightRange(startHeight, endHeight int32) ([]chainhash.Hash
 		return nil, nil
 	}
 
-	// Grab a lock on the chain view to prevent it from changing due to a
-	// reorg while building the hashes.
-	b.bestChain.mtx.Lock()
-	defer b.bestChain.mtx.Unlock()
-
 	// When the requested start height is after the most recent best chain
 	// height, there is nothing to do.
-	latestHeight := b.bestChain.tip().height
+	latestHeight := b.bestChain.Height()
 	if startHeight > latestHeight {
 		return nil, nil
 	}
@@ -1647,10 +1759,17 @@ func (b *BlockChain) HeightRange(startHeight, endHeight int32) ([]chainhash.Hash
 		endHeight = latestHeight + 1
 	}
 
-	// Fetch as many as are available within the specified range.
-	hashes := make([]chainhash.Hash, 0, endHeight-startHeight)
-	for i := startHeight; i < endHeight; i++ {
-		hashes = append(hashes, b.bestChain.nodeByHeight(i).hash)
+	// Fetch as many as are available within the specified range.  Heights
+	// that have been evicted from the in-memory header window are served by
+	// the cold-read layer from the main-chain height index.
+	nodes := b.nodesInHeightRange(startHeight, endHeight-1)
+	hashes := make([]chainhash.Hash, 0, len(nodes))
+	for _, blockNode := range nodes {
+		if blockNode == nil {
+			return nil, fmt.Errorf("block at height %d is not indexed "+
+				"on the main chain", startHeight+int32(len(hashes)))
+		}
+		hashes = append(hashes, blockNode.hash)
 	}
 	return hashes, nil
 }
@@ -1691,6 +1810,10 @@ func (b *BlockChain) HeightToHashRange(startHeight int32,
 	node := endNode
 	hashes := make([]chainhash.Hash, resultsLength)
 	for i := resultsLength - 1; i >= 0; i-- {
+		if node == nil {
+			return nil, fmt.Errorf("block at height %d is not in the "+
+				"in-memory header window", startHeight+int32(i))
+		}
 		hashes[i] = node.hash
 		node = node.parent
 	}
@@ -1730,6 +1853,12 @@ func (b *BlockChain) IntervalBlockHashes(endHash *chainhash.Hash, interval int,
 			blockNode = blockNode.Ancestor(blockHeight)
 		}
 
+		if blockNode == nil {
+			// The requested height has been evicted from the in-memory
+			// header window.
+			return nil, fmt.Errorf("block at height %d is not in the "+
+				"in-memory header window", blockHeight)
+		}
 		hashes[index-1] = blockNode.hash
 	}
 
@@ -1756,6 +1885,11 @@ func (b *BlockChain) locateInventory(locator BlockLocator, hashStop *chainhash.H
 	// There are no block locators so a specific block is being requested
 	// as identified by the stop hash.
 	stopNode := b.index.LookupNode(hashStop)
+	if stopNode == nil {
+		// The stop hash has been evicted from the in-memory header window,
+		// so materialize it from the two-hop block index.
+		stopNode = b.materializeColdNode(hashStop)
+	}
 	if len(locator) == 0 {
 		if stopNode == nil {
 			// No blocks with the stop hash were found so there is
@@ -1765,29 +1899,50 @@ func (b *BlockChain) locateInventory(locator BlockLocator, hashStop *chainhash.H
 		return stopNode, 1
 	}
 
-	// Find the most recent locator block hash in the main chain.  In the
-	// case none of the hashes in the locator are in the main chain, fall
-	// back to the genesis block.
-	startNode := b.bestChain.Genesis()
+	// Find the most recent locator block hash in the main chain, serving
+	// either from the in-memory header window or via a cold materialization.
+	// In the case none of the hashes in the locator are in the main chain,
+	// fall back to the oldest block retained in the window.
+	var startNode *blockNode
 	for _, hash := range locator {
-		node := b.index.LookupNode(hash)
-		if node != nil && b.bestChain.Contains(node) {
+		var node *blockNode
+		if inMem := b.index.LookupNode(hash); inMem != nil &&
+			b.bestChain.Contains(inMem) {
+
+			node = inMem
+		} else if cold := b.materializeColdNode(hash); cold != nil &&
+			b.isMainChainHash(hash) {
+
+			node = cold
+		}
+
+		if node != nil {
 			startNode = node
 			break
 		}
 	}
 
+	// When no locator hash is on the main chain, start after the oldest
+	// block the window retains.
+	if startNode == nil {
+		if b.bestChain.Height() < 0 {
+			return nil, 0
+		}
+		startNode = b.bestChain.Genesis()
+	}
+
 	// Start at the block after the most recently known block.  When there
 	// is no next block it means the most recently known block is the tip of
 	// the best chain, so there is nothing more to do.
-	startNode = b.bestChain.Next(startNode)
+	startNode = b.nodeAtHeight(startNode.height + 1)
 	if startNode == nil {
 		return nil, 0
 	}
 
 	// Calculate how many entries are needed.
 	total := uint32((b.bestChain.Tip().height - startNode.height) + 1)
-	if stopNode != nil && b.bestChain.Contains(stopNode) &&
+	if stopNode != nil &&
+		(b.bestChain.Contains(stopNode) || b.isMainChainHash(&stopNode.hash)) &&
 		stopNode.height >= startNode.height {
 
 		total = uint32((stopNode.height - startNode.height) + 1)
@@ -1815,11 +1970,19 @@ func (b *BlockChain) locateBlocks(locator BlockLocator, hashStop *chainhash.Hash
 		return nil
 	}
 
-	// Populate and return the found hashes.
+	// Populate and return the found hashes.  The first node is the one the
+	// locator resolved (which may be a side-chain stop hash rather than a
+	// main-chain block); the remaining successors share a contiguous span and
+	// are materialized in a single database view where heights are evicted.
 	hashes := make([]chainhash.Hash, 0, total)
-	for i := uint32(0); i < total; i++ {
-		hashes = append(hashes, node.hash)
-		node = b.bestChain.Next(node)
+	hashes = append(hashes, node.hash)
+	for _, next := range b.nodesInHeightRange(node.height+1,
+		node.height+int32(total)-1) {
+
+		if next == nil {
+			break
+		}
+		hashes = append(hashes, next.hash)
 	}
 	return hashes
 }
@@ -1860,11 +2023,19 @@ func (b *BlockChain) locateHeaders(locator BlockLocator, hashStop *chainhash.Has
 		return nil
 	}
 
-	// Populate and return the found headers.
+	// Populate and return the found headers.  The first node is the one the
+	// locator resolved (which may be a side-chain stop hash rather than a
+	// main-chain block); the remaining successors share a contiguous span and
+	// are materialized in a single database view where heights are evicted.
 	headers := make([]wire.BlockHeader, 0, total)
-	for i := uint32(0); i < total; i++ {
-		headers = append(headers, node.Header())
-		node = b.bestChain.Next(node)
+	headers = append(headers, node.Header())
+	for _, next := range b.nodesInHeightRange(node.height+1,
+		node.height+int32(total)-1) {
+
+		if next == nil {
+			break
+		}
+		headers = append(headers, next.Header())
 	}
 	return headers
 }
@@ -2154,6 +2325,13 @@ type Config struct {
 	// This field is required.
 	UtxoCacheMaxSize uint64
 
+	// HeaderWindow, when greater than zero, bounds the number of recent
+	// headers/blocks kept in memory to this many nodes at the tip of both the
+	// best chain and best header chain.  Headers outside the window are read
+	// from disk on demand.  A value of zero keeps the full block index in
+	// memory, which is the historical btcd behavior.
+	HeaderWindow int32
+
 	// Interrupt specifies a channel the caller can close to signal that
 	// long running operations, such as catching up indexes or performing
 	// database migrations, should be interrupted.
@@ -2266,12 +2444,25 @@ func New(config *Config) (*BlockChain, error) {
 		hashCache:           config.HashCache,
 		bestChain:           newChainView(nil),
 		bestHeader:          newChainView(nil),
+		coldCache:           newColdNodeCache(),
 		orphans:             make(map[chainhash.Hash]*orphanBlock),
 		prevOrphans:         make(map[chainhash.Hash][]*orphanBlock),
 		warningCaches:       newThresholdCaches(vbNumBits),
 		deploymentCaches:    newThresholdCaches(chaincfg.DefinedDeployments),
 		pruneTarget:         config.Prune,
 	}
+
+	// Set the best header tip function so flushToDB persists the best header
+	// state alongside the block index writes.
+	b.index.bestHeaderNode = func() *blockNode {
+		return b.bestHeader.Tip()
+	}
+
+	// Adopt the header window and wire the window management hooks so the
+	// block index can evict older headers and page cold headers back in from
+	// disk.
+	b.headerWindow = config.HeaderWindow
+	b.index.setWindow(b.headerWindow, b.bestChain, b.bestHeader)
 
 	// Ensure all the deployments are synchronized with our clock if
 	// needed.
@@ -2293,6 +2484,10 @@ func New(config *Config) (*BlockChain, error) {
 	if err := b.initChainState(); err != nil {
 		return nil, err
 	}
+
+	// Enable in-memory header window eviction now that the block index has
+	// been fully materialized.
+	b.index.markInitialized()
 
 	// Perform any upgrades to the various chain-specific buckets as needed.
 	if err := b.maybeUpgradeDbBuckets(config.Interrupt); err != nil {

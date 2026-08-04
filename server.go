@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -37,6 +38,7 @@ import (
 	"github.com/btcsuite/btcd/mining/cpuminer"
 	"github.com/btcsuite/btcd/netsync"
 	"github.com/btcsuite/btcd/peer"
+	"github.com/btcsuite/btcd/sugarindex"
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/decred/dcrd/lru"
@@ -305,6 +307,10 @@ type server struct {
 	txIndex   *indexers.TxIndex
 	addrIndex *indexers.AddrIndex
 	cfIndex   *indexers.CfIndex
+
+	// sugarIndex is the umami-byte-compatible address/spent/timestamp index
+	// (raw LevelDB under <datadir>/index).  It powers the getaddress* RPCs.
+	sugarIndex *sugarindex.Manager
 
 	// The fee estimator keeps track of how long transactions are left in
 	// the mempool before they are mined into blocks.
@@ -2755,6 +2761,21 @@ func (s *server) Stop() error {
 		s.rpcServer.Stop()
 	}
 
+	// Flush any pending block index updates so a restart can resume the
+	// header sync from the last written header instead of re-downloading
+	// the final batch.
+	if err := s.chain.FlushBlockIndex(); err != nil {
+		srvrLog.Errorf("Failed to flush block index: %v", err)
+	}
+
+	// Close the sugar index LevelDB if it was opened.
+	if s.sugarIndex != nil {
+		if err := s.sugarIndex.Close(); err != nil {
+			srvrLog.Errorf("Failed to close sugar index: %v", err)
+		}
+		s.sugarIndex = nil
+	}
+
 	// Save fee estimator state in the database.
 	s.db.Update(func(tx database.Tx) error {
 		metadata := tx.Metadata()
@@ -3069,6 +3090,20 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 		indexManager = indexers.NewManager(db, indexes)
 	}
 
+	// The sugar index is a standalone umami-byte-compatible raw LevelDB.  It
+	// deliberately replaces btcd's native indexes when enabled (they are not
+	// byte-compatible with umami and would only waste CPU/memory/disk).
+	if cfg.SugarIndex {
+		var siErr error
+		s.sugarIndex, siErr = sugarindex.NewManager(
+			filepath.Join(cfg.DataDir, "index"))
+		if siErr != nil {
+			return nil, siErr
+		}
+		sugarindex.UseLogger(indxLog)
+		indexManager = s.sugarIndex
+	}
+
 	// Merge given checkpoints with the default ones unless they are disabled.
 	var checkpoints []chaincfg.Checkpoint
 	if !cfg.DisableCheckpoints {
@@ -3093,6 +3128,7 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 		HashCache:        s.hashCache,
 		Prune:            cfg.Prune * 1024 * 1024,
 		UtxoCacheMaxSize: uint64(cfg.UtxoCacheMaxSizeMiB) * 1024 * 1024,
+		HeaderWindow:     cfg.HeaderWindow,
 	})
 	if err != nil {
 		return nil, err
@@ -3324,6 +3360,7 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 			AddrIndex:    s.addrIndex,
 			CfIndex:      s.cfIndex,
 			FeeEstimator: s.feeEstimator,
+			SugarIndex:   s.sugarIndex,
 		})
 		if err != nil {
 			return nil, err

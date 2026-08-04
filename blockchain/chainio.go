@@ -51,6 +51,13 @@ var (
 	// chain state.
 	chainStateKeyName = []byte("chainstate")
 
+	// bestHeaderStateKeyName is the name of the db key used to store the best
+	// header state.  Unlike chainStateKeyName, which tracks the best fully
+	// connected chain, this tracks the tip of the best known header chain so a
+	// restart can resume a header sync from the last accepted header instead of
+	// re-downloading headers up to the best connected chain tip.
+	bestHeaderStateKeyName = []byte("headerchainstate")
+
 	// utxoStateConsistencyKeyName is the name of the db key used to store the
 	// consistency status of the utxo state.
 	utxoStateConsistencyKeyName = []byte("utxostateconsistency")
@@ -894,6 +901,18 @@ func dbPutBlockIndex(dbTx database.Tx, hash *chainhash.Hash, height int32) error
 	return heightIndex.Put(serializedHeight[:], hash[:])
 }
 
+// dbPutHashIndex uses an existing database transaction to add a block hash to
+// height mapping to the hash index bucket.  Unlike dbPutBlockIndex, it does not
+// write the height to hash mapping: it is used when flushing header-only block
+// nodes whose height in the height index must stay owned by the main chain.
+func dbPutHashIndex(dbTx database.Tx, hash *chainhash.Hash, height int32) error {
+	var serializedHeight [4]byte
+	byteOrder.PutUint32(serializedHeight[:], uint32(height))
+	meta := dbTx.Metadata()
+	hashIndex := meta.Bucket(hashIndexBucketName)
+	return hashIndex.Put(hash[:], serializedHeight[:])
+}
+
 // dbRemoveBlockIndex uses an existing database transaction remove block index
 // entries from the hash to height and height to hash mappings for the provided
 // values.
@@ -943,6 +962,46 @@ func dbFetchHashByHeight(dbTx database.Tx, height int32) (*chainhash.Hash, error
 	var hash chainhash.Hash
 	copy(hash[:], hashBytes)
 	return &hash, nil
+}
+
+// dbFetchBlockRowByHash uses an existing database transaction to retrieve the
+// block header and status for the provided hash from the block index via the
+// two-hop hash to-height to-block-index mapping, without reading the block
+// file.  It returns a nil header when the hash has no corresponding block index
+// entry.
+func dbFetchBlockRowByHash(dbTx database.Tx, hash *chainhash.Hash) (*wire.BlockHeader, blockStatus, int32, error) {
+	height, err := dbFetchHeightByHash(dbTx, hash)
+	if err != nil {
+		return nil, statusNone, 0, err
+	}
+
+	key := blockIndexKey(hash, uint32(height))
+	meta := dbTx.Metadata()
+	blockIndex := meta.Bucket(blockIndexBucketName)
+	row := blockIndex.Get(key)
+	if row == nil {
+		return nil, statusNone, 0, nil
+	}
+
+	header, status, err := deserializeBlockRow(row)
+	if err != nil {
+		return nil, statusNone, 0, err
+	}
+
+	return header, status, height, nil
+}
+
+// dbFetchBlockRowByHeight uses an existing database transaction to retrieve the
+// main-chain block header and status for the provided height via the two-hop
+// height-to-hash-to-block-index mapping, without reading the block file.  It
+// returns a nil header when the height has no corresponding main-chain entry.
+func dbFetchBlockRowByHeight(dbTx database.Tx, height int32) (*wire.BlockHeader, blockStatus, int32, error) {
+	hash, err := dbFetchHashByHeight(dbTx, height)
+	if err != nil {
+		return nil, statusNone, 0, err
+	}
+
+	return dbFetchBlockRowByHash(dbTx, hash)
 }
 
 // -----------------------------------------------------------------------------
@@ -1044,6 +1103,66 @@ func dbPutBestState(dbTx database.Tx, snapshot *BestState, workSum *big.Int) err
 
 	// Store the current best chain state into the database.
 	return dbTx.Metadata().Put(chainStateKeyName, serializedData)
+}
+
+// bestHeaderState represents the data to be stored in the database for the
+// current best header state.
+type bestHeaderState struct {
+	hash   chainhash.Hash
+	height uint32
+}
+
+// serializeBestHeaderState returns the serialization of the passed best header
+// state.  This is data to be stored under bestHeaderStateKeyName.
+func serializeBestHeaderState(state bestHeaderState) []byte {
+	serializedLen := chainhash.HashSize + 4
+	serializedData := make([]byte, serializedLen)
+	copy(serializedData[0:chainhash.HashSize], state.hash[:])
+	byteOrder.PutUint32(serializedData[chainhash.HashSize:], state.height)
+	return serializedData
+}
+
+// deserializeBestHeaderState deserializes the passed serialized best header
+// state.
+func deserializeBestHeaderState(serializedData []byte) (bestHeaderState, error) {
+	if len(serializedData) < chainhash.HashSize+4 {
+		return bestHeaderState{}, database.Error{
+			ErrorCode:   database.ErrCorruption,
+			Description: "corrupt best header state",
+		}
+	}
+
+	state := bestHeaderState{}
+	copy(state.hash[:], serializedData[0:chainhash.HashSize])
+	state.height = byteOrder.Uint32(serializedData[chainhash.HashSize:])
+	return state, nil
+}
+
+// dbPutBestHeaderState uses an existing database transaction to update the best
+// header state with the given parameters.
+func dbPutBestHeaderState(dbTx database.Tx, hash *chainhash.Hash, height int32) error {
+	serializedData := serializeBestHeaderState(bestHeaderState{
+		hash:   *hash,
+		height: uint32(height),
+	})
+
+	return dbTx.Metadata().Put(bestHeaderStateKeyName, serializedData)
+}
+
+// dbFetchBestHeaderState uses an existing database transaction to retrieve the
+// best header state.  It returns nil when no state has been stored, which is
+// the case for databases created by versions that predate the key.
+func dbFetchBestHeaderState(dbTx database.Tx) (*bestHeaderState, error) {
+	serializedData := dbTx.Metadata().Get(bestHeaderStateKeyName)
+	if serializedData == nil {
+		return nil, nil
+	}
+
+	state, err := deserializeBestHeaderState(serializedData)
+	if err != nil {
+		return nil, err
+	}
+	return &state, nil
 }
 
 // dbPutUtxoStateConsistency uses an existing database transaction to
@@ -1162,6 +1281,13 @@ func (b *BlockChain) createChainState() error {
 			return err
 		}
 
+		// Store the current best header state (initially the genesis
+		// block) into the database.
+		err = dbPutBestHeaderState(dbTx, &node.hash, node.height)
+		if err != nil {
+			return err
+		}
+
 		// Store the genesis block into the database.
 		return dbStoreBlock(dbTx, genesisBlock)
 	})
@@ -1239,17 +1365,47 @@ func (b *BlockChain) initChainState() error {
 			return err
 		}
 
-		// Load all of the headers from the data for the known best
-		// chain and construct the block index accordingly.  Since the
-		// number of nodes are already known, perform a single alloc
-		// for them versus a whole bunch of little ones to reduce
-		// pressure on the GC.
+		// Restore the best header tip state before loading the block index
+		// so the in-memory header window can be computed from the furthest
+		// tip.  When no state exists, such as with a database created by an
+		// older version, the header tip falls back to the best connected
+		// chain tip as before.
+		headerState, err := dbFetchBestHeaderState(dbTx)
+		if err != nil {
+			return err
+		}
+		headerTipHeight := int32(state.height)
+		if headerState != nil {
+			headerTipHeight = int32(headerState.height)
+		}
+
+		// Determine the in-memory header window boundaries.  When the window
+		// is enabled, only the most recent windowSize blocks from each tip
+		// are materialized in memory: the connected chain keeps its own
+		// trailing window (during a header sync the best chain tip can sit
+		// far below the header tip), and the header chain keeps the trailing
+		// window of the furthest tip.  Every older row is accumulated only as
+		// running work so the node at each window boundary carries the
+		// correct cumulative workSum.  A windowSize of zero materializes the
+		// entire index as before.
+		chainBoundary := b.index.windowBoundary(int32(state.height))
+		headerBoundary := b.index.windowBoundary(headerTipHeight)
+
+		// Load the headers from the data for the known best chain and
+		// construct the block index accordingly.
 		log.Infof("Loading block index...")
 
 		blockIndexBucket := dbTx.Metadata().Bucket(blockIndexBucketName)
 
 		var i int32
 		var lastNode *blockNode
+
+		// runningWorkSum accumulates the cumulative chain work of every row
+		// below the header window boundary so the boundary node can be
+		// seeded with the correct workSum even though its parent is not
+		// materialized.
+		var runningWorkSum *big.Int
+
 		cursor := blockIndexBucket.Cursor()
 		for ok := cursor.First(); ok; ok = cursor.Next() {
 			header, status, err := deserializeBlockRow(cursor.Value())
@@ -1257,34 +1413,69 @@ func (b *BlockChain) initChainState() error {
 				return err
 			}
 
+			// Accumulate the work of every row below the header window
+			// boundary, materialized or not, so the running total is correct
+			// at whichever boundary anchor consumes it.
+			if i < headerBoundary {
+				if runningWorkSum == nil {
+					runningWorkSum = CalcWork(header.Bits)
+				} else {
+					runningWorkSum.Add(runningWorkSum, CalcWork(header.Bits))
+				}
+			}
+
+			// Materialize this row when it falls within either the connected
+			// chain's window or the header chain's window.
+			inChainWindow := i >= chainBoundary && i <= int32(state.height)
+			inHeaderWindow := i >= headerBoundary
+			if !inChainWindow && !inHeaderWindow {
+				i++
+				continue
+			}
+
 			// Determine the parent block node. Since we iterate block headers
 			// in order of height, if the blocks are mostly linear there is a
 			// very good chance the previous header processed is the parent.
 			var parent *blockNode
-			if lastNode == nil {
+			if lastNode != nil && header.PrevBlock == lastNode.hash {
+				// Since we iterate block headers in order of height, if the
+				// blocks are mostly linear there is a very good chance the
+				// previous header processed is the parent.
+				parent = lastNode
+			} else if parent = b.index.LookupNode(&header.PrevBlock); parent != nil {
+				// The parent was materialized earlier within the window (a
+				// side chain, or a jump between the connected chain window
+				// and the header window).
+			} else if i == 0 {
+				// This is the very first row, which must be genesis.
 				blockHash := header.BlockHash()
 				if !blockHash.IsEqual(b.chainParams.GenesisHash) {
 					return AssertError(fmt.Sprintf("initChainState: Expected "+
 						"first entry in block index to be genesis block, "+
 						"found %s", blockHash))
 				}
-			} else if header.PrevBlock == lastNode.hash {
-				// Since we iterate block headers in order of height, if the
-				// blocks are mostly linear there is a very good chance the
-				// previous header processed is the parent.
-				parent = lastNode
 			} else {
-				parent = b.index.LookupNode(&header.PrevBlock)
-				if parent == nil {
-					return AssertError(fmt.Sprintf("initChainState: Could "+
-						"not find parent for block %s", header.BlockHash()))
-				}
+				// The node at a window boundary.  Its parent lives below the
+				// materialized window; the parent hash is retained on the
+				// node so its header can be reconstructed, and the running
+				// work accumulated above provides its cumulative work.
+				parent = nil
 			}
 
 			// Initialize the block node for the block, connect it,
 			// and add it to the block index.
 			node := new(blockNode)
 			initBlockNode(node, header, parent)
+			if parent == nil && i > 0 {
+				// Seed the boundary anchor with the cumulative work of the
+				// entire chain up to and including this row, and fix its
+				// height since its parent is not materialized.
+				node.height = i
+				if runningWorkSum != nil {
+					node.workSum = new(big.Int).Add(runningWorkSum,
+						CalcWork(header.Bits))
+				}
+			}
 			node.status = status
 			b.index.addNode(node)
 
@@ -1299,7 +1490,19 @@ func (b *BlockChain) initChainState() error {
 				"chain tip %s in block index", state.hash))
 		}
 		b.bestChain.SetTip(tip)
-		b.bestHeader.SetTip(tip)
+
+		headerTip := tip
+		if headerState != nil {
+			headerNode := b.index.LookupNode(&headerState.hash)
+			if headerNode == nil {
+				log.Warnf("Best header state %s not found in block "+
+					"index, falling back to best chain tip",
+					headerState.hash)
+			} else {
+				headerTip = headerNode
+			}
+		}
+		b.bestHeader.SetTip(headerTip)
 
 		// Load the raw block bytes for the best block.
 		blockBytes, err := dbTx.FetchBlock(&state.hash)
@@ -1472,8 +1675,10 @@ func blockIndexKey(blockHash *chainhash.Hash, blockHeight uint32) []byte {
 //
 // This function is safe for concurrent access.
 func (b *BlockChain) BlockByHeight(blockHeight int32) (*btcutil.Block, error) {
-	// Lookup the block height in the best chain.
-	node := b.bestChain.NodeByHeight(blockHeight)
+	// Lookup the block height in the best chain, falling back to a cold
+	// materialization when the height has been evicted from the in-memory
+	// header window.
+	node := b.nodeAtHeight(blockHeight)
 	if node == nil {
 		str := fmt.Sprintf("no block at height %d exists", blockHeight)
 		return nil, errNotInMainChain(str)
@@ -1495,9 +1700,16 @@ func (b *BlockChain) BlockByHeight(blockHeight int32) (*btcutil.Block, error) {
 // This function is safe for concurrent access.
 func (b *BlockChain) BlockByHash(hash *chainhash.Hash) (*btcutil.Block, error) {
 	// Lookup the block hash in block index and ensure it is in the best
-	// chain.
+	// chain, falling back to a cold materialization when the block has been
+	// evicted from the in-memory header window.
 	node := b.index.LookupNode(hash)
-	if node == nil || !b.bestChain.Contains(node) {
+	if node == nil {
+		node = b.materializeColdNode(hash)
+		if node == nil || !b.isMainChainHash(hash) {
+			str := fmt.Sprintf("block %s is not in the main chain", hash)
+			return nil, errNotInMainChain(str)
+		}
+	} else if !b.bestChain.Contains(node) {
 		str := fmt.Sprintf("block %s is not in the main chain", hash)
 		return nil, errNotInMainChain(str)
 	}

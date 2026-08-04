@@ -79,8 +79,17 @@ type blockNode struct {
 	// hundreds of thousands of these in memory, so a few extra bytes of
 	// padding adds up.
 
-	// parent is the parent block for this node.
+	// parent is the parent block for this node.  It may be nil for nodes at
+	// the lower boundary of the in-memory header window, in which case the
+	// parent must be (re)materialized from disk via parentHash if needed.
 	parent *blockNode
+
+	// parentHash is the hash of the parent block.  It is always populated from
+	// the header's previous block hash during construction so that a node's
+	// header serialization does not depend on whether the parent pointer is
+	// resolved, and so a severed parent (due to header windowing) does not
+	// corrupt the reconstructed header.
+	parentHash chainhash.Hash
 
 	// ancestor is a block that is more than one block back from this node.
 	ancestor *blockNode
@@ -119,6 +128,7 @@ type blockNode struct {
 func initBlockNode(node *blockNode, blockHeader *wire.BlockHeader, parent *blockNode) {
 	*node = blockNode{
 		hash:       blockHeader.BlockHash(),
+		parentHash: blockHeader.PrevBlock,
 		workSum:    CalcWork(blockHeader.Bits),
 		version:    blockHeader.Version,
 		bits:       blockHeader.Bits,
@@ -161,14 +171,12 @@ func (node *blockNode) Equals(other *blockNode) bool {
 //
 // This function is safe for concurrent access.
 func (node *blockNode) Header() wire.BlockHeader {
-	// No lock is needed because all accessed fields are immutable.
-	prevHash := &zeroHash
-	if node.parent != nil {
-		prevHash = &node.parent.hash
-	}
+	// No lock is needed because all accessed fields are immutable.  The
+	// parent hash is stored on the node so the reconstructed header stays
+	// correct even when the parent pointer is severed by the header window.
 	return wire.BlockHeader{
 		Version:    node.version,
-		PrevBlock:  *prevHash,
+		PrevBlock:  node.parentHash,
 		MerkleRoot: node.merkleRoot,
 		Timestamp:  time.Unix(node.timestamp, 0),
 		Bits:       node.bits,
@@ -368,7 +376,40 @@ type blockIndex struct {
 	db          database.DB
 	chainParams *chaincfg.Params
 
+	// bestHeaderNode, when set, returns the current best header tip.  It is
+	// used by flushToDB to persist the best header state in the same write
+	// transaction that flushes the dirty block nodes, so a restart can
+	// resume a header sync from the last accepted header.
+	bestHeaderNode func() *blockNode
+
 	sync.RWMutex
+
+	// windowSize, when greater than zero, bounds the in-memory block index
+	// to the most recent windowSize blocks from each active chain tip.
+	// Nodes at or above the window boundary are materialized in memory;
+	// everything below it is evicted after each successful flushToDB and
+	// must be re-materialized from disk on demand.  A value of zero
+	// preserves the historical btcd behavior of keeping the entire block
+	// index in memory.
+	//
+	// The remaining fields in this section are only written while holding
+	// the index lock, so reads performed under the same lock (as in
+	// evictWindow and flushToDB) never observe a half-updated state.
+	windowSize int32
+
+	// bestChainView and bestHeaderView are the chain views owned by the
+	// BlockChain instance.  They are used to determine the current window
+	// boundary and are pruned in lockstep with the index so evicted block
+	// nodes are not kept alive by the views and can be reclaimed by the
+	// garbage collector.
+	bestChainView  *chainView
+	bestHeaderView *chainView
+
+	// ready is set once the initial block index load has completed.  Window
+	// eviction is disabled until then so the startup path never races with
+	// the initial materialization of the block index.
+	ready bool
+
 	index map[chainhash.Hash]*blockNode
 	dirty map[*blockNode]struct{}
 }
@@ -427,6 +468,168 @@ func (bi *blockIndex) addNode(node *blockNode) {
 	bi.index[node.hash] = node
 }
 
+// setWindow enables or disables the in-memory header window.  When windowSize
+// is greater than zero, the block index keeps only the most recent windowSize
+// blocks from each active chain tip in memory and evicts everything below that
+// boundary after each successful flushToDB.  A windowSize of zero (or less)
+// preserves the historical btcd behavior of keeping the entire block index in
+// memory.
+//
+// bestChain and bestHeader are the chain views owned by the BlockChain
+// instance; they are pruned in lockstep with the index so evicted block nodes
+// are not kept alive by the views and can be reclaimed by the garbage
+// collector.
+//
+// This function is safe for concurrent access.
+func (bi *blockIndex) setWindow(windowSize int32, bestChain, bestHeader *chainView) {
+	bi.Lock()
+	bi.windowSize = windowSize
+	bi.bestChainView = bestChain
+	bi.bestHeaderView = bestHeader
+	bi.ready = false
+	bi.Unlock()
+}
+
+// markInitialized marks the block index as fully loaded so window eviction is
+// enabled.  Until this is called, evictWindow is a no-op.
+//
+// This function is safe for concurrent access.
+func (bi *blockIndex) markInitialized() {
+	bi.Lock()
+	bi.ready = true
+	bi.Unlock()
+}
+
+// windowEnabled returns whether in-memory header windowing is active.
+func (bi *blockIndex) windowEnabled() bool {
+	return bi.windowSize > 0
+}
+
+// windowBoundary returns the lowest height that must stay materialized in
+// memory for the provided tip height.  Nodes below the returned boundary are
+// eligible for eviction.  When windowing is disabled, or the tip is shorter
+// than the window, the returned boundary is zero so nothing is ever evicted.
+func (bi *blockIndex) windowBoundary(tipHeight int32) int32 {
+	if !bi.windowEnabled() || tipHeight <= 0 {
+		return 0
+	}
+	if boundary := tipHeight - bi.windowSize; boundary > 0 {
+		return boundary
+	}
+	return 0
+}
+
+// tipHeight returns the height of the given chain view's tip, or -1 when the
+// view is unset or empty.
+func (bi *blockIndex) tipHeight(view *chainView) int32 {
+	if view == nil {
+		return -1
+	}
+	if tip := view.Tip(); tip != nil {
+		return tip.height
+	}
+	return -1
+}
+
+// evictWindow prunes the block index and both chain views down to the current
+// in-memory header windows.  Each view keeps its own trailing window: the best
+// chain view retains the most recent windowSize connected blocks (the chain
+// state depends on them, and during a header sync the best chain tip may be
+// far behind the header tip), while the block index and the best header view
+// are bounded by the best header tip's window.  Nodes below the respective
+// boundaries that are not part of the best chain view are removed from the
+// index map, and the parent and ancestor pointers of any in-window node that
+// still points at an evicted node are severed so the evicted structs can be
+// reclaimed by the garbage collector.
+//
+// The parent and ancestor pointers must be severed for any ancestor that was
+// evicted.  Otherwise the dangling reference would keep the evicted struct --
+// and, transitively through its own parent links, the entire evicted prefix of
+// the chain -- alive, defeating the window's memory bound.  The severing is
+// performed while holding both the index lock and the chain view locks so it
+// can never race with a concurrent chain walk, and so upward walks terminate
+// at the window boundary instead of walking past the end of the materialized
+// index.
+//
+// The node at each window boundary height itself is retained as the severed
+// anchor so the chain views still resolve heights down to the boundary.
+//
+// This function is NOT safe for concurrent access and must be called with the
+// index lock held (for writes).
+func (bi *blockIndex) evictWindow() {
+	if !bi.windowEnabled() || !bi.ready {
+		return
+	}
+
+	chainBoundary := bi.windowBoundary(bi.tipHeight(bi.bestChainView))
+	headerBoundary := bi.windowBoundary(bi.tipHeight(bi.bestHeaderView))
+	if headerBoundary <= 0 {
+		return
+	}
+
+	// Grab the chain view locks so the eviction and pointer severing below
+	// cannot race with a concurrent chain walk.
+	if bi.bestChainView != nil {
+		bi.bestChainView.mtx.Lock()
+	}
+	if bi.bestHeaderView != nil {
+		bi.bestHeaderView.mtx.Lock()
+	}
+
+	// Remove every node strictly below the header window boundary from the
+	// index map, except nodes that are part of the best chain view.  The
+	// connected chain's trailing window is allowed to sit below the header
+	// window boundary during a header sync and must stay materialized.
+	if bi.bestChainView != nil {
+		for hash, node := range bi.index {
+			if node.height < headerBoundary && !bi.bestChainView.contains(node) {
+				delete(bi.index, hash)
+			}
+		}
+	} else {
+		for hash, node := range bi.index {
+			if node.height < headerBoundary {
+				delete(bi.index, hash)
+			}
+		}
+	}
+
+	// Sever the parent and ancestor pointers of any in-window node that
+	// still points below the boundary applicable to it.  This is done under
+	// the chain view locks so concurrent chain walks never observe a
+	// partially severed view, and the boundary nodes are covered even though
+	// they may not be reachable through either view (a side chain that has
+	// fallen out of the window).
+	for _, node := range bi.index {
+		bound := headerBoundary
+		if bi.bestChainView != nil && bi.bestChainView.contains(node) {
+			bound = chainBoundary
+		}
+		if node.parent != nil && node.parent.height < bound {
+			node.parent = nil
+		}
+		if node.ancestor != nil && node.ancestor.height < bound {
+			node.ancestor = nil
+		}
+	}
+
+	// Prune the chain views below their respective boundaries in lockstep so
+	// they no longer reference the evicted structs.
+	if bi.bestChainView != nil {
+		bi.bestChainView.pruneBelow(chainBoundary)
+	}
+	if bi.bestHeaderView != nil {
+		bi.bestHeaderView.pruneBelow(headerBoundary)
+	}
+
+	if bi.bestHeaderView != nil {
+		bi.bestHeaderView.mtx.Unlock()
+	}
+	if bi.bestChainView != nil {
+		bi.bestChainView.mtx.Unlock()
+	}
+}
+
 // NodeStatus provides concurrent-safe access to the status field of a node.
 //
 // This function is safe for concurrent access.
@@ -476,7 +679,13 @@ func (bi *blockIndex) InactiveTips(bestChain *chainView) []*blockNode {
 		found := bestChain.Contains(node)
 		if !found {
 			orphans[hash] = node
-			orphanParent[node.parent.hash] = node.parent
+			// A node may have a severed parent when it sits at the
+			// boundary of the in-memory header window.  Its true parent
+			// lives below the window and is handled by the caller's
+			// orphan resolution, so simply skip tracking it here.
+			if node.parent != nil {
+				orphanParent[node.parent.hash] = node.parent
+			}
 		}
 	}
 
@@ -500,6 +709,15 @@ func (bi *blockIndex) InactiveTips(bestChain *chainView) []*blockNode {
 
 // flushToDB writes all dirty block nodes to the database. If all writes
 // succeed, this clears the dirty set.
+//
+// Header-only nodes are written as well (including a hash -> height index
+// entry) so that a restart can resume the header sync from the last written
+// header instead of re-downloading every header from genesis.  This changes
+// the historical btcd behavior documented in the NOTE that was removed here:
+// older btcd versions assume a blockNode being present means the block data is
+// available as well.  That assumption is only relied upon by initChainState
+// when converting an old db without the best header state key, and the new
+// startup path never uses header-only block nodes as a source of block data.
 func (bi *blockIndex) flushToDB() error {
 	bi.Lock()
 	if len(bi.dirty) == 0 {
@@ -507,48 +725,39 @@ func (bi *blockIndex) flushToDB() error {
 		return nil
 	}
 
-	// Check if any dirty node actually needs to be written.  Header-only
-	// nodes are skipped for backwards compatibility (see NOTE below), so
-	// if every dirty node is header-only, we can avoid opening a write
-	// transaction entirely.  This matters during header sync where every
-	// ProcessBlockHeader call would otherwise open a no-op write txn.
-	needsWrite := false
-	for node := range bi.dirty {
-		if node.status.HaveData() {
-			needsWrite = true
-			break
-		}
-	}
-	if !needsWrite {
-		bi.dirty = make(map[*blockNode]struct{})
-		bi.Unlock()
-		return nil
-	}
-
 	err := bi.db.Update(func(dbTx database.Tx) error {
 		for node := range bi.dirty {
-			// NOTE: we specifically don't flush the block indexes that
-			// we don't have the data for backwards compatibility.
-			// While flushing would save us the work of re-downloading
-			// the block headers upon restart, if the user were to start
-			// up a btcd node with an older version, it would result in
-			// an unrecoverable error as older versions would consider a
-			// blockNode being present as having the block data as well.
-			if node.status.HaveHeader() &&
-				!node.status.HaveData() {
-				continue
-			}
 			err := dbStoreBlockNode(dbTx, node)
 			if err != nil {
 				return err
+			}
+			err = dbPutHashIndex(dbTx, &node.hash, node.height)
+			if err != nil {
+				return err
+			}
+		}
+
+		// Persist the best header state in the same transaction so the
+		// stored header tip is always consistent with the written block
+		// index rows.
+		if bi.bestHeaderNode != nil {
+			if tip := bi.bestHeaderNode(); tip != nil {
+				err := dbPutBestHeaderState(dbTx, &tip.hash, tip.height)
+				if err != nil {
+					return err
+				}
 			}
 		}
 		return nil
 	})
 
-	// If write was successful, clear the dirty set.
+	// If write was successful, clear the dirty set and evict the nodes
+	// that have fallen out of the in-memory header window.  Eviction is a
+	// no-op until the block index has been fully initialized and when the
+	// window is disabled.
 	if err == nil {
 		bi.dirty = make(map[*blockNode]struct{})
+		bi.evictWindow()
 	}
 
 	bi.Unlock()

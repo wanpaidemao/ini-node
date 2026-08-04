@@ -12,6 +12,12 @@ import (
 	"github.com/btcsuite/btcd/wire/v2"
 )
 
+// headerFlushBatchSize is the number of headers to accumulate in the dirty set
+// before the block index is flushed to the database during header sync.
+// Batching bounds the amount of work re-downloaded after a restart to at most
+// this many headers.
+const headerFlushBatchSize = 10000
+
 // maybeAcceptBlock potentially accepts a block into the block chain and, if
 // accepted, returns whether or not it is on the main chain.  It performs
 // several validation checks which depend on its position within the block chain
@@ -186,11 +192,18 @@ func (b *BlockChain) maybeAcceptBlockHeader(header *wire.BlockHeader,
 		b.index.AddNode(node)
 	}
 
-	// Flush the block index to database at this point since we added the
-	// node.
-	err = b.index.flushToDB()
-	if err != nil {
-		return false, err
+	// Flush the block index to the database periodically rather than on
+	// every header.  Header sync can process thousands of headers per
+	// second, so a write transaction per header would dominate the sync
+	// time.  Batching bounds the headers re-downloaded after a restart to
+	// headerFlushBatchSize.
+	b.headerFlushCount++
+	if b.headerFlushCount >= headerFlushBatchSize {
+		b.headerFlushCount = 0
+		err = b.index.flushToDB()
+		if err != nil {
+			return false, err
+		}
 	}
 
 	// Check if the header extends the best header tip.
@@ -208,16 +221,22 @@ func (b *BlockChain) maybeAcceptBlockHeader(header *wire.BlockHeader,
 	// We're extending (or creating) a side chain, but the cumulative
 	// work for this new side chain is not enough to make it the new chain.
 	if node.workSum.Cmp(b.bestHeader.Tip().workSum) <= 0 {
-		// Log information about how the header is forking the chain.
+		// Log information about how the header is forking the chain.  The
+		// fork may be unresolvable (nil) when it falls below the in-memory
+		// header window boundary, in which case just log the header itself.
 		fork := b.bestHeader.FindFork(node)
-		if fork.hash.IsEqual(parentHash) {
+		if fork != nil && fork.hash.IsEqual(parentHash) {
 			log.Infof("FORK: BlockHeader %v(%v) forks the chain at block %v(%v) "+
 				"but did not have enough work to be the "+
 				"main chain", node.hash, node.height, fork.hash, fork.height)
-		} else {
+		} else if fork != nil {
 			log.Infof("EXTEND FORK: BlockHeader %v(%v) extends a side chain "+
 				"which forks the chain at block %v(%v)",
 				node.hash, node.height, fork.hash, fork.height)
+		} else {
+			log.Infof("EXTEND FORK: BlockHeader %v(%v) forks the chain below "+
+				"the in-memory header window and did not have enough work "+
+				"to be the main chain", node.hash, node.height)
 		}
 
 		return false, nil

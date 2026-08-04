@@ -39,6 +39,7 @@ import (
 	"github.com/btcsuite/btcd/mining"
 	"github.com/btcsuite/btcd/mining/cpuminer"
 	"github.com/btcsuite/btcd/peer"
+	"github.com/btcsuite/btcd/sugarindex"
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/websocket"
@@ -187,6 +188,14 @@ var rpcHandlersBeforeInit = map[string]commandHandler{
 	"version":                handleVersion,
 	"testmempoolaccept":      handleTestMempoolAccept,
 	"gettxspendingprevout":   handleGetTxSpendingPrevOut,
+	"getaddressbalance":      handleGetAddressBalance,
+	"getaddressesbalance":     handleGetAddressesBalance,
+	"getaddressutxos":        handleGetAddressUtxos,
+	"getaddressdeltas":       handleGetAddressDeltas,
+	"getaddresstxids":        handleGetAddressTxids,
+	"getaddressmempool":      handleGetAddressMempool,
+	"getblockhashes":         handleGetBlockHashes,
+	"getspentinfo":           handleGetSpentInfo,
 }
 
 // list of commands that we recognize, but for which btcd has no support because
@@ -4847,6 +4856,11 @@ type rpcserverConfig struct {
 	TxIndex   *indexers.TxIndex
 	AddrIndex *indexers.AddrIndex
 	CfIndex   *indexers.CfIndex
+
+	// SugarIndex is the umami-byte-compatible address/spent/timestamp index
+	// backing the getaddress* family of RPCs.  It may be nil when the
+	// --sugarindex flag is not set.
+	SugarIndex *sugarindex.Manager
 
 	// The fee estimator keeps track of how long transactions are left in
 	// the mempool before they are mined into blocks.

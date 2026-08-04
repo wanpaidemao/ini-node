@@ -160,6 +160,53 @@ func (c *chainView) SetTip(node *blockNode) {
 	c.mtx.Unlock()
 }
 
+// pruneBelow drops every node strictly below the provided height from the
+// chain view and severs the parent and ancestor pointers of the node at the
+// boundary height so upward walks terminate there instead of walking past the
+// end of the materialized window.  Nodes below the boundary become
+// unreachable from the view and can be garbage collected once they are also
+// removed from the block index.
+//
+// This only differs from the exported version in that it is up to the caller
+// to ensure the lock is held.
+//
+// This function MUST be called with the view mutex locked (for writes).
+func (c *chainView) pruneBelow(height int32) {
+	if height < 0 {
+		return
+	}
+	if height > int32(len(c.nodes)) {
+		height = int32(len(c.nodes))
+	}
+
+	// Nil out the slots below the boundary so the view no longer references
+	// the evicted nodes.
+	for i := int32(0); i < height; i++ {
+		c.nodes[i] = nil
+	}
+
+	// Sever the parent and ancestor of the node that now sits at the window
+	// boundary so upward walks terminate there and so the evicted prefix of
+	// the chain is not kept alive through those back-references.
+	if height < int32(len(c.nodes)) {
+		if node := c.nodes[height]; node != nil {
+			node.parent = nil
+			node.ancestor = nil
+		}
+	}
+}
+
+// PruneBelow drops every node strictly below the provided height from the
+// chain view and severs the back-references of the boundary node.  This is
+// used to keep the view consistent with an in-memory header window.
+//
+// This function is safe for concurrent access.
+func (c *chainView) PruneBelow(height int32) {
+	c.mtx.Lock()
+	c.pruneBelow(height)
+	c.mtx.Unlock()
+}
+
 // height returns the height of the tip of the chain view.  It will return -1 if
 // there is no tip (which only happens if the chain view has not been
 // initialized).  This only differs from the exported version in that it is up

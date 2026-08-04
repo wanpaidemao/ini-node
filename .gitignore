@@ -6,6 +6,9 @@ btcd.db
 *-shm
 *-wal
 
+# Test databases created by blockchain tests
+blockchain/testdbs/
+
 # Log files
 *.log
 
