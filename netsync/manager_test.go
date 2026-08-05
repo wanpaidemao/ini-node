@@ -1571,3 +1571,130 @@ func TestParallelHeaderSyncAddPeer(t *testing.T) {
 	}
 	require.Len(t, hs.peers, maxHeaderSyncPeers)
 }
+
+// containsPeer reports whether the given peer is present in the slice.
+func containsPeer(slice []*peer.Peer, target *peer.Peer) bool {
+	for _, p := range slice {
+		if p == target {
+			return true
+		}
+	}
+	return false
+}
+
+// TestParallelBlockDownloadDisjoint verifies that the parallel block download
+// hands disjoint slices of the header chain to multiple participating peers
+// via the globally deduplicated requestedBlocks map.  A small request size is
+// simulated by pre-claiming a front slice on one peer so blkDownload tops up
+// the other peer with the disjoint tail.
+func TestParallelBlockDownloadDisjoint(t *testing.T) {
+	params := chaincfg.RegressionNetParams
+	params.Checkpoints = nil
+
+	sm, tearDown := makeMockSyncManager(t, &params)
+	defer tearDown()
+
+	// Install headers for 20 blocks while the block chain stays at genesis.
+	// Headers are applied with BFNoPoWCheck to mirror the IBD header path so
+	// the test does not depend on generating PoW-valid blocks.
+	const numBlocks = 20
+	for _, hdr := range makeTestHeaderChain(t, &params, numBlocks) {
+		_, err := sm.chain.ProcessBlockHeader(hdr, blockchain.BFNoPoWCheck, false)
+		require.NoError(t, err)
+	}
+	_, bestHeaderHeight := sm.chain.BestHeader()
+	require.Equal(t, int32(numBlocks), bestHeaderHeight)
+
+	hashAt := func(h int32) chainhash.Hash {
+		hash, err := sm.chain.HeaderHashByHeight(h)
+		require.NoError(t, err)
+		return *hash
+	}
+
+	// Register two participating peers and start a parallel block download.
+	peers := newHeaderSyncPeers(t, sm, 2, numBlocks)
+	p0, p1 := peers[0], peers[1]
+	sm.syncPeer = p0
+	sm.ibdMode = true
+
+	// Simulate p0 already being in-flight with the first 11 blocks (at or
+	// above the minInFlightBlocks floor) so blkDownload tops up the other
+	// peer instead of p0.
+	state0 := sm.peerStates[p0]
+	for h := int32(1); h <= 11; h++ {
+		hash := hashAt(h)
+		sm.requestedBlocks[hash] = struct{}{}
+		state0.requestedBlocks[hash] = struct{}{}
+	}
+	sm.blockSync = []*peer.Peer{p0, p1}
+
+	sm.blkDownload()
+
+	// p1 must have claimed the remaining, disjoint blocks [12..20].
+	state1 := sm.peerStates[p1]
+	require.Equal(t, 9, len(state1.requestedBlocks))
+	for h := int32(12); h <= numBlocks; h++ {
+		hash := hashAt(h)
+		require.Contains(t, state1.requestedBlocks, hash)
+		require.Contains(t, sm.requestedBlocks, hash)
+	}
+	// No overlap: p0 still owns its front slice.
+	for h := int32(1); h <= 11; h++ {
+		require.Contains(t, state0.requestedBlocks, hashAt(h))
+		require.NotContains(t, state1.requestedBlocks, hashAt(h))
+	}
+}
+
+// TestParallelBlockDownloadDropPeer verifies that when a participating peer
+// disconnects mid-download it is removed from blockSync and its in-flight
+// blocks are freed back to the global requestedBlocks pool, so a remaining
+// peer re-claims them on the next top-up.
+func TestParallelBlockDownloadDropPeer(t *testing.T) {
+	params := chaincfg.RegressionNetParams
+	params.Checkpoints = nil
+
+	sm, tearDown := makeMockSyncManager(t, &params)
+	defer tearDown()
+
+	const numBlocks = 20
+	for _, hdr := range makeTestHeaderChain(t, &params, numBlocks) {
+		_, err := sm.chain.ProcessBlockHeader(hdr, blockchain.BFNoPoWCheck, false)
+		require.NoError(t, err)
+	}
+
+	hashAt := func(h int32) chainhash.Hash {
+		hash, err := sm.chain.HeaderHashByHeight(h)
+		require.NoError(t, err)
+		return *hash
+	}
+
+	peers := newHeaderSyncPeers(t, sm, 2, numBlocks)
+	p0, p1 := peers[0], peers[1]
+
+	// p0 is a participating (non-sync) peer holding the front 11 blocks; p1
+	// is the designated sync peer so dropping p0 does not restart startSync.
+	sm.syncPeer = p1
+	sm.ibdMode = true
+	state0 := sm.peerStates[p0]
+	for h := int32(1); h <= 11; h++ {
+		hash := hashAt(h)
+		sm.requestedBlocks[hash] = struct{}{}
+		state0.requestedBlocks[hash] = struct{}{}
+	}
+	sm.blockSync = []*peer.Peer{p0, p1}
+
+	// p0 disconnects: drop it from blockSync and free its in-flight blocks.
+	sm.handleDonePeerMsg(p0)
+
+	require.False(t, containsPeer(sm.blockSync, p0))
+	require.True(t, containsPeer(sm.blockSync, p1))
+	require.Empty(t, sm.requestedBlocks,
+		"dropped peer's blocks should be freed back to the global pool")
+
+	// Topping up re-claims all the recently freed blocks from the remaining
+	// peer.
+	sm.blkDownload()
+	state1 := sm.peerStates[p1]
+	require.Len(t, state1.requestedBlocks, numBlocks)
+	require.Len(t, sm.requestedBlocks, numBlocks)
+}

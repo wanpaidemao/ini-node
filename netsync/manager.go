@@ -6,6 +6,7 @@ package netsync
 
 import (
 	"math/rand"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -242,6 +243,13 @@ type SyncManager struct {
 	// the blockHandler goroutine.
 	headerSync *headerSyncState
 
+	// blockSync is the set of peers taking part in a parallel initial block
+	// download.  Each participating peer is handed a disjoint slice of the
+	// header chain (via the globally deduplicated requestedBlocks map) and
+	// tops itself back up as it drains.  It is only touched from the
+	// blockHandler goroutine.
+	blockSync []*peerpkg.Peer
+
 	// The following fields are used for the initial block download mode.
 	ibdMode bool
 
@@ -309,6 +317,18 @@ func (sm *SyncManager) isInIBDMode() bool {
 	return true
 }
 
+// peerHost returns the host portion of the peer's address.  It is used to keep
+// the parallel header download from treating multiple connections to the same
+// remote node as distinct peers (btcd can transiently dial the same scarce
+// address several times when the network has very few reachable nodes).
+func peerHost(p *peerpkg.Peer) string {
+	host, _, err := net.SplitHostPort(p.Addr())
+	if err != nil {
+		return p.Addr()
+	}
+	return host
+}
+
 // fetchHeaders starts the initial header download across several peers in
 // parallel.  Each participating peer is handed a disjoint, contiguous slice of
 // the header chain, and the slices are applied in order once they arrive.  The
@@ -321,12 +341,31 @@ func (sm *SyncManager) fetchHeaders() {
 		return
 	}
 
-	// Randomize the candidate order so we don't always favor the same peers
-	// and cap the number of peers that take part in the parallel download.
+	// Randomize the candidate order so we don't always favor the same peers.
 	shuffled := make([]*peerpkg.Peer, len(higherPeers))
 	for i, j := range rand.Perm(len(higherPeers)) {
 		shuffled[i] = higherPeers[j]
 	}
+
+	// Deduplicate by host so duplicate connections to the same remote node
+	// do not each consume a slice of the parallel download, then cap the
+	// number of peers that take part in it.  Peers with an empty address
+	// (test mocks) are always kept.
+	seen := make(map[string]struct{}, len(shuffled))
+	uniq := shuffled[:0]
+	for _, p := range shuffled {
+		host := peerHost(p)
+		if host == "" {
+			uniq = append(uniq, p)
+			continue
+		}
+		if _, ok := seen[host]; ok {
+			continue
+		}
+		seen[host] = struct{}{}
+		uniq = append(uniq, p)
+	}
+	shuffled = uniq
 	if len(shuffled) > maxHeaderSyncPeers {
 		shuffled = shuffled[:maxHeaderSyncPeers]
 	}
@@ -562,7 +601,15 @@ func (sm *SyncManager) startSync() {
 
 	log.Infof("Syncing to block height %d from peer %v",
 		sm.syncPeer.LastBlock(), sm.syncPeer.Addr())
-	sm.fetchHeaderBlocks(sm.syncPeer)
+
+	// Kick off a parallel block download using all of the higher peers
+	// (deduplicated by host and capped by blockSyncAddPeer).  Each accepted
+	// peer is immediately handed a disjoint slice of blocks to download.
+	sm.blockSync = make([]*peerpkg.Peer, 0, len(higherPeers))
+	sm.blockSyncAddPeer(bestPeer)
+	for _, p := range higherPeers {
+		sm.blockSyncAddPeer(p)
+	}
 }
 
 // isSyncCandidate returns whether or not the peer is a candidate to consider
@@ -658,6 +705,12 @@ func (sm *SyncManager) handleNewPeerMsg(peer *peerpkg.Peer) {
 	if isSyncCandidate && sm.headerSync != nil {
 		sm.headerSyncAddPeer(peer)
 	}
+
+	// Similarly, if a parallel initial block download is already running, fold
+	// the new peer in so additional peers can serve block slices.
+	if isSyncCandidate && sm.ibdMode && sm.blockSync != nil {
+		sm.blockSyncAddPeer(peer)
+	}
 }
 
 // headerSyncAddPeer folds a newly-connected sync candidate into an in-progress
@@ -677,12 +730,16 @@ func (sm *SyncManager) headerSyncAddPeer(peer *peerpkg.Peer) {
 		return
 	}
 
-	// Don't exceed the parallel-download limit or admit a peer twice.
+	// Don't exceed the parallel-download limit or admit the same peer twice.
 	if len(hs.peers) >= maxHeaderSyncPeers {
 		return
 	}
+	host := peerHost(peer)
 	for _, p := range hs.peers {
 		if p == peer {
+			return
+		}
+		if host != "" && peerHost(p) == host {
 			return
 		}
 	}
@@ -697,6 +754,53 @@ func (sm *SyncManager) headerSyncAddPeer(peer *peerpkg.Peer) {
 
 	log.Infof("Added peer %v to the parallel header download (%d peers active)",
 		peer.Addr(), len(hs.peers))
+}
+
+// blockSyncAddPeer folds a newly-connected sync candidate into an in-progress
+// parallel initial block download and immediately dispatches an initial block
+// request to it so it starts contributing right away.  The set of participating
+// peers grows toward maxHeaderSyncPeers as peers connect.
+func (sm *SyncManager) blockSyncAddPeer(peer *peerpkg.Peer) {
+	if sm.blockSync == nil || peer == nil {
+		return
+	}
+
+	if len(sm.blockSync) >= maxHeaderSyncPeers {
+		return
+	}
+	host := peerHost(peer)
+	for _, p := range sm.blockSync {
+		if p == peer {
+			return
+		}
+		if host != "" && peerHost(p) == host {
+			return
+		}
+	}
+
+	sm.blockSync = append(sm.blockSync, peer)
+	sm.fetchHeaderBlocks(peer)
+
+	log.Infof("Added peer %v to the parallel block download (%d peers active)",
+		peer.Addr(), len(sm.blockSync))
+}
+
+// blkDownload tops up every participating block-download peer that has drained
+// below the minimum in-flight threshold.  Because buildBlockRequest only hands
+// out blocks that are not already claimed in the globally deduplicated
+// requestedBlocks map, concurrent calls across peers automatically partition
+// the header chain into disjoint slices with no overlap.
+func (sm *SyncManager) blkDownload() {
+	for _, p := range sm.blockSync {
+		if p == nil {
+			continue
+		}
+		state := sm.peerStates[p]
+		if state == nil || len(state.requestedBlocks) >= minInFlightBlocks {
+			continue
+		}
+		sm.fetchHeaderBlocks(p)
+	}
 }
 
 // handleStallSample will switch to a new sync peer if the current one has
@@ -781,6 +885,19 @@ func (sm *SyncManager) handleDonePeerMsg(peer *peerpkg.Peer) {
 	// can be re-issued to a remaining peer.
 	if sm.headerSync != nil {
 		sm.dropHeaderPeer(peer)
+	}
+
+	// If the peer was taking part in a parallel block download, drop it from
+	// the participating set.  clearRequestedState above already freed all of
+	// its in-flight blocks back to the global requestedBlocks map, so another
+	// peer will re-claim and re-request them on the next top-up.
+	if sm.blockSync != nil {
+		for i, p := range sm.blockSync {
+			if p == peer {
+				sm.blockSync = append(sm.blockSync[:i], sm.blockSync[i+1:]...)
+				break
+			}
+		}
 	}
 
 	if peer == sm.syncPeer {
@@ -1061,7 +1178,17 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 			peer.PushGetBlocksMsg(locator, orphanRoot)
 		}
 	} else {
-		if peer == sm.syncPeer {
+		// Any participating block-download peer (or the sync peer outside
+		// of it) counts as progress so the stall handler doesn't mistake a
+		// healthy parallel download for a stalled sync peer.
+		if sm.ibdMode && sm.blockSync != nil {
+			for _, p := range sm.blockSync {
+				if p == peer {
+					sm.lastProgressTime = time.Now()
+					break
+				}
+			}
+		} else if peer == sm.syncPeer {
 			sm.lastProgressTime = time.Now()
 		}
 
@@ -1118,7 +1245,9 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 	_, lastHeight := sm.chain.BestHeader()
 	if bmsg.block.Height() < lastHeight &&
 		len(state.requestedBlocks) < minInFlightBlocks {
-		sm.fetchHeaderBlocks(sm.syncPeer)
+		// Top up the delivering peer and any other drained peer in the
+		// parallel block download.
+		sm.blkDownload()
 		return
 	}
 
@@ -1429,12 +1558,31 @@ func (sm *SyncManager) finishHeaderSync() {
 	log.Infof("downloaded headers to %v(%v) in %d parallel "+
 		"slices -- now fetching blocks", bestHash, bestHeight, len(hs.peers))
 
-	// Hand the block download off to the sync peer.  If we no longer have a
-	// sync peer the normal new-peer/stall handling will restart the sync.
+	// Hand the block download off to all of the peers that served headers so
+	// the initial block download is also performed in parallel.  buildBlockRequest
+	// partitions the header chain into disjoint slices across the peers via the
+	// globally deduplicated requestedBlocks map.  If we end up with no peers the
+	// normal new-peer/stall handling will restart the sync.
 	sm.ibdMode = true
-	if sm.syncPeer != nil {
-		sm.fetchHeaderBlocks(sm.syncPeer)
+	sm.blockSync = hs.peers
+	if len(sm.blockSync) > maxHeaderSyncPeers {
+		sm.blockSync = sm.blockSync[:maxHeaderSyncPeers]
 	}
+	if len(sm.blockSync) == 0 {
+		log.Infof("No peers remaining for parallel block download")
+		return
+	}
+
+	// Use the first participating peer as the sync peer so stall handling and
+	// progress tracking keep working, then dispatch an initial request to every
+	// participating peer at once.
+	sm.syncPeer = sm.blockSync[0]
+	sm.lastProgressTime = time.Now()
+	for _, p := range sm.blockSync {
+		sm.fetchHeaderBlocks(p)
+	}
+	log.Infof("Starting parallel block download from %d peers",
+		len(sm.blockSync))
 }
 
 // dropHeaderPeer removes a peer from an in-progress parallel header download,
