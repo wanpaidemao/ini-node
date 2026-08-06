@@ -1,12 +1,8 @@
 package netsync
 
 import (
-	"bufio"
-	"bytes"
-	"encoding/hex"
 	"fmt"
 	"math"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -102,35 +98,6 @@ func chainSetup(t *testing.T, params *chaincfg.Params) (
 	return chain, teardown, nil
 }
 
-// loadHeaders loads headers from mainnet from 1 to 11.
-func loadHeaders(t *testing.T) []*wire.BlockHeader {
-	testFile := "blockheaders-mainnet-1-11.txt"
-	filename := filepath.Join("testdata/", testFile)
-
-	file, err := os.Open(filename)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	headers := make([]*wire.BlockHeader, 0, 10)
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := scanner.Text()
-		b, err := hex.DecodeString(line)
-		if err != nil {
-			t.Fatalf("failed to read block headers from file %v", testFile)
-		}
-
-		r := bytes.NewReader(b)
-		header := new(wire.BlockHeader)
-		header.Deserialize(r)
-
-		headers = append(headers, header)
-	}
-
-	return headers
-}
-
 func makeMockSyncManager(t *testing.T,
 	params *chaincfg.Params) (*SyncManager, func()) {
 
@@ -150,18 +117,17 @@ func makeMockSyncManager(t *testing.T,
 }
 
 func TestCheckHeadersList(t *testing.T) {
-	// Set params to mainnet with a checkpoint at block 11.
-	params := chaincfg.MainNetParams
+	// Build a dynamically-generated header chain with a checkpoint at block
+	// 11.  The static mainnet test data no longer matches the sugarchain
+	// mainnet genesis, so the chain is generated instead.
+	params := chaincfg.RegressionNetParams
+	headers := makeTestHeaderChain(t, &params, 11)
 	checkpointHeight := int32(11)
-	checkpointHash, err := chainhash.NewHashFromStr(
-		"0000000097be56d606cdd9c54b04d4747e957d3608abe69198c661f2add73073")
-	if err != nil {
-		t.Fatal(err)
-	}
+	checkpointHash := headers[10].BlockHash()
 	params.Checkpoints = []chaincfg.Checkpoint{
 		{
 			Height: checkpointHeight,
-			Hash:   checkpointHash,
+			Hash:   &checkpointHash,
 		},
 	}
 
@@ -169,11 +135,11 @@ func TestCheckHeadersList(t *testing.T) {
 	sm, tearDown := makeMockSyncManager(t, &params)
 	defer tearDown()
 
-	// Setup SyncManager with headers processed.
-	headers := loadHeaders(t)
+	// Setup SyncManager with headers processed.  Headers are applied with
+	// BFNoPoWCheck to mirror the IBD header path.
 	for _, header := range headers {
 		isMainChain, err := sm.chain.ProcessBlockHeader(
-			header, blockchain.BFNone, false)
+			header, blockchain.BFNoPoWCheck, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -185,41 +151,39 @@ func TestCheckHeadersList(t *testing.T) {
 	}
 
 	tests := []struct {
-		hash              string
+		hash              chainhash.Hash
 		isCheckpointBlock bool
 		behaviorFlags     blockchain.BehaviorFlags
 	}{
 		{
-			hash:              chaincfg.MainNetParams.GenesisHash.String(),
+			// Genesis.
+			hash:              *params.GenesisHash,
 			isCheckpointBlock: false,
 			behaviorFlags:     blockchain.BFFastAdd,
 		},
 		{
 			// Block 10.
-			hash:              "000000002c05cc2e78923c34df87fd108b22221ac6076c18f3ade378a4d915e9",
+			hash:              headers[9].BlockHash(),
 			isCheckpointBlock: false,
 			behaviorFlags:     blockchain.BFFastAdd,
 		},
 		{
 			// Block 11.
-			hash:              "0000000097be56d606cdd9c54b04d4747e957d3608abe69198c661f2add73073",
+			hash:              headers[10].BlockHash(),
 			isCheckpointBlock: true,
 			behaviorFlags:     blockchain.BFFastAdd,
 		},
 		{
-			// Block 12.
-			hash:              "0000000027c2488e2510d1acf4369787784fa20ee084c258b58d9fbd43802b5e",
+			// Block 12 -- never processed, so checkHeadersList must fall
+			// through to false and BFNone.
+			hash:              makeTestHeaderChain(t, &params, 12)[11].BlockHash(),
 			isCheckpointBlock: false,
 			behaviorFlags:     blockchain.BFNone,
 		},
 	}
 
 	for _, test := range tests {
-		hash, err := chainhash.NewHashFromStr(test.hash)
-		if err != nil {
-			t.Errorf("NewHashFromStr: %v", err)
-			continue
-		}
+		hash := &test.hash
 
 		// Make sure that when the ibd mode is off, we always get
 		// false and BFNone.
@@ -366,17 +330,20 @@ func TestBuildBlockRequestSkipsInflightBlocks(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			params := chaincfg.MainNetParams
+			params := chaincfg.RegressionNetParams
 			params.Checkpoints = nil
 			sm, tearDown := makeMockSyncManager(t, &params)
 			defer tearDown()
 
 			// Process headers 1-11 so the header chain is
-			// ahead of the block chain.
-			headers := loadHeaders(t)
+			// ahead of the block chain.  Headers are generated from the
+			// regtest genesis (the static mainnet header file no longer
+			// matches the sugarchain mainnet genesis) and applied with
+			// BFNoPoWCheck to mirror the IBD header path.
+			headers := makeTestHeaderChain(t, &params, 11)
 			for _, header := range headers {
 				_, err := sm.chain.ProcessBlockHeader(
-					header, blockchain.BFNone, false)
+					header, blockchain.BFNoPoWCheck, false)
 				require.NoError(t, err)
 			}
 
