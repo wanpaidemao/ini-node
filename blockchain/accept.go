@@ -243,20 +243,6 @@ func (b *BlockChain) maybeAcceptBlockHeader(header *wire.BlockHeader,
 		b.index.AddNode(node)
 	}
 
-	// Flush the block index to the database periodically rather than on
-	// every header.  Header sync can process thousands of headers per
-	// second, so a write transaction per header would dominate the sync
-	// time.  Batching bounds the headers re-downloaded after a restart to
-	// headerFlushBatchSize.
-	b.headerFlushCount++
-	if b.headerFlushCount >= headerFlushBatchSize {
-		b.headerFlushCount = 0
-		err = b.index.flushToDB()
-		if err != nil {
-			return false, err
-		}
-	}
-
 	// Check if the header extends the best header tip.
 	isMainChain := false
 	parentHash := &header.PrevBlock
@@ -266,12 +252,9 @@ func (b *BlockChain) maybeAcceptBlockHeader(header *wire.BlockHeader,
 		// This header is now the end of the best headers.
 		b.bestHeader.SetTip(node)
 		isMainChain = true
-		return isMainChain, nil
-	}
-
-	// We're extending (or creating) a side chain, but the cumulative
-	// work for this new side chain is not enough to make it the new chain.
-	if node.workSum.Cmp(b.bestHeader.Tip().workSum) <= 0 {
+	} else if node.workSum.Cmp(b.bestHeader.Tip().workSum) <= 0 {
+		// We're extending (or creating) a side chain, but the cumulative
+		// work for this new side chain is not enough to make it the new chain.
 		// Log information about how the header is forking the chain.  The
 		// fork may be unresolvable (nil) when it falls below the in-memory
 		// header window boundary, in which case just log the header itself.
@@ -289,18 +272,36 @@ func (b *BlockChain) maybeAcceptBlockHeader(header *wire.BlockHeader,
 				"the in-memory header window and did not have enough work "+
 				"to be the main chain", node.hash, node.height)
 		}
+	} else {
+		prevTip := b.bestHeader.Tip()
+		log.Infof("NEW BEST HEADER CHAIN: BlockHeader %v(%v) is now a longer "+
+			"PoW chain than the previous header tip of %v(%v).",
+			node.hash, node.height,
+			prevTip.hash, prevTip.height)
 
-		return false, nil
+		b.bestHeader.SetTip(node)
+		isMainChain = true
 	}
 
-	prevTip := b.bestHeader.Tip()
-	log.Infof("NEW BEST HEADER CHAIN: BlockHeader %v(%v) is now a longer "+
-		"PoW chain than the previous header tip of %v(%v).",
-		node.hash, node.height,
-		prevTip.hash, prevTip.height)
-
-	b.bestHeader.SetTip(node)
-	isMainChain = true
+	// Flush the block index to the database periodically rather than on
+	// every header.  Header sync can process thousands of headers per
+	// second, so a write transaction per header would dominate the sync
+	// time.  Batching bounds the headers re-downloaded after a restart to
+	// headerFlushBatchSize.
+	//
+	// The flush runs after bestHeader.SetTip so the header that triggers a
+	// flush is already part of the best header chain when the height index
+	// rows are written; otherwise its height entry would be skipped (it is
+	// guarded by bestHeaderView membership) and the height would never
+	// become cold-readable, stalling the block downloader at that height.
+	b.headerFlushCount++
+	if b.headerFlushCount >= headerFlushBatchSize {
+		b.headerFlushCount = 0
+		err = b.index.flushToDB()
+		if err != nil {
+			return false, err
+		}
+	}
 
 	return isMainChain, nil
 }

@@ -10,7 +10,31 @@ import (
 	_ "github.com/btcsuite/btcd/database/ffldb"
 )
 
+const (
+	chainStateBucketName     = "chainstate"
+	headerChainStateBucket   = "headerchainstate"
+	blockIndexBucketName     = "blockheaderidx"
+	heightIndexBucketName    = "heightidx"
+)
+
+// stateHeight parses the height stored in a serialized best-chain/best-header
+// state value.  Both formats store the hash first (32 bytes) followed by the
+// height as a little-endian uint32 at offset 32.
+func stateHeight(state []byte) int32 {
+	if len(state) < 36 {
+		return -1
+	}
+	return int32(binary.LittleEndian.Uint32(state[32:36]))
+}
+
 func main() {
+	repair := false
+	for _, a := range os.Args[1:] {
+		if a == "-repair" {
+			repair = true
+		}
+	}
+
 	dbPath := `C:\Users\adest\AppData\Local\btcd\sugarmainnet\blocks_ffldb`
 	db, err := database.Open("ffldb", dbPath, chaincfg.MainNetParams.Net)
 	if err != nil {
@@ -19,96 +43,123 @@ func main() {
 	}
 	defer db.Close()
 
+	var (
+		headerHeight int32
+		missing      []uint32
+	)
+
 	err = db.View(func(dbTx database.Tx) error {
 		md := dbTx.Metadata()
 
-		chainRaw := md.Get([]byte("chainstate"))
-		fmt.Printf("chainstate (%d bytes): %x\n", len(chainRaw), chainRaw)
-		if len(chainRaw) >= 4+32+32 {
-			h := binary.LittleEndian.Uint32(chainRaw[0:4])
-			fmt.Printf("  best chain height: %d\n", h)
-		}
+		chainRaw := md.Get([]byte(chainStateBucketName))
+		fmt.Printf("chainstate best height: %d\n", stateHeight(chainRaw))
 
-		hs := md.Get([]byte("headerchainstate"))
-		fmt.Printf("headerchainstate (%d bytes): %x\n", len(hs), hs)
-		if len(hs) >= 4+32+32 {
-			hh := binary.LittleEndian.Uint32(hs[0:4])
-			fmt.Printf("  best header height: %d\n", hh)
-		}
+		hs := md.Get([]byte(headerChainStateBucket))
+		headerHeight = stateHeight(hs)
+		fmt.Printf("headerchainstate best header height: %d\n", headerHeight)
 
-		bds := md.Get([]byte("blockdownloadstate"))
-		fmt.Printf("blockdownloadstate (%d bytes): %x\n", len(bds), bds)
-
-		bucket := md.Bucket([]byte("blockheaderidx"))
-		if bucket == nil {
+		bi := md.Bucket([]byte(blockIndexBucketName))
+		if bi == nil {
 			fmt.Println("blockheaderidx bucket: MISSING")
 			return nil
 		}
-		count := 0
-		c := bucket.Cursor()
-		for ok := c.First(); ok; ok = c.Next() {
-			count++
+		rowCount := 0
+		bc := bi.Cursor()
+		for ok := bc.First(); ok; ok = bc.Next() {
+			rowCount++
 		}
-		fmt.Printf("blockheaderidx rows: %d\n", count)
+		fmt.Printf("blockheaderidx rows: %d\n", rowCount)
 
-		// Sample a few height->hash entries if the height index bucket exists.
-		hb := md.Bucket([]byte("heightidx"))
+		hb := md.Bucket([]byte(heightIndexBucketName))
 		if hb == nil {
 			fmt.Println("heightidx bucket: MISSING")
-		} else {
-			for _, h := range []uint32{0, 1, 10000, 100000, 1000000, 20000000, 43000000, 43709998, 43710000} {
-				var key [4]byte
-				binary.LittleEndian.PutUint32(key[:], h)
-				v := hb.Get(key[:])
-				fmt.Printf("  height %d -> %x\n", h, v)
-			}
+			return nil
 		}
 
-		hi := md.Bucket([]byte("hashidx"))
-		if hi != nil {
-			c := hi.Cursor()
-			n := 0
-			for ok := c.First(); ok; ok = c.Next() {
-				n++
-			}
-			fmt.Printf("hashidx entries: %d\n", n)
-		} else {
-			fmt.Println("hashidx bucket: MISSING")
-		}
-
-		he := md.Bucket([]byte("heightidx"))
-		if he != nil {
-			c := he.Cursor()
-			n := 0
-			firstH, lastH := uint32(0xffffffff), uint32(0)
-			var firstKey, lastKey [4]byte
-			for ok := c.First(); ok; ok = c.Next() {
-				binary.LittleEndian.PutUint32(firstKey[:], firstH)
-				k := c.Key()
-				if len(k) == 4 {
-					h := binary.LittleEndian.Uint32(k)
-					if h < firstH {
-						firstH = h
-						copy(firstKey[:], k)
-					}
-					if h > lastH {
-						lastH = h
-						copy(lastKey[:], k)
-					}
+		// Detect gaps: mark every height present in the height index and
+		// report those missing in [0, headerHeight].
+		present := make([]bool, headerHeight+1)
+		c := hb.Cursor()
+		for ok := c.First(); ok; ok = c.Next() {
+			k := c.Key()
+			if len(k) == 4 {
+				h := binary.LittleEndian.Uint32(k)
+				if int32(h) <= headerHeight {
+					present[h] = true
 				}
-				n++
 			}
-			fmt.Printf("heightidx entries: %d (first=%d last=%d)\n", n, firstH, lastH)
-			_ = lastKey
-		} else {
-			fmt.Println("heightidx bucket: MISSING")
 		}
-
-		// Fetch a raw block by hash to confirm block storage works.
+		for h := int32(0); h <= headerHeight; h++ {
+			if !present[h] {
+				missing = append(missing, uint32(h))
+			}
+		}
+		fmt.Printf("heightidx entries: %d; missing heights: %d\n",
+			len(present)-len(missing), len(missing))
+		for i, h := range missing {
+			if i < 12 {
+				fmt.Printf("  missing height %d\n", h)
+			}
+		}
+		if len(missing) > 12 {
+			fmt.Printf("  ... (%d more)\n", len(missing)-12)
+		}
 		return nil
 	})
 	if err != nil {
 		fmt.Println("VIEW ERR:", err)
 		os.Exit(1)
 	}
+
+	if !repair {
+		return
+	}
+
+	missingSet := make(map[uint32]struct{}, len(missing))
+	for _, h := range missing {
+		missingSet[h] = struct{}{}
+	}
+
+	filled := 0
+	seen := 0
+	err = db.Update(func(dbTx database.Tx) error {
+		md := dbTx.Metadata()
+		hi := md.Bucket([]byte(heightIndexBucketName))
+		bi := md.Bucket([]byte(blockIndexBucketName))
+
+		bc := bi.Cursor()
+		for ok := bc.First(); ok; ok = bc.Next() {
+			key := bc.Key()
+			if len(key) < 36 {
+				continue
+			}
+			h := binary.BigEndian.Uint32(key[0:4])
+			if int32(h) > headerHeight {
+				continue
+			}
+			if _, ok := missingSet[h]; !ok {
+				continue
+			}
+			seen++
+			var hk [4]byte
+			binary.LittleEndian.PutUint32(hk[:], h)
+			if hi.Get(hk[:]) != nil {
+				continue
+			}
+			hash := key[4:36]
+			var hashCopy [32]byte
+			copy(hashCopy[:], hash)
+			if err := hi.Put(hk[:], hashCopy[:]); err != nil {
+				return err
+			}
+			filled++
+		}
+		return nil
+	})
+	if err != nil {
+		fmt.Println("REPAIR ERR:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("REPAIR: matched %d missing heights, filled %d new entries\n",
+		seen, filled)
 }
