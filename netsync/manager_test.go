@@ -1790,6 +1790,164 @@ func TestBlockDownloadResumeAfterRestart(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, *want, iv.Hash, "requested block at height %d", 11+i)
 	}
+
+	// Now drive the actual block-arrival pipeline for the remaining blocks
+	// 11..20 and confirm the download resumes all the way to the tip with no
+	// gaps, exactly as a real peer would deliver them after the restart.
+	syncPeer := newSyncCandidate(t, sm2, 20)
+	peerState := sm2.peerStates[syncPeer]
+	sm2.syncPeer = syncPeer
+	sm2.ibdMode = true
+	sm2.blockSync = []*peer.Peer{syncPeer}
+
+	for _, blk := range blocks[10:] {
+		hash := blk.Hash()
+		sm2.requestedBlocks[*hash] = struct{}{}
+		peerState.requestedBlocks[*hash] = struct{}{}
+
+		sm2.handleBlockMsg(&blockMsg{
+			block: blk,
+			peer:  syncPeer,
+			reply: make(chan struct{}, 1),
+		})
+	}
+
+	assertIBDComplete(t, sm2, peerState, 20)
+	require.Equal(t, int32(20),
+		sm2.chain.BestSnapshot().Height,
+		"resumed download should connect every block up to the tip")
+	_, cursorHeight := sm2.chain.BestDownloadState()
+	require.Equal(t, int32(20), cursorHeight,
+		"download cursor should mark every block connected")
 	db2.Close()
+}
+
+// TestFullSyncAllBlocks verifies an entire chain is synced end-to-end through
+// the real block-arrival pipeline (handleBlockMsg -> checkHeadersList ->
+// ProcessBlock) while the in-memory header window is smaller than the chain,
+// forcing the eviction / cold-read frontier path to run as blocks connect.
+// Every block must reach the best chain, the download cursor must land on the
+// tip, and IBD must complete.
+func TestFullSyncAllBlocks(t *testing.T) {
+	params := chaincfg.RegressionNetParams
+	params.Checkpoints = nil
+
+	// Enough blocks for many flushes and window evictions at window size 5.
+	const numBlocks = 80
+
+	newChain := func(db database.DB) (*blockchain.BlockChain, error) {
+		return blockchain.New(&blockchain.Config{
+			DB:           db,
+			Checkpoints:  params.Checkpoints,
+			ChainParams:  &params,
+			TimeSource:   blockchain.NewMedianTime(),
+			SigCache:     txscript.NewSigCache(1000),
+			HeaderWindow: 5,
+		})
+	}
+	newSM := func(chain *blockchain.BlockChain) (*SyncManager, error) {
+		return New(&Config{
+			PeerNotifier: noopPeerNotifier{},
+			Chain:        chain,
+			ChainParams:  &params,
+		})
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "ffldb")
+	db, err := database.Create("ffldb", dbPath, params.Net)
+	require.NoError(t, err)
+	defer db.Close()
+
+	chain, err := newChain(db)
+	require.NoError(t, err)
+	sm, err := newSM(chain)
+	require.NoError(t, err)
+
+	// Header IBD over the entire range.
+	blocks := generateTestBlocks(t, &params, numBlocks)
+	for _, blk := range blocks {
+		_, err := chain.ProcessBlockHeader(&blk.MsgBlock().Header,
+			blockchain.BFNoPoWCheck, false)
+		require.NoError(t, err)
+	}
+	_, bestHeaderHeight := chain.BestHeader()
+	require.Equal(t, int32(numBlocks), bestHeaderHeight)
+
+	// Register a download peer and feed every block through the real
+	// arrival pipeline.
+	syncPeer := newSyncCandidate(t, sm, numBlocks)
+	peerState := sm.peerStates[syncPeer]
+	sm.syncPeer = syncPeer
+	sm.ibdMode = true
+	sm.blockSync = []*peer.Peer{syncPeer}
+
+	for i, blk := range blocks {
+		hash := blk.Hash()
+		sm.requestedBlocks[*hash] = struct{}{}
+		peerState.requestedBlocks[*hash] = struct{}{}
+
+		sm.handleBlockMsg(&blockMsg{
+			block: blk,
+			peer:  syncPeer,
+			reply: make(chan struct{}, 1),
+		})
+
+		if i < len(blocks)-1 {
+			require.True(t, sm.ibdMode,
+				"ibdMode should still be on at block %d", i+1)
+		}
+	}
+
+	// The whole chain is connected, IBD has finished, nothing is left
+	// in-flight, and the cursor is at the tip.
+	assertIBDComplete(t, sm, peerState, numBlocks)
+	_, cursorHeight := sm.chain.BestDownloadState()
+	require.Equal(t, int32(numBlocks), cursorHeight,
+		"download cursor should land exactly on the tip")
+
+	// Every single block must be stored (each was accepted), even the ones
+	// long since evicted from the in-memory window.
+	snapshot := sm.chain.BestSnapshot()
+	require.Equal(t, int32(numBlocks), snapshot.Height)
+	for _, blk := range blocks {
+		have, err := sm.chain.HaveBlock(blk.Hash())
+		require.NoError(t, err)
+		require.True(t, have,
+			"block %v should be stored after full sync", blk.Hash())
+	}
+
+	// Reopening a window-less chain on the same DB must reproduce the full
+	// connected chain to prove nothing was silently dropped during the
+	// windowed sync.
+	db.Close()
+	db2, err := database.Open("ffldb", dbPath, params.Net)
+	require.NoError(t, err)
+	defer db2.Close()
+	chain2, err := blockchain.New(&blockchain.Config{
+		DB:          db2,
+		Checkpoints: params.Checkpoints,
+		ChainParams: &params,
+		TimeSource:  blockchain.NewMedianTime(),
+		SigCache:    txscript.NewSigCache(1000),
+	})
+	require.NoError(t, err)
+	best2 := chain2.BestSnapshot()
+	require.Equal(t, int32(numBlocks), best2.Height,
+		"reopened chain should reproduce the full synced height")
+	// Walk the whole best chain backwards and confirm every height matches
+	// the block we fed in.
+	got := make(map[chainhash.Hash]bool, len(blocks))
+	gotHash := best2.Hash
+	for h := int32(numBlocks); h >= 1; h-- {
+		got[gotHash] = true
+		hb, err := chain2.FetchBlockByHash(&gotHash)
+		require.NoError(t, err, "block at height %d must be resolvable", h)
+		gotHash = hb.MsgBlock().Header.PrevBlock
+	}
+	for _, blk := range blocks {
+		require.Contains(t, got, *blk.Hash(),
+			"every fed block (%v) must appear on the reproduced best chain",
+			blk.Hash())
+	}
 }
 
