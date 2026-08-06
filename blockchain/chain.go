@@ -22,7 +22,15 @@ import (
 const (
 	// maxOrphanBlocks is the maximum number of orphan blocks that can be
 	// queued.
-	maxOrphanBlocks = 100
+	//
+	// The parallel block download hands each peer a contiguous slice of the
+	// header chain, so blocks frequently arrive several thousand heights
+	// ahead of the connecting tip and are buffered as orphans until their
+	// parents connect.  The classic btcd value of 100 causes those low-height
+	// orphans to be evicted as fast as they arrive, stalling the download at
+	// the tip, so the pool is sized to absorb a full in-flight request batch
+	// (plus headroom).
+	maxOrphanBlocks = 4096
 )
 
 // BlockLocator is used to help locate a specific block.  The algorithm for
@@ -152,6 +160,12 @@ type BlockChain struct {
 	// block index is retained in memory (historical behavior).  Protected by
 	// chainLock.
 	headerWindow int32
+
+	// blockDownload tracks the furthest block whose data has been written to
+	// disk, so a restart can resume a block download from that point.  It is
+	// restored from the database during initChainState and advanced whenever a
+	// block is stored.  Protected by chainLock.
+	blockDownload *bestBlockDownloadState
 
 	// The UTXO state holds a cached view of the UTXO state of the chain.
 	// It is protected by the chain lock.
@@ -1417,6 +1431,20 @@ func (b *BlockChain) BestHeader() (chainhash.Hash, int32) {
 
 	best := b.bestHeader.Tip()
 	return best.hash, best.height
+}
+
+// BestDownloadState returns the hash and the height of the furthest block whose
+// data is present on disk.  A restart uses it to resume a block download from
+// that block instead of re-scanning every height below it.  A height of -1 is
+// returned when no block data has been stored.
+func (b *BlockChain) BestDownloadState() (chainhash.Hash, int32) {
+	b.chainLock.RLock()
+	defer b.chainLock.RUnlock()
+
+	if b.blockDownload == nil {
+		return chainhash.Hash{}, -1
+	}
+	return b.blockDownload.hash, int32(b.blockDownload.height)
 }
 
 // FlushBlockIndex writes any pending block index updates to the database.

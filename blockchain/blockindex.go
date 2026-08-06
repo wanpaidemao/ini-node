@@ -567,6 +567,12 @@ func (bi *blockIndex) evictWindow() {
 		return
 	}
 
+	// Compute the block-connection frontier window before acquiring the chain
+	// view locks, since tipHeight needs to read the views.
+	chainTip := bi.tipHeight(bi.bestChainView)
+	frontierLow := chainTip - bi.windowSize
+	frontierHigh := chainTip + bi.windowSize
+
 	// Grab the chain view locks so the eviction and pointer severing below
 	// cannot race with a concurrent chain walk.
 	if bi.bestChainView != nil {
@@ -580,15 +586,32 @@ func (bi *blockIndex) evictWindow() {
 	// index map, except nodes that are part of the best chain view.  The
 	// connected chain's trailing window is allowed to sit below the header
 	// window boundary during a header sync and must stay materialized.
+	//
+	// Additionally protect the block-connection frontier.  During an initial
+	// block download the connected chain tip sits far below the header
+	// window boundary, and both the node currently being connected (which
+	// has not entered the best chain view yet) and the header nodes for the
+	// blocks about to be requested would otherwise be evicted on the very
+	// flush that stores them, making their parents unresolvable ("previous
+	// block ... is unknown").  Nodes within one window of the best chain tip
+	// are therefore retained alongside the header window; this keeps the
+	// download hot without blowing up the memory bound, since the frontier
+	// window slides with the tip as blocks connect.
 	if bi.bestChainView != nil {
 		for hash, node := range bi.index {
 			if node.height < headerBoundary && !bi.bestChainView.contains(node) {
+				if node.height >= frontierLow && node.height <= frontierHigh {
+					continue
+				}
 				delete(bi.index, hash)
 			}
 		}
 	} else {
 		for hash, node := range bi.index {
 			if node.height < headerBoundary {
+				if node.height >= frontierLow && node.height <= frontierHigh {
+					continue
+				}
 				delete(bi.index, hash)
 			}
 		}
@@ -602,7 +625,16 @@ func (bi *blockIndex) evictWindow() {
 	// fallen out of the window).
 	for _, node := range bi.index {
 		bound := headerBoundary
-		if bi.bestChainView != nil && bi.bestChainView.contains(node) {
+		// The best chain view and the block-connection frontier below the
+		// header window boundary must keep their ancestor chains intact so
+		// context validation (median time past, BIP9 state) can walk them
+		// while the next blocks connect; they are severed only below the
+		// best chain's own window boundary.  Nodes at or above the header
+		// boundary (the header window proper) are still severed below it.
+		if bi.bestChainView != nil &&
+			(bi.bestChainView.contains(node) ||
+				(node.height < headerBoundary && node.height >= frontierLow)) {
+
 			bound = chainBoundary
 		}
 		if node.parent != nil && node.parent.height < bound {
@@ -734,6 +766,18 @@ func (bi *blockIndex) flushToDB() error {
 			err = dbPutHashIndex(dbTx, &node.hash, node.height)
 			if err != nil {
 				return err
+			}
+
+			// Maintain the height-to-hash mapping for nodes on the best
+			// header chain so the DB cold-read fallback can resolve evicted
+			// heights.  Side-chain rows are skipped since they must never
+			// claim a main-chain height, and rows below the window are no
+			// longer dirty because an earlier flush already persisted them.
+			if bi.bestHeaderView != nil && bi.bestHeaderView.Contains(node) {
+				err = dbPutHeightIndex(dbTx, node.height, &node.hash)
+				if err != nil {
+					return err
+				}
 			}
 		}
 

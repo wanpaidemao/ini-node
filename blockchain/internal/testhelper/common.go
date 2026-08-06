@@ -8,6 +8,7 @@ import (
 	"github.com/btcsuite/btcd/blockchain/internal/workmath"
 	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/btcsuite/btcd/pow"
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 )
@@ -157,7 +158,7 @@ func SolveBlock(header *wire.BlockHeader) bool {
 				return
 			default:
 				hdr.Nonce = i
-				hash := hdr.BlockHash()
+				hash := pow.BlockPoWHash(&hdr)
 				if workmath.HashToBig(&hash).Cmp(
 					targetDifficulty) <= 0 {
 

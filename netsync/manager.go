@@ -35,6 +35,21 @@ const (
 	// hashes to store in memory.
 	maxRequestedBlocks = wire.MaxInvPerMsg
 
+	// maxBlockRequestWindow is the maximum number of blocks that the
+	// initial block download may have requested ahead of the currently
+	// connected best chain height.
+	//
+	// Without this bound, buildBlockRequest walks the entire (multi-million
+	// block) header chain and requests every missing block in one go.  The
+	// parallel download then spreads those requests across disjoint slices
+	// spanning the whole chain, so blocks arrive dozens of thousands of
+	// heights out of order and flood the orphan pool; the pool evicts the
+	// low-height blocks needed to advance the tip and the download stalls.
+	// Capping the request horizon keeps every requested block close enough
+	// to the tip that it connects (draining its orphaned descendants) long
+	// before the pool fills.
+	maxBlockRequestWindow = 2048
+
 	// maxRequestedTxns is the maximum number of requested transactions
 	// hashes to store in memory.
 	maxRequestedTxns = wire.MaxInvPerMsg
@@ -610,6 +625,11 @@ func (sm *SyncManager) startSync() {
 	for _, p := range higherPeers {
 		sm.blockSyncAddPeer(p)
 	}
+
+	// Resume any block download that was interrupted by a restart before
+	// dispatching fresh block requests, so locally-stored blocks are connected
+	// instead of being skipped.
+	sm.reconnectStoredBlocks()
 }
 
 // isSyncCandidate returns whether or not the peer is a candidate to consider
@@ -791,6 +811,11 @@ func (sm *SyncManager) blockSyncAddPeer(peer *peerpkg.Peer) {
 // requestedBlocks map, concurrent calls across peers automatically partition
 // the header chain into disjoint slices with no overlap.
 func (sm *SyncManager) blkDownload() {
+	// First connect any locally-stored blocks that were left behind by a
+	// previous session, so a resumed download does not stall on data it
+	// already has.
+	sm.reconnectStoredBlocks()
+
 	for _, p := range sm.blockSync {
 		if p == nil {
 			continue
@@ -1294,10 +1319,37 @@ func (sm *SyncManager) buildBlockRequest(peer *peerpkg.Peer) *wire.MsgGetData {
 		// that happens below.
 		return wire.NewMsgGetDataSizeHint(0)
 	}
-	length := bestHeaderHeight - forkHeight
+
+	// Only request blocks within a bounded window ahead of the connected
+	// best chain.  Requesting the whole remaining header chain at once
+	// floods the orphan pool with out-of-order blocks and stalls the
+	// download, so the request horizon advances as blocks connect.
+	bestHeight := sm.chain.BestSnapshot().Height
+	requestEnd := bestHeight + maxBlockRequestWindow
+	if requestEnd > bestHeaderHeight {
+		requestEnd = bestHeaderHeight
+	}
+
+	length := requestEnd - forkHeight
 	gdmsg := wire.NewMsgGetDataSizeHint(uint(length))
 	numRequested := 0
-	for h := forkHeight + 1; h <= bestHeaderHeight; h++ {
+
+	// Jump the request start past blocks whose data is already present on
+	// disk when the persisted block-download cursor points at a block that
+	// lies on the current best header chain.  Blocks below the cursor were
+	// stored in height order, so they never need to be requested again; the
+	// per-height haveInventory check below remains the source of truth for
+	// the heights that actually get requested.
+	startHeight := forkHeight + 1
+	cursorHash, cursorHeight := sm.chain.BestDownloadState()
+	if cursorHeight > forkHeight && cursorHeight <= bestHeaderHeight {
+		if headerHash, err := sm.chain.HeaderHashByHeight(cursorHeight); err == nil &&
+			*headerHash == cursorHash {
+			startHeight = cursorHeight + 1
+		}
+	}
+
+	for h := startHeight; h <= requestEnd; h++ {
 		hash, err := sm.chain.HeaderHashByHeight(h)
 		if err != nil {
 			log.Warnf("error while fetching the block hash for height %v -- %v",
@@ -1328,13 +1380,11 @@ func (sm *SyncManager) buildBlockRequest(peer *peerpkg.Peer) *wire.MsgGetData {
 			sm.requestedBlocks[*hash] = struct{}{}
 			peerState.requestedBlocks[*hash] = struct{}{}
 
-			// If we're fetching from a witness enabled peer
-			// post-fork, then ensure that we receive all the
-			// witness data in the blocks.
-			if peer.IsWitnessEnabled() {
-				iv.Type = wire.InvTypeWitnessBlock
-			}
-
+			// Always request plain block inventory.  Sugarchain has no
+			// segregated witness, and its peers do not serve witness-block
+			// inventory types; a getdata populated with InvTypeWitnessBlock is
+			// silently ignored by them even though they advertise the legacy
+			// witness service flag.
 			gdmsg.AddInvVect(iv)
 			numRequested++
 		}
@@ -1344,6 +1394,38 @@ func (sm *SyncManager) buildBlockRequest(peer *peerpkg.Peer) *wire.MsgGetData {
 		}
 	}
 	return gdmsg
+}
+
+// reconnectStoredBlocks connects blocks that were already downloaded and stored
+// in the database but never connected to the best chain (e.g. a restart
+// interrupted the download) through the connection logic.  Without this, the
+// downloader would treat those blocks as already present -- both skipping them
+// here and never requesting them again -- and the sync would stall even though
+// the data is local.  Blocks are connected in height order from the current
+// tip, so each block's parent is the previously connected block.
+func (sm *SyncManager) reconnectStoredBlocks() {
+	_, bestHeaderHeight := sm.chain.BestHeader()
+	for {
+		nextHeight := sm.chain.BestSnapshot().Height + 1
+		if nextHeight > bestHeaderHeight {
+			return
+		}
+
+		hash, err := sm.chain.HeaderHashByHeight(nextHeight)
+		if err != nil {
+			return
+		}
+
+		have, err := sm.chain.HaveBlock(hash)
+		if err != nil || !have {
+			return
+		}
+
+		_, behaviorFlags := sm.checkHeadersList(hash)
+		if _, err := sm.chain.ResumeBlockConnect(hash, behaviorFlags); err != nil {
+			return
+		}
+	}
 }
 
 // handleHeadersMsg handles block header messages from all peers.  Headers are
@@ -1583,6 +1665,11 @@ func (sm *SyncManager) finishHeaderSync() {
 	}
 	log.Infof("Starting parallel block download from %d peers",
 		len(sm.blockSync))
+
+	// Connect any blocks that were downloaded and stored by a previous
+	// session before dispatching fresh requests, so the download resumes from
+	// where it left off instead of re-fetching or stalling on local data.
+	sm.reconnectStoredBlocks()
 }
 
 // dropHeaderPeer removes a peer from an in-progress parallel header download,

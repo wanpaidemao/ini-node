@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	"github.com/btcsuite/btcd/btcutil/v2"
+	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/database"
 	"github.com/btcsuite/btcd/wire/v2"
 )
@@ -61,7 +62,21 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
 	// such as making blocks that never become part of the main chain or
 	// blocks that fail to connect available for further analysis.
 	err = b.db.Update(func(dbTx database.Tx) error {
-		return dbStoreBlock(dbTx, block)
+		if err := dbStoreBlock(dbTx, block); err != nil {
+			return err
+		}
+
+		// Advance the persisted block-download cursor when this block is the
+		// furthest block data stored so far, so a restart can resume the block
+		// download from the highest locally-available block.
+		if b.blockDownload == nil || blockHeight > int32(b.blockDownload.height) {
+			b.blockDownload = &bestBlockDownloadState{
+				hash:   *block.Hash(),
+				height: uint32(blockHeight),
+			}
+			return dbPutBestBlockDownloadState(dbTx, block.Hash(), blockHeight)
+		}
+		return nil
 	})
 	if err != nil {
 		return false, err
@@ -107,6 +122,42 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
 	}()
 
 	return isMainChain, nil
+}
+
+// ResumeBlockConnect connects a block whose data is already stored in the
+// database but which was not connected to the best chain, typically because the
+// node restarted between the store and connect steps of a previous session.
+// Blocks that were never connected must be driven through the connection logic
+// explicitly: ProcessBlock refuses them (blockExists reports them as already
+// present), so without this a resumed download would stall on local data.
+//
+// It is a no-op that returns true when the block is already on the best chain.
+//
+// This function is safe for concurrent access.
+func (b *BlockChain) ResumeBlockConnect(hash *chainhash.Hash, flags BehaviorFlags) (bool, error) {
+	b.chainLock.Lock()
+	defer b.chainLock.Unlock()
+
+	// Nothing to do when the block is already connected and its node is
+	// still retained in the in-memory header window.  Evicted connected nodes
+	// cannot be cheaply distinguished from stored-but-unconnected ones (the
+	// cold height index tracks the best header chain, not the connected
+	// chain), but the resume loop only targets blocks above the current tip,
+	// which are never connected, so this guard is a safety net rather than
+	// the primary path.
+	if node := b.index.LookupNode(hash); node != nil && b.bestChain.Contains(node) {
+		return true, nil
+	}
+
+	// Load the stored block payload and run it through the same acceptance
+	// path used for a freshly downloaded block.  The data is already on disk,
+	// so the store step simply overwrites it, and the existing node entry (if
+	// any) is upgraded with the data-present status before connecting.
+	block, err := b.FetchBlockByHash(hash)
+	if err != nil {
+		return false, err
+	}
+	return b.maybeAcceptBlock(block, flags)
 }
 
 // maybeAcceptBlockHeader potentially accepts the header to the block index and,

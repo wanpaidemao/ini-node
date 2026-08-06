@@ -251,3 +251,200 @@ func TestColdReadFallback(t *testing.T) {
 
 	db2.Close()
 }
+
+// chainFromHeaders builds a header-only chain of numHeaders blocks on top of
+// genesis, adds each to the block index and sets the best header tip, recording
+// the expected hashes for heights [0, numHeaders].
+func chainFromHeaders(t *testing.T, chain *BlockChain, numHeaders int32,
+	expectedHashes *[]chainhash.Hash) {
+
+	genesis := chain.bestChain.Tip()
+	(*expectedHashes)[0] = genesis.hash
+	tip := genesis
+	for i := int32(1); i <= numHeaders; i++ {
+		node := newBlockNode(&wire.BlockHeader{
+			PrevBlock: tip.hash,
+			Bits:      0x1f00ffff,
+			Nonce:     uint32(i),
+		}, tip)
+		node.status = statusHeaderStored
+		chain.index.AddNode(node)
+		(*expectedHashes)[i] = node.hash
+		tip = node
+	}
+	chain.bestHeader.SetTip(tip)
+}
+
+// TestHeaderFlushMaintainsHeightIndex verifies that flushing a header-only
+// chain through the block index now persists the height-to-hash mapping for the
+// best header chain, so the DB cold-read fallback resolves evicted heights
+// without any manual seeding step.
+func TestHeaderFlushMaintainsHeightIndex(t *testing.T) {
+	if err := os.MkdirAll(testDbRoot, 0700); err != nil {
+		t.Fatalf("failed to create test db root: %v", err)
+	}
+	const window = 5
+	dbPath := filepath.Join(testDbRoot, "headflush_hidx")
+
+	newChain := func(db database.DB) (*BlockChain, error) {
+		return New(&Config{
+			DB:           db,
+			ChainParams:  &chaincfg.SimNetParams,
+			Checkpoints:  nil,
+			TimeSource:   NewMedianTime(),
+			SigCache:     txscript.NewSigCache(1000),
+			HeaderWindow: window,
+		})
+	}
+
+	_ = os.RemoveAll(dbPath)
+	db1, err := database.Create(testDbType, dbPath, blockDataNet)
+	if err != nil {
+		t.Fatalf("failed to create db: %v", err)
+	}
+	chain1, err := newChain(db1)
+	if err != nil {
+		db1.Close()
+		t.Fatalf("failed to create chain: %v", err)
+	}
+
+	expectedHashes := make([]chainhash.Hash, 21)
+	chainFromHeaders(t, chain1, 20, &expectedHashes)
+
+	// Flush writes the block index rows, hash index and now the height index
+	// for every node on the best header chain, and evicts heights [1, 14].
+	if err := chain1.FlushBlockIndex(); err != nil {
+		db1.Close()
+		t.Fatalf("failed to flush block index: %v", err)
+	}
+
+	// The height index must be present without any manual seeding.
+	var missing int
+	err = db1.View(func(dbTx database.Tx) error {
+		for h := int32(1); h <= 20; h++ {
+			hash, err := dbFetchHashByHeight(dbTx, h)
+			if err != nil || *hash != expectedHashes[h] {
+				missing++
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		db1.Close()
+		t.Fatalf("view failed: %v", err)
+	}
+	if missing != 0 {
+		db1.Close()
+		t.Fatalf("height index missing/incorrect for %d heights", missing)
+	}
+	db1.Close()
+
+	// Reopen with a small window: heights [1, 14] are evicted and must be
+	// served purely from the DB via the height index written above.
+	db2, err := database.Open(testDbType, dbPath, blockDataNet)
+	if err != nil {
+		t.Fatalf("failed to reopen db: %v", err)
+	}
+	chain2, err := newChain(db2)
+	if err != nil {
+		db2.Close()
+		t.Fatalf("failed to reopen chain: %v", err)
+	}
+
+	for h := int32(1); h <= 14; h++ {
+		hash, err := chain2.HeaderHashByHeight(h)
+		if err != nil || *hash != expectedHashes[h] {
+			db2.Close()
+			t.Fatalf("HeaderHashByHeight(%d) = %v, err %v, want %v",
+				h, hash, err, expectedHashes[h])
+		}
+	}
+	db2.Close()
+}
+
+// TestHeightIndexRebuild verifies that initChainState rebuilds the
+// height-to-hash index for databases (for example synced before the height
+// index was maintained for header-only nodes) whose index is empty or stale.
+func TestHeightIndexRebuild(t *testing.T) {
+	if err := os.MkdirAll(testDbRoot, 0700); err != nil {
+		t.Fatalf("failed to create test db root: %v", err)
+	}
+	const window = 5
+	dbPath := filepath.Join(testDbRoot, "headrebuild")
+
+	newChain := func(db database.DB) (*BlockChain, error) {
+		return New(&Config{
+			DB:           db,
+			ChainParams:  &chaincfg.SimNetParams,
+			Checkpoints:  nil,
+			TimeSource:   NewMedianTime(),
+			SigCache:     txscript.NewSigCache(1000),
+			HeaderWindow: window,
+		})
+	}
+
+	_ = os.RemoveAll(dbPath)
+	db1, err := database.Create(testDbType, dbPath, blockDataNet)
+	if err != nil {
+		t.Fatalf("failed to create db: %v", err)
+	}
+	chain1, err := newChain(db1)
+	if err != nil {
+		db1.Close()
+		t.Fatalf("failed to create chain: %v", err)
+	}
+
+	expectedHashes := make([]chainhash.Hash, 21)
+	chainFromHeaders(t, chain1, 20, &expectedHashes)
+	if err := chain1.FlushBlockIndex(); err != nil {
+		db1.Close()
+		t.Fatalf("failed to flush block index: %v", err)
+	}
+
+	// Simulate a database created before the height index was maintained for
+	// header-only nodes: drop every height-to-hash entry while leaving the
+	// block index rows, hash index and best header state intact.
+	err = db1.Update(func(dbTx database.Tx) error {
+		heightIndex := dbTx.Metadata().Bucket(heightIndexBucketName)
+		var toDrop [][]byte
+		if err := heightIndex.ForEach(func(k, v []byte) error {
+			toDrop = append(toDrop, append([]byte(nil), k...))
+			return nil
+		}); err != nil {
+			return err
+		}
+		for _, k := range toDrop {
+			if err := heightIndex.Delete(k); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		db1.Close()
+		t.Fatalf("failed to clear height index: %v", err)
+	}
+	db1.Close()
+
+	// Reopen: initChainState must detect the missing height index and rebuild
+	// it from the persisted block index, after which evicted heights resolve.
+	db2, err := database.Open(testDbType, dbPath, blockDataNet)
+	if err != nil {
+		t.Fatalf("failed to reopen db: %v", err)
+	}
+	chain2, err := newChain(db2)
+	if err != nil {
+		db2.Close()
+		t.Fatalf("failed to reopen chain: %v", err)
+	}
+
+	for h := int32(1); h <= 14; h++ {
+		hash, err := chain2.HeaderHashByHeight(h)
+		if err != nil || *hash != expectedHashes[h] {
+			db2.Close()
+			t.Fatalf("HeaderHashByHeight(%d) = %v, err %v, want %v",
+				h, hash, err, expectedHashes[h])
+		}
+	}
+	db2.Close()
+}

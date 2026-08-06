@@ -19,6 +19,7 @@ import (
 	_ "github.com/btcsuite/btcd/database/ffldb"
 	"github.com/btcsuite/btcd/mempool"
 	"github.com/btcsuite/btcd/peer"
+	"github.com/btcsuite/btcd/pow"
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/stretchr/testify/require"
@@ -592,7 +593,7 @@ func solveTestBlock(header *wire.BlockHeader, params *chaincfg.Params) bool {
 	target := blockchain.CompactToBig(params.PowLimitBits)
 	for nonce := uint32(0); nonce < math.MaxUint32; nonce++ {
 		header.Nonce = nonce
-		hash := header.BlockHash()
+		hash := pow.BlockPoWHash(header)
 		if blockchain.HashToBig(&hash).Cmp(target) <= 0 {
 			return true
 		}
@@ -1698,3 +1699,97 @@ func TestParallelBlockDownloadDropPeer(t *testing.T) {
 	require.Len(t, state1.requestedBlocks, numBlocks)
 	require.Len(t, sm.requestedBlocks, numBlocks)
 }
+
+// TestBlockDownloadResumeAfterRestart verifies that a block download resumes
+// after a restart: the furthest stored block is persisted, reconnectStoredBlocks
+// leaves a fully-connected chain untouched, and buildBlockRequest continues from
+// the persisted cursor instead of re-requesting blocks that are already present.
+func TestBlockDownloadResumeAfterRestart(t *testing.T) {
+	params := chaincfg.RegressionNetParams
+	params.Checkpoints = nil
+
+	newChain := func(db database.DB) (*blockchain.BlockChain, error) {
+		return blockchain.New(&blockchain.Config{
+			DB:           db,
+			Checkpoints:  params.Checkpoints,
+			ChainParams:  &params,
+			TimeSource:   blockchain.NewMedianTime(),
+			SigCache:     txscript.NewSigCache(1000),
+			HeaderWindow: 5,
+		})
+	}
+	newSM := func(chain *blockchain.BlockChain) (*SyncManager, error) {
+		return New(&Config{
+			PeerNotifier: noopPeerNotifier{},
+			Chain:        chain,
+			ChainParams:  &params,
+		})
+	}
+
+	// Session 1: download headers 1..20 and connect blocks 1..10.  The best
+	// header chain is 10 blocks ahead of the best chain, exactly the state a
+	// restart would interrupt.
+	dbPath := filepath.Join(t.TempDir(), "ffldb")
+	db1, err := database.Create("ffldb", dbPath, params.Net)
+	require.NoError(t, err)
+	chain1, err := newChain(db1)
+	require.NoError(t, err)
+	sm1, err := newSM(chain1)
+	require.NoError(t, err)
+	_ = sm1
+
+	blocks := generateTestBlocks(t, &params, 20)
+	for _, blk := range blocks {
+		_, err := chain1.ProcessBlockHeader(&blk.MsgBlock().Header,
+			blockchain.BFNoPoWCheck, false)
+		require.NoError(t, err)
+	}
+	for _, blk := range blocks[:10] {
+		_, _, err := chain1.ProcessBlock(blk, blockchain.BFNoPoWCheck)
+		require.NoError(t, err)
+	}
+	_, bestDownloadHeight := chain1.BestDownloadState()
+	require.Equal(t, int32(10), bestDownloadHeight,
+		"download cursor should track the highest connected block")
+	db1.Close()
+
+	// Session 2: reopen the database and resume the download.
+	db2, err := database.Open("ffldb", dbPath, params.Net)
+	require.NoError(t, err)
+	chain2, err := newChain(db2)
+	require.NoError(t, err)
+	sm2, err := newSM(chain2)
+	require.NoError(t, err)
+
+	_, bestHeaderHeight := chain2.BestHeader()
+	require.Equal(t, int32(20), bestHeaderHeight)
+	require.Equal(t, int32(10), chain2.BestSnapshot().Height)
+
+	// The download cursor survives the restart.
+	_, bestDownloadHeight = chain2.BestDownloadState()
+	require.Equal(t, int32(10), bestDownloadHeight)
+
+	// Nothing is stored above the connected tip, so the resume pump is a
+	// no-op and the chain stays put.
+	sm2.reconnectStoredBlocks()
+	require.Equal(t, int32(10), chain2.BestSnapshot().Height)
+
+	// The next getdata request resumes at cursor+1 (height 11) rather than
+	// re-requesting the already-present blocks 1..10.
+	p := peer.NewInboundPeer(&peer.Config{})
+	p.UpdateLastBlockHeight(20)
+	sm2.peerStates[p] = &peerSyncState{
+		requestedTxns:   make(map[chainhash.Hash]struct{}),
+		requestedBlocks: make(map[chainhash.Hash]struct{}),
+	}
+	gdmsg := sm2.buildBlockRequest(p)
+	require.Len(t, gdmsg.InvList, 10,
+		"resumed request should cover exactly blocks 11..20")
+	for i, iv := range gdmsg.InvList {
+		want, err := chain2.HeaderHashByHeight(int32(11 + i))
+		require.NoError(t, err)
+		require.Equal(t, *want, iv.Hash, "requested block at height %d", 11+i)
+	}
+	db2.Close()
+}
+

@@ -58,6 +58,12 @@ var (
 	// re-downloading headers up to the best connected chain tip.
 	bestHeaderStateKeyName = []byte("headerchainstate")
 
+	// blockDownloadStateKeyName is the name of the db key used to store the
+	// furthest block whose data has been written to disk.  A restart can use it
+	// to resume a block download from that block instead of re-scanning every
+	// height below it.
+	blockDownloadStateKeyName = []byte("blockdownloadstate")
+
 	// utxoStateConsistencyKeyName is the name of the db key used to store the
 	// consistency status of the utxo state.
 	utxoStateConsistencyKeyName = []byte("utxostateconsistency")
@@ -913,6 +919,19 @@ func dbPutHashIndex(dbTx database.Tx, hash *chainhash.Hash, height int32) error 
 	return hashIndex.Put(hash[:], serializedHeight[:])
 }
 
+// dbPutHeightIndex uses an existing database transaction to add a block height
+// to hash mapping to the height index bucket.  It is the inverse of
+// dbPutHashIndex and is used when flushing header-only block nodes that sit on
+// the best header chain so the DB cold-read fallback can resolve any evicted
+// height back to its header hash.
+func dbPutHeightIndex(dbTx database.Tx, height int32, hash *chainhash.Hash) error {
+	var serializedHeight [4]byte
+	byteOrder.PutUint32(serializedHeight[:], uint32(height))
+	meta := dbTx.Metadata()
+	heightIndex := meta.Bucket(heightIndexBucketName)
+	return heightIndex.Put(serializedHeight[:], hash[:])
+}
+
 // dbRemoveBlockIndex uses an existing database transaction remove block index
 // entries from the hash to height and height to hash mappings for the provided
 // values.
@@ -943,6 +962,135 @@ func dbFetchHeightByHash(dbTx database.Tx, hash *chainhash.Hash) (int32, error) 
 	}
 
 	return int32(byteOrder.Uint32(serializedHeight)), nil
+}
+
+// heightIndexFlushBatch is the maximum number of best-header-chain rows written
+// to the height index within a single write transaction when rebuilding it.  The
+// ffldb write transaction buffers every pending write in memory until it is
+// committed, so a single transaction over the whole ~43.7M-header Sugarchain
+// chain would balloon the process's memory; batching keeps the in-memory buffer
+// bounded to this many rows.
+const heightIndexFlushBatch = 50000
+
+// rebuildHeightIndex reconstructs the height-to-hash mapping for every height
+// on the best header chain from the persisted block index.  It upgrades
+// databases created before the height index was maintained for header-only
+// nodes, so the cold-read fallback can resolve evicted heights without
+// re-downloading the chain.
+//
+// The walk descends in height order, matching each row against the expected
+// best-header-chain hash, and commits every heightIndexFlushBatch rows so the
+// write transaction's in-memory buffer stays bounded.  Every height's
+// best-header-chain hash overwrites any previously stored value, and side-chain
+// rows are skipped so they never claim a main-chain height.
+func (b *BlockChain) rebuildHeightIndex(tipHash *chainhash.Hash,
+	tipHeight int32) error {
+
+	expected := *tipHash
+	for end := tipHeight; end >= 0; {
+		start := end - heightIndexFlushBatch + 1
+		if start < 0 {
+			start = 0
+		}
+
+		var nextHeight int32
+		var err error
+		expected, nextHeight, err = b.rebuildHeightIndexRange(&expected, start, end)
+		if err != nil {
+			return err
+		}
+		if nextHeight < 0 {
+			return nil
+		}
+		end = nextHeight
+	}
+	return nil
+}
+
+// rebuildHeightIndexRange writes the height-to-hash mapping for the best header
+// chain over the inclusive height range [start, end] within a single write
+// transaction and returns the hash of the best-header-chain header at height
+// end-below-range (start-1), together with that height, so the caller can
+// continue the walk in a fresh transaction.  A nextHeight of -1 means the walk
+// has reached genesis and no further rows remain.
+func (b *BlockChain) rebuildHeightIndexRange(expected *chainhash.Hash,
+	start, end int32) (chainhash.Hash, int32, error) {
+
+	var nextHash chainhash.Hash
+	nextHeight := int32(-1)
+
+	err := b.db.Update(func(dbTx database.Tx) error {
+		blockIndexBucket := dbTx.Metadata().Bucket(blockIndexBucketName)
+		heightIndex := dbTx.Metadata().Bucket(heightIndexBucketName)
+		cursor := blockIndexBucket.Cursor()
+
+		// curHash is the best-header-chain hash expected at height curHeight.
+		// Seek directly to it (the exact key exists) so each batch starts near
+		// where the previous one ended rather than re-scanning the whole index.
+		curHash := *expected
+		curHeight := end
+		var serializedHeight [4]byte
+		first := true
+		for {
+			if first {
+				if !cursor.Seek(blockIndexKey(&curHash, uint32(curHeight))) {
+					return nil
+				}
+				first = false
+			} else if !cursor.Prev() {
+				break
+			}
+
+			i := int32(binary.BigEndian.Uint32(cursor.Key()[0:4]))
+
+			// Rows above the height we are currently matching share the last
+			// matched height and are side chains; skip them since they must
+			// never claim a main-chain height.
+			if i > curHeight {
+				continue
+			}
+
+			// The block index is ordered by height, so once the walk has
+			// descended past the expected height, no further rows below can be
+			// on the best header chain.
+			if i < curHeight {
+				return nil
+			}
+
+			header, _, err := deserializeBlockRow(cursor.Value())
+			if err != nil {
+				return err
+			}
+			hash := header.BlockHash()
+			if !hash.IsEqual(&curHash) {
+				// A side-chain row (or stale row from a reorg) at this height.
+				continue
+			}
+
+			// Best-header-chain row: write height→hash.
+			byteOrder.PutUint32(serializedHeight[:], uint32(i))
+			if err := heightIndex.Put(serializedHeight[:], hash[:]); err != nil {
+				return err
+			}
+
+			// Remember the row just below for the continuation.
+			nextHash = header.PrevBlock
+			nextHeight = i - 1
+
+			if i <= start {
+				// Reached the bottom of this batch.
+				return nil
+			}
+
+			curHash = header.PrevBlock
+			curHeight = i - 1
+		}
+		return nil
+	})
+	if err != nil {
+		return chainhash.Hash{}, -1, err
+	}
+	return nextHash, nextHeight, nil
 }
 
 // dbFetchHashByHeight uses an existing database transaction to retrieve the
@@ -1165,6 +1313,74 @@ func dbFetchBestHeaderState(dbTx database.Tx) (*bestHeaderState, error) {
 	return &state, nil
 }
 
+// bestBlockDownloadState represents the data to be stored in the database for
+// the furthest block whose data is present on disk.
+type bestBlockDownloadState struct {
+	hash   chainhash.Hash
+	height uint32
+}
+
+// serializeBestBlockDownloadState returns the serialization of the passed best
+// block download state.  This is data to be stored under
+// blockDownloadStateKeyName.
+func serializeBestBlockDownloadState(state bestBlockDownloadState) []byte {
+	serializedLen := chainhash.HashSize + 4
+	serializedData := make([]byte, serializedLen)
+	copy(serializedData[0:chainhash.HashSize], state.hash[:])
+	byteOrder.PutUint32(serializedData[chainhash.HashSize:], state.height)
+	return serializedData
+}
+
+// deserializeBestBlockDownloadState deserializes the passed serialized best
+// block download state.
+func deserializeBestBlockDownloadState(serializedData []byte) (bestBlockDownloadState,
+	error) {
+
+	if len(serializedData) < chainhash.HashSize+4 {
+		return bestBlockDownloadState{}, database.Error{
+			ErrorCode:   database.ErrCorruption,
+			Description: "corrupt best block download state",
+		}
+	}
+
+	state := bestBlockDownloadState{}
+	copy(state.hash[:], serializedData[0:chainhash.HashSize])
+	state.height = byteOrder.Uint32(serializedData[chainhash.HashSize:])
+	return state, nil
+}
+
+// dbPutBestBlockDownloadState uses an existing database transaction to update
+// the best block download state with the given parameters.
+func dbPutBestBlockDownloadState(dbTx database.Tx, hash *chainhash.Hash,
+	height int32) error {
+
+	serializedData := serializeBestBlockDownloadState(bestBlockDownloadState{
+		hash:   *hash,
+		height: uint32(height),
+	})
+
+	return dbTx.Metadata().Put(blockDownloadStateKeyName, serializedData)
+}
+
+// dbFetchBestBlockDownloadState uses an existing database transaction to
+// retrieve the best block download state.  It returns nil when no state has
+// been stored, which is the case for databases created by versions that predate
+// the key.
+func dbFetchBestBlockDownloadState(dbTx database.Tx) (*bestBlockDownloadState,
+	error) {
+
+	serializedData := dbTx.Metadata().Get(blockDownloadStateKeyName)
+	if serializedData == nil {
+		return nil, nil
+	}
+
+	state, err := deserializeBestBlockDownloadState(serializedData)
+	if err != nil {
+		return nil, err
+	}
+	return &state, nil
+}
+
 // dbPutUtxoStateConsistency uses an existing database transaction to
 // update the utxo state consistency status with the given parameters.
 func dbPutUtxoStateConsistency(dbTx database.Tx, hash *chainhash.Hash) error {
@@ -1353,6 +1569,13 @@ func (b *BlockChain) initChainState() error {
 	}
 
 	// Attempt to load the chain state from the database.
+	//
+	// The best header state observed here is surfaced to the caller so the
+	// height-to-hash index can be rebuilt afterwards when it does not already
+	// cover the stored best header chain.
+	var headerStateHash chainhash.Hash
+	var headerStateHeight int32
+	var needHeightRebuild bool
 	err = b.db.View(func(dbTx database.Tx) error {
 		// Fetch the stored chain state from the database metadata.
 		// When it doesn't exist, it means the database hasn't been
@@ -1377,6 +1600,15 @@ func (b *BlockChain) initChainState() error {
 		headerTipHeight := int32(state.height)
 		if headerState != nil {
 			headerTipHeight = int32(headerState.height)
+		}
+
+		// Restore the furthest stored block so a restart can resume the block
+		// download from the highest locally-available block instead of
+		// re-scanning every height below it.  When no state exists, such as
+		// with a database created by an older version, it stays nil.
+		b.blockDownload, err = dbFetchBestBlockDownloadState(dbTx)
+		if err != nil {
+			return err
 		}
 
 		// Determine the in-memory header window boundaries.  When the window
@@ -1426,7 +1658,16 @@ func (b *BlockChain) initChainState() error {
 
 			// Materialize this row when it falls within either the connected
 			// chain's window or the header chain's window.
-			inChainWindow := i >= chainBoundary && i <= int32(state.height)
+			//
+			// The connected chain's window extends a full window ahead of the
+			// best chain tip.  After a restart the block-connection frontier
+			// must be able to resolve the parent of every block the downloader
+			// requests next (which always lives within one request window of
+			// the tip) from the in-memory index, since block acceptance
+			// resolves parents only through the in-memory index and never falls
+			// back to the cold-read layer.
+			inChainWindow := i >= chainBoundary &&
+				i <= int32(state.height)+b.index.windowSize
 			inHeaderWindow := i >= headerBoundary
 			if !inChainWindow && !inHeaderWindow {
 				i++
@@ -1504,6 +1745,21 @@ func (b *BlockChain) initChainState() error {
 		}
 		b.bestHeader.SetTip(headerTip)
 
+		// Determine whether the persisted height-to-hash index already covers
+		// the best header chain.  Databases created before the height index
+		// was maintained for header-only nodes have an empty or stale index;
+		// they are rebuilt once the in-memory index has been loaded so the
+		// cold-read fallback can resolve evicted heights right after startup.
+		if headerState != nil {
+			headerStateHash = headerState.hash
+			headerStateHeight = int32(headerState.height)
+			storedHash, err := dbFetchHashByHeight(dbTx,
+				int32(headerState.height))
+			if err != nil || !storedHash.IsEqual(&headerState.hash) {
+				needHeightRebuild = true
+			}
+		}
+
 		// Load the raw block bytes for the best block.
 		blockBytes, err := dbTx.FetchBlock(&state.hash)
 		if err != nil {
@@ -1551,6 +1807,18 @@ func (b *BlockChain) initChainState() error {
 	})
 	if err != nil {
 		return err
+	}
+
+	// Rebuild the height-to-hash index for the best header chain when the
+	// stored copy is missing or stale.  This is a one-time O(n) sequential
+	// backfill over the persisted block index for databases that were synced
+	// before the height index was maintained for header-only nodes.
+	if needHeightRebuild {
+		log.Infof("Rebuilding height-to-hash index for the best header "+
+			"chain (height %d)...", headerStateHeight)
+		if err := b.rebuildHeightIndex(&headerStateHash, headerStateHeight); err != nil {
+			return err
+		}
 	}
 
 	// As we might have updated the index after it was loaded, we'll
@@ -1712,6 +1980,35 @@ func (b *BlockChain) BlockByHash(hash *chainhash.Hash) (*btcutil.Block, error) {
 	} else if !b.bestChain.Contains(node) {
 		str := fmt.Sprintf("block %s is not in the main chain", hash)
 		return nil, errNotInMainChain(str)
+	}
+
+	// Load the block from the database and return it.
+	var block *btcutil.Block
+	err := b.db.View(func(dbTx database.Tx) error {
+		var err error
+		block, err = dbFetchBlockByNode(dbTx, node)
+		return err
+	})
+	return block, err
+}
+
+// FetchBlockByHash returns the block with the given hash from the database,
+// regardless of whether it is currently part of the best chain.  This is
+// intended for resuming a block download after a restart: blocks that were
+// already downloaded and stored but never connected can be replayed through the
+// connection logic from disk.
+//
+// This function is safe for concurrent access.
+func (b *BlockChain) FetchBlockByHash(hash *chainhash.Hash) (*btcutil.Block, error) {
+	// Lookup the block hash in the block index, falling back to a cold
+	// materialization when the block has been evicted from the in-memory
+	// header window.
+	node := b.index.LookupNode(hash)
+	if node == nil {
+		node = b.materializeColdNode(hash)
+		if node == nil {
+			return nil, fmt.Errorf("block %s is not known", hash)
+		}
 	}
 
 	// Load the block from the database and return it.
