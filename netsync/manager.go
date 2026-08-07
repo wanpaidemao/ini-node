@@ -241,6 +241,7 @@ type blockSyncState struct {
 	peerSlice   map[*peerpkg.Peer]*blockSlice // slice currently assigned to each peer
 	sliceLen    int32                         // max height span handed to a peer at once
 	lastReissue time.Time                     // last time a stale slice was reissued
+	lastProgress map[*peerpkg.Peer]time.Time  // last time each peer delivered a block
 }
 
 // limitAdd is a helper function for maps that require a maximum limit by
@@ -886,6 +887,7 @@ func (sm *SyncManager) handleStallSample() {
 	// a slow peer cannot stall the parallel block download.
 	if sm.blockSyncState != nil {
 		sm.reissueStaleBlockSlices()
+		sm.reissueStalledBlockPeers()
 	}
 
 	// If we don't have an active sync peer, exit early.
@@ -1178,6 +1180,12 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 	// will fail the insert and thus we'll retry next time we get an inv.
 	delete(state.requestedBlocks, *blockHash)
 	delete(sm.requestedBlocks, *blockHash)
+
+	// Record the peer's delivery so a parallel block-download peer that has
+	// stopped producing data can be detected and freed by the stall handler.
+	if bs := sm.blockSyncState; bs != nil {
+		bs.lastProgress[peer] = time.Now()
+	}
 
 	// Process the block to include validation, best chain selection, orphan
 	// handling, etc.
@@ -1867,11 +1875,12 @@ func (sm *SyncManager) finishHeaderSync() {
 		sliceLen = 1
 	}
 	sm.blockSyncState = &blockSyncState{
-		nextAssign: bestHeight + 1,
-		target:     bestHeaderHeight,
-		slices:     make(map[int32]*blockSlice),
-		peerSlice:  make(map[*peerpkg.Peer]*blockSlice),
-		sliceLen:   sliceLen,
+		nextAssign:   bestHeight + 1,
+		target:       bestHeaderHeight,
+		slices:       make(map[int32]*blockSlice),
+		peerSlice:    make(map[*peerpkg.Peer]*blockSlice),
+		sliceLen:     sliceLen,
+		lastProgress: make(map[*peerpkg.Peer]time.Time),
 	}
 
 	// Use the first participating peer as the sync peer so stall handling and
@@ -2048,6 +2057,49 @@ func (sm *SyncManager) reissueStaleBlockSlices() {
 		delete(bs.peerSlice, sl.peer)
 		sm.assignBlockSlice(target)
 		break
+	}
+}
+
+// reissueStalledBlockPeers frees a participating block-download peer that has
+// not delivered a single block within blockSliceStallTimeout.  Such a peer has
+// a slice whose heights were all requested (so the slice was released), but the
+// in-flight blocks never arrive, so its requestedBlocks stays full and
+// blkDownload never tops it up -- leaving the peer idle forever.  Its in-flight
+// set is cleared and a fresh slice is assigned so the download does not lose a
+// worker.
+func (sm *SyncManager) reissueStalledBlockPeers() {
+	bs := sm.blockSyncState
+	if bs == nil {
+		return
+	}
+	if bs.lastProgress == nil {
+		bs.lastProgress = make(map[*peerpkg.Peer]time.Time)
+	}
+
+	now := time.Now()
+	for _, p := range sm.blockSync {
+		state := sm.peerStates[p]
+		if state == nil || len(state.requestedBlocks) == 0 {
+			continue
+		}
+		last, ok := bs.lastProgress[p]
+		if !ok {
+			// Give a freshly-added peer one grace period to start
+			// delivering before it can be cleared.
+			bs.lastProgress[p] = now
+			continue
+		}
+		if now.Sub(last) < blockSliceStallTimeout {
+			continue
+		}
+
+		log.Warnf("Freeing %d in-flight blocks from peer %v after it "+
+			"stalled in the parallel block download", len(state.requestedBlocks),
+			p.Addr())
+		sm.clearRequestedState(state)
+		sm.releaseBlockSlice(p)
+		sm.fetchHeaderBlocks(p)
+		bs.lastProgress[p] = now
 	}
 }
 

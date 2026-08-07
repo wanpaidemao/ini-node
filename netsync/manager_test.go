@@ -1750,6 +1750,97 @@ func heightOfHash(t *testing.T, sm *SyncManager, hash chainhash.Hash) int32 {
 	return 0
 }
 
+// TestReissueStalledBlockPeer verifies that a participating block-download peer
+// that has stopped delivering blocks is freed by the stall handler: its
+// in-flight set is cleared and a fresh slice is assigned so the download does
+// not permanently lose a worker to an idle "zombie" peer.
+func TestReissueStalledBlockPeer(t *testing.T) {
+	params := chaincfg.RegressionNetParams
+	params.Checkpoints = nil
+
+	sm, tearDown := makeMockSyncManager(t, &params)
+	defer tearDown()
+
+	const numBlocks = 60
+	for _, hdr := range makeTestHeaderChain(t, &params, numBlocks) {
+		_, err := sm.chain.ProcessBlockHeader(hdr, blockchain.BFNoPoWCheck, false)
+		require.NoError(t, err)
+	}
+
+	peers := newHeaderSyncPeers(t, sm, 3, numBlocks)
+	sm.syncPeer = peers[0]
+	sm.ibdMode = true
+	sm.blockSync = append([]*peer.Peer(nil), peers...)
+	sm.blockSyncState = &blockSyncState{
+		nextAssign:   1,
+		target:       numBlocks,
+		slices:       make(map[int32]*blockSlice),
+		peerSlice:    make(map[*peer.Peer]*blockSlice),
+		sliceLen:     10,
+		lastProgress: make(map[*peer.Peer]time.Time),
+	}
+	sm.requestedBlocks = make(map[chainhash.Hash]struct{})
+
+	hashAt := func(h int32) chainhash.Hash {
+		hash, err := sm.chain.HeaderHashByHeight(h)
+		require.NoError(t, err)
+		return *hash
+	}
+
+	// peers[0] owns heights 1..10 but has not delivered anything for well
+	// past the stall timeout.  The other two peers have in-flight blocks too
+	// but delivered recently, so they must not be touched.
+	stalledState := &peerSyncState{
+		syncCandidate:   true,
+		requestedTxns:   make(map[chainhash.Hash]struct{}),
+		requestedBlocks: make(map[chainhash.Hash]struct{}),
+	}
+	for h := int32(1); h <= 10; h++ {
+		stalledState.requestedBlocks[hashAt(h)] = struct{}{}
+		sm.requestedBlocks[hashAt(h)] = struct{}{}
+	}
+	sm.peerStates[peers[0]] = stalledState
+	startProgress := map[*peer.Peer]time.Time{}
+	sm.blockSyncState.lastProgress[peers[0]] =
+		time.Now().Add(-2 * blockSliceStallTimeout)
+	startProgress[peers[0]] = sm.blockSyncState.lastProgress[peers[0]]
+
+	for i := 1; i < len(peers); i++ {
+		state := sm.peerStates[peers[i]]
+		for h := int32(11 + (i-1)*10); h <= int32(20+(i-1)*10); h++ {
+			state.requestedBlocks[hashAt(h)] = struct{}{}
+			sm.requestedBlocks[hashAt(h)] = struct{}{}
+		}
+		sm.blockSyncState.lastProgress[peers[i]] = time.Now()
+		startProgress[peers[i]] = sm.blockSyncState.lastProgress[peers[i]]
+	}
+
+	sm.reissueStalledBlockPeers()
+
+	// peers[0] must have been freed and restarted: its progress timestamp
+	// was refreshed (proving the stall path executed), it has a fresh
+	// in-flight set re-claiming the front hole at 1..10, and the chain is
+	// still consistent.
+	require.True(t, sm.blockSyncState.lastProgress[peers[0]].
+		After(startProgress[peers[0]]),
+		"stalled peer's progress timestamp should be refreshed")
+	require.NotEmpty(t, sm.peerStates[peers[0]].requestedBlocks,
+		"stalled peer should be re-requesting blocks")
+	for h := range sm.peerStates[peers[0]].requestedBlocks {
+		require.LessOrEqual(t, heightOfHash(t, sm, h), int32(10),
+			"front hole at heights 1..10 should be re-claimed first")
+	}
+
+	// The healthy peers must have been left untouched: they keep their
+	// in-flight sets and their progress timestamps are not refreshed.
+	require.NotEmpty(t, sm.peerStates[peers[1]].requestedBlocks)
+	require.NotEmpty(t, sm.peerStates[peers[2]].requestedBlocks)
+	require.Equal(t, startProgress[peers[1]], sm.blockSyncState.lastProgress[peers[1]],
+		"healthy peer should not be refreshed")
+	require.Equal(t, startProgress[peers[2]], sm.blockSyncState.lastProgress[peers[2]],
+		"healthy peer should not be refreshed")
+}
+
 // TestParallelBlockDownloadDropPeer verifies that when a participating peer
 // disconnects mid-download it is removed from blockSync and its in-flight
 // blocks are freed back to the global requestedBlocks pool, so a remaining
