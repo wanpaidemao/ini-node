@@ -1613,6 +1613,143 @@ func TestParallelBlockDownloadDisjoint(t *testing.T) {
 	}
 }
 
+// TestParallelBlockDownloadAllPeersServed verifies that every participating
+// peer in a parallel block download is handed a disjoint slice of the chain,
+// rather than the whole download collapsing onto the single sync peer.  The
+// assignment frontier must only ever advance: released heights are already in
+// flight or connected, so re-issuing them to the next peer would produce an
+// empty getdata and starve it (the bug that reduced the parallel download to a
+// single peer).  Each peer claims its own slice, and a second blkDownload round
+// hands the next slice to whoever has drained, keeping the frontier moving.
+func TestParallelBlockDownloadAllPeersServed(t *testing.T) {
+	params := chaincfg.RegressionNetParams
+	params.Checkpoints = nil
+
+	sm, tearDown := makeMockSyncManager(t, &params)
+	defer tearDown()
+
+	// Install headers for 60 blocks while the chain stays at genesis, then
+	// initialize a parallel block download with 5 peers and a slice length
+	// of 10 so the request window comfortably exceeds one slice per peer.
+	const numBlocks = 60
+	for _, hdr := range makeTestHeaderChain(t, &params, numBlocks) {
+		_, err := sm.chain.ProcessBlockHeader(hdr, blockchain.BFNoPoWCheck, false)
+		require.NoError(t, err)
+	}
+	_, bestHeaderHeight := sm.chain.BestHeader()
+	require.Equal(t, int32(numBlocks), bestHeaderHeight)
+
+	hashAt := func(h int32) chainhash.Hash {
+		hash, err := sm.chain.HeaderHashByHeight(h)
+		require.NoError(t, err)
+		return *hash
+	}
+
+	peers := newHeaderSyncPeers(t, sm, 5, numBlocks)
+	sm.syncPeer = peers[0]
+	sm.ibdMode = true
+	sm.blockSync = append([]*peer.Peer(nil), peers...)
+	sm.blockSyncState = &blockSyncState{
+		nextAssign: 1,
+		target:     numBlocks,
+		slices:     make(map[int32]*blockSlice),
+		peerSlice:  make(map[*peer.Peer]*blockSlice),
+		sliceLen:   10,
+	}
+
+	// blkDownload tops up every peer whose in-flight count is below the
+	// minimum.  With a fresh download that is all of them, so all 5 peers
+	// must be handed non-overlapping slices covering heights 1..50.  A
+	// slice is released as soon as every height in it has been requested
+	// (the block messages are still in flight), so what must hold is that
+	// every peer owns a disjoint set of requested blocks, not that the
+	// slice objects persist.
+	sm.blkDownload()
+
+	// All 50 requested hashes (1..50) must be in the global pool exactly
+	// once, and no peer's requested set may overlap another's.
+	for h := int32(1); h <= 50; h++ {
+		require.Contains(t, sm.requestedBlocks, hashAt(h))
+	}
+	for h := int32(51); h <= numBlocks; h++ {
+		require.NotContains(t, sm.requestedBlocks, hashAt(h))
+	}
+	for i, p := range peers {
+		require.NotEmpty(t, sm.peerStates[p].requestedBlocks,
+			"peer %v should have been handed a slice", p)
+		for j, q := range peers {
+			if i == j {
+				continue
+			}
+			for h := range sm.peerStates[p].requestedBlocks {
+				require.NotContains(t, sm.peerStates[q].requestedBlocks, h,
+					"peer slices overlap at hash %v", h)
+			}
+		}
+	}
+
+	// The frontier must only ever advance: handing out a fresh slice after
+	// a peer has drained must not re-issue heights that are still in flight
+	// from the earlier assignment.  Construct the scenario directly: peers
+	// 1..4 claim the whole window [1..40] as disjoint slices so the front
+	// height 1 stays in flight, peers[0] is drained, and its next slice
+	// must be carved past the current frontier instead of rewinding onto
+	// the already-requested heights.
+	sm.blockSyncState = &blockSyncState{
+		nextAssign: 41,
+		target:     numBlocks,
+		slices:     make(map[int32]*blockSlice),
+		peerSlice:  make(map[*peer.Peer]*blockSlice),
+		sliceLen:   10,
+	}
+	sm.requestedBlocks = make(map[chainhash.Hash]struct{})
+	for h := int32(1); h <= 40; h++ {
+		sm.requestedBlocks[hashAt(h)] = struct{}{}
+	}
+	for i, p := range peers {
+		state := sm.peerStates[p]
+		state.requestedBlocks = make(map[chainhash.Hash]struct{})
+		for h := int32(1+i*10); h <= int32(10+i*10); h++ {
+			state.requestedBlocks[hashAt(h)] = struct{}{}
+		}
+	}
+	sm.peerStates[peers[0]] = &peerSyncState{
+		syncCandidate:   true,
+		requestedTxns:   make(map[chainhash.Hash]struct{}),
+		requestedBlocks: make(map[chainhash.Hash]struct{}),
+	}
+	require.True(t, sm.assignBlockSlice(peers[0]),
+		"assignBlockSlice should hand the drained peer the next slice")
+	require.NotNil(t, sm.blockSyncState.peerSlice[peers[0]])
+	require.Greater(t, sm.blockSyncState.peerSlice[peers[0]].start, int32(40))
+	sm.fetchHeaderBlocks(peers[0])
+	for h := int32(41); h <= 50; h++ {
+		require.Contains(t, sm.peerStates[peers[0]].requestedBlocks, hashAt(h),
+			"drained peer should be handed heights past the frontier")
+	}
+	require.NotEmpty(t, sm.peerStates[peers[0]].requestedBlocks)
+	for h := range sm.peerStates[peers[0]].requestedBlocks {
+		require.Greater(t, heightOfHash(t, sm, h), int32(40),
+			"released slice must not be re-issued to the drained peer")
+	}
+}
+
+// heightOfHash resolves the block height for a hash by searching the header
+// chain.
+func heightOfHash(t *testing.T, sm *SyncManager, hash chainhash.Hash) int32 {
+	t.Helper()
+	_, bestHeaderHeight := sm.chain.BestHeader()
+	for h := int32(1); h <= bestHeaderHeight; h++ {
+		headerHash, err := sm.chain.HeaderHashByHeight(h)
+		require.NoError(t, err)
+		if *headerHash == hash {
+			return h
+		}
+	}
+	t.Fatalf("hash %v not found in header chain", hash)
+	return 0
+}
+
 // TestParallelBlockDownloadDropPeer verifies that when a participating peer
 // disconnects mid-download it is removed from blockSync and its in-flight
 // blocks are freed back to the global requestedBlocks pool, so a remaining

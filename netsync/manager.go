@@ -75,6 +75,15 @@ const (
 	// to another peer is always safe even while the previous request for it
 	// is still in flight.
 	headerRangeStallTimeout = 6 * time.Second
+
+	// blockSliceStallTimeout is the amount of time an in-flight block slice
+	// is allowed to remain without any of its blocks being requested by the
+	// peer before it is re-issued to a different peer.  It is longer than
+	// headerRangeStallTimeout because block responses are large and the
+	// per-slice window is bounded, so a peer needs more time to stream it.
+	// The re-issue clears the slice's hashes from the global request pool
+	// first, so the taking-over peer actually re-requests them.
+	blockSliceStallTimeout = 30 * time.Second
 )
 
 // zeroHash is the zero value hash (all zeros).  It is defined as a convenience.
@@ -210,23 +219,28 @@ type headerSyncState struct {
 }
 
 // blockSlice represents the contiguous range of block heights assigned to a
-// single peer during a parallel initial block download.  Ranges handed to
-// different peers never overlap because they are carved out of a single
-// advancing frontier, so each peer fetches a disjoint slice of the chain in
-// parallel.
+// single peer during a parallel initial block download.  Slices handed to
+// different peers never overlap: the assignment frontier only ever advances
+// and the front of an assigned slice is capped by the next already-assigned
+// slice (see nextSliceBeyond), so each peer fetches a disjoint slice of the
+// chain in parallel.
 type blockSlice struct {
-	start int32
-	end   int32
+	start      int32
+	end        int32
+	peer       *peerpkg.Peer
+	assignedAt time.Time
 }
 
 // blockSyncState tracks the parallel (multi-peer) initial block download.  It
 // is only accessed from the blockHandler goroutine and is non-nil while blocks
 // are being fetched from several peers simultaneously.
 type blockSyncState struct {
-	nextAssign int32                         // next height to hand out to a peer
-	target     int32                         // highest header height to reach
-	peerSlice  map[*peerpkg.Peer]*blockSlice // slice currently assigned to each peer
-	sliceLen   int32                         // max height span handed to a peer at once
+	nextAssign  int32                         // next height to hand out to a peer
+	target      int32                         // highest header height to reach
+	slices      map[int32]*blockSlice         // assigned slices by start height
+	peerSlice   map[*peerpkg.Peer]*blockSlice // slice currently assigned to each peer
+	sliceLen    int32                         // max height span handed to a peer at once
+	lastReissue time.Time                     // last time a stale slice was reissued
 }
 
 // limitAdd is a helper function for maps that require a maximum limit by
@@ -868,6 +882,12 @@ func (sm *SyncManager) handleStallSample() {
 		sm.reissueStaleHeaderRanges()
 	}
 
+	// Likewise re-issue any block slice that has been in flight too long so
+	// a slow peer cannot stall the parallel block download.
+	if sm.blockSyncState != nil {
+		sm.reissueStaleBlockSlices()
+	}
+
 	// If we don't have an active sync peer, exit early.
 	if sm.syncPeer == nil {
 		return
@@ -1329,10 +1349,13 @@ func (sm *SyncManager) fetchHeaderBlocks(peer *peerpkg.Peer) {
 }
 
 // assignBlockSlice hands the next unassigned, non-overlapping slice of the
-// block chain to the given peer, if it does not already have one.  Slices are
-// carved out of a single advancing frontier so they never overlap, and are
-// capped at the same bounded window ahead of the connected best chain that the
-// single-peer path used.  It returns true if a slice was assigned.
+// block chain to the given peer, if it does not already have one.  It prefers
+// to fill a hole at the front of the download (left by a dropped or stalled
+// peer) and otherwise extends the contiguous frontier.  The slice is capped by
+// the bounded request window ahead of the connected best chain and by the next
+// already-assigned slice so slices never overlap.  The assignment frontier only
+// ever advances; released heights are already in flight or connected and are
+// never handed out again.  It returns true if a slice was assigned.
 func (sm *SyncManager) assignBlockSlice(peer *peerpkg.Peer) bool {
 	bs := sm.blockSyncState
 	if bs == nil || peer == nil {
@@ -1357,36 +1380,89 @@ func (sm *SyncManager) assignBlockSlice(peer *peerpkg.Peer) bool {
 	if bs.nextAssign <= bestHeight {
 		bs.nextAssign = bestHeight + 1
 	}
-	if bs.nextAssign > windowEnd {
+
+	// Fill a front hole first; otherwise extend the frontier.  A hole
+	// exists when the first height after the connected tip has not already
+	// been requested by any peer (e.g. a dropped or stalled peer owned it
+	// and its request was freed).  If the front height is already in flight
+	// the frontier simply extends past it; the front slice may have been
+	// released by buildBlockRequest once its heights were all requested
+	// while the block messages themselves are still in flight.
+	start := bs.nextAssign
+	frontHash, err := sm.chain.HeaderHashByHeight(bestHeight + 1)
+	frontInFlight := err == nil
+	if frontInFlight {
+		_, frontInFlight = sm.requestedBlocks[*frontHash]
+	}
+	if !frontInFlight && bestHeight+1 <= windowEnd {
+		start = bestHeight + 1
+	}
+	if start > windowEnd {
 		return false
 	}
 
-	start := bs.nextAssign
+	// Slices are half-open [start, end): end is the first height NOT
+	// included.  The request window is capped at windowEnd (an inclusive
+	// highest height), so a slice truncated by the window must end one past
+	// it to still cover that height.
 	end := start + bs.sliceLen
-	if end > windowEnd {
-		end = windowEnd
+	if end > windowEnd+1 {
+		end = windowEnd + 1
+	}
+	// Never overlap a slice already handed out beyond the start.
+	if sl, ok := bs.nextSliceBeyond(start); ok {
+		if nextStart := sl.start; nextStart < end {
+			end = nextStart
+		}
 	}
 	if end <= start {
 		return false
 	}
 
-	bs.peerSlice[peer] = &blockSlice{start: start, end: end}
-	bs.nextAssign = end
+	sl := &blockSlice{
+		start:      start,
+		end:        end,
+		peer:       peer,
+		assignedAt: time.Now(),
+	}
+	bs.slices[start] = sl
+	bs.peerSlice[peer] = sl
+
+	// Only advance the contiguous frontier for fresh (non hole-filling)
+	// assignments.
+	if start == bs.nextAssign {
+		bs.nextAssign = end
+	}
 	return true
 }
 
+// nextSliceBeyond returns the already-assigned block slice with the smallest
+// start height greater than the passed start, if any.
+func (bs *blockSyncState) nextSliceBeyond(start int32) (*blockSlice, bool) {
+	var best *blockSlice
+	for s, sl := range bs.slices {
+		if s <= start {
+			continue
+		}
+		if best == nil || s < best.start {
+			best = sl
+		}
+	}
+	return best, best != nil
+}
+
 // releaseBlockSlice frees a peer's slice so the next top-up can hand it a fresh
-// slice.  It also rewinds the assignment frontier so the released heights are
-// assignable again instead of being skipped forever.
+// slice.  The assignment frontier is deliberately not modified: released
+// heights are either already connected or still in flight to the peer, so
+// handing them out again would just produce an empty request for the next peer
+// (every height would be skipped as already requested) and starve it.
 func (sm *SyncManager) releaseBlockSlice(peer *peerpkg.Peer) {
 	bs := sm.blockSyncState
 	if bs == nil || peer == nil {
 		return
 	}
 	if sl, ok := bs.peerSlice[peer]; ok {
-		if sl.start < bs.nextAssign {
-			bs.nextAssign = sl.start
-		}
+		delete(bs.slices, sl.start)
 		delete(bs.peerSlice, peer)
 	}
 }
@@ -1446,8 +1522,10 @@ func (sm *SyncManager) buildBlockRequest(peer *peerpkg.Peer) *wire.MsgGetData {
 			sl = bs.peerSlice[peer]
 		}
 		startHeight = sl.start
-		if sl.end < requestEnd {
-			requestEnd = sl.end
+		// Slices are half-open [start, end) so the loop below (which is
+		// inclusive of requestEnd) must stop one before the slice end.
+		if sl.end-1 < requestEnd {
+			requestEnd = sl.end - 1
 		}
 		inSlice = true
 	} else {
@@ -1791,6 +1869,7 @@ func (sm *SyncManager) finishHeaderSync() {
 	sm.blockSyncState = &blockSyncState{
 		nextAssign: bestHeight + 1,
 		target:     bestHeaderHeight,
+		slices:     make(map[int32]*blockSlice),
 		peerSlice:  make(map[*peerpkg.Peer]*blockSlice),
 		sliceLen:   sliceLen,
 	}
@@ -1907,6 +1986,68 @@ func (sm *SyncManager) reissueStaleHeaderRanges() {
 			sm.reissueHeaderRange(p, start)
 			break
 		}
+	}
+}
+
+// reissueStaleBlockSlices reassigns any in-flight block slice that has not
+// made progress within blockSliceStallTimeout to a different idle peer so a
+// slow or unresponsive peer cannot stall the parallel block download.  The
+// slice's heights are first freed from the global request pool so the taking
+// over peer actually re-requests them instead of skipping them as already
+// in flight.
+func (sm *SyncManager) reissueStaleBlockSlices() {
+	bs := sm.blockSyncState
+	if bs == nil {
+		return
+	}
+
+	now := time.Now()
+	for start, sl := range bs.slices {
+		if now.Sub(sl.assignedAt) < blockSliceStallTimeout {
+			continue
+		}
+
+		// The slice may be entirely connected already (assignedAt was
+		// set at assignment time); only re-issue heights that are still
+		// pending, and prefer an idle peer to take over the slice.
+		if _, ok := bs.peerSlice[sl.peer]; !ok {
+			continue
+		}
+		var target *peerpkg.Peer
+		for _, p := range sm.blockSync {
+			if p == sl.peer {
+				continue
+			}
+			if _, ok := bs.peerSlice[p]; ok {
+				continue
+			}
+			target = p
+			break
+		}
+		if target == nil {
+			continue
+		}
+
+		// Free the stale slice's hashes from the global request pool so
+		// the taking over peer can re-request them.  The old peer's own
+		// requestedBlocks is left untouched: if its late response
+		// arrives, handleBlockMsg still sees it as requested and simply
+		// processes the duplicate (which the chain already has).
+		for h := sl.start; h < sl.end; h++ {
+			hash, err := sm.chain.HeaderHashByHeight(h)
+			if err != nil {
+				continue
+			}
+			delete(sm.requestedBlocks, *hash)
+		}
+
+		log.Warnf("Re-issuing block slice [%d,%d] from peer %v to peer %v "+
+			"after it stalled", sl.start, sl.end-1, sl.peer.Addr(),
+			target.Addr())
+		delete(bs.slices, start)
+		delete(bs.peerSlice, sl.peer)
+		sm.assignBlockSlice(target)
+		break
 	}
 }
 
