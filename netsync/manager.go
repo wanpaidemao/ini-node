@@ -84,6 +84,16 @@ const (
 	// The re-issue clears the slice's hashes from the global request pool
 	// first, so the taking-over peer actually re-requests them.
 	blockSliceStallTimeout = 30 * time.Second
+
+	// blockInFlightTarget is the number of blocks each participating peer in
+	// the parallel block download keeps in flight at a time.  A single
+	// buildBlockRequest fills the peer's window up to this target instead of
+	// draining its whole slice at once, so a slow peer keeps getting topped
+	// up by blkDownload instead of sitting idle behind a full in-flight set
+	// that never drains.  Draining an entire slice at once starved every peer
+	// but the fastest one, which alone re-claimed the new frontier slices and
+	// reduced the parallel download to a single peer.
+	blockInFlightTarget = 200
 )
 
 // zeroHash is the zero value hash (all zeros).  It is defined as a convenience.
@@ -1403,7 +1413,17 @@ func (sm *SyncManager) assignBlockSlice(peer *peerpkg.Peer) bool {
 		_, frontInFlight = sm.requestedBlocks[*frontHash]
 	}
 	if !frontInFlight && bestHeight+1 <= windowEnd {
-		start = bestHeight + 1
+		// The front slice is the critical one: whoever holds it controls
+		// how fast the tip advances.  A peer that has just been freed for
+		// stalling must not immediately re-claim it, or it would just
+		// freeze the download again; prefer a peer that has recently shown
+		// it can deliver.
+		if last, ok := bs.lastProgress[peer]; !ok ||
+			time.Since(last) < blockSliceStallTimeout {
+			start = bestHeight + 1
+		} else {
+			return false
+		}
 	}
 	if start > windowEnd {
 		return false
@@ -1588,7 +1608,7 @@ func (sm *SyncManager) buildBlockRequest(peer *peerpkg.Peer) *wire.MsgGetData {
 			numRequested++
 		}
 
-		if numRequested >= wire.MaxInvPerMsg {
+		if numRequested >= blockInFlightTarget && h < requestEnd {
 			completed = false
 			break
 		}

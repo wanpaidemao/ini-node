@@ -1841,6 +1841,58 @@ func TestReissueStalledBlockPeer(t *testing.T) {
 		"healthy peer should not be refreshed")
 }
 
+// TestBlockInFlightThrottle verifies that a single buildBlockRequest only tops
+// the peer's in-flight set up to blockInFlightTarget instead of draining its
+// whole slice at once.  Draining a whole slice starved every peer but the
+// fastest one (its full in-flight set never dropped below the top-up floor, so
+// it was never handed a fresh slice), collapsing the parallel download onto a
+// single peer.  Throttling keeps each peer requesting in small batches, and the
+// slice is only released once every height in it has been requested.
+func TestBlockInFlightThrottle(t *testing.T) {
+	params := chaincfg.RegressionNetParams
+	params.Checkpoints = nil
+
+	sm, tearDown := makeMockSyncManager(t, &params)
+	defer tearDown()
+
+	// A slice bigger than blockInFlightTarget so a single request cannot
+	// cover it all.
+	const numBlocks = 2 * blockInFlightTarget
+	for _, hdr := range makeTestHeaderChain(t, &params, numBlocks) {
+		_, err := sm.chain.ProcessBlockHeader(hdr, blockchain.BFNoPoWCheck, false)
+		require.NoError(t, err)
+	}
+
+	peers := newHeaderSyncPeers(t, sm, 1, int32(numBlocks))
+	sm.syncPeer = peers[0]
+	sm.ibdMode = true
+	sm.blockSync = append([]*peer.Peer(nil), peers...)
+	sm.blockSyncState = &blockSyncState{
+		nextAssign:   1,
+		target:       int32(numBlocks),
+		slices:       make(map[int32]*blockSlice),
+		peerSlice:    make(map[*peer.Peer]*blockSlice),
+		sliceLen:     int32(numBlocks),
+		lastProgress: make(map[*peer.Peer]time.Time),
+	}
+
+	// First top-up: exactly blockInFlightTarget blocks requested and the
+	// slice is retained for later top-ups.
+	sm.fetchHeaderBlocks(peers[0])
+	require.Len(t, sm.peerStates[peers[0]].requestedBlocks, blockInFlightTarget,
+		"first request should be throttled to blockInFlightTarget")
+	require.NotNil(t, sm.blockSyncState.peerSlice[peers[0]],
+		"slice should be retained while the request window is not exhausted")
+
+	// Second top-up: the remaining heights are requested and once the slice
+	// is fully covered it is released.
+	sm.fetchHeaderBlocks(peers[0])
+	require.Len(t, sm.peerStates[peers[0]].requestedBlocks, numBlocks,
+		"second request should finish the slice")
+	require.Nil(t, sm.blockSyncState.peerSlice[peers[0]],
+		"slice should be released once every height in it was requested")
+}
+
 // TestParallelBlockDownloadDropPeer verifies that when a participating peer
 // disconnects mid-download it is removed from blockSync and its in-flight
 // blocks are freed back to the global requestedBlocks pool, so a remaining
