@@ -758,70 +758,85 @@ func (bi *blockIndex) InactiveTips(bestChain *chainView) []*blockNode {
 // available as well.  That assumption is only relied upon by initChainState
 // when converting an old db without the best header state key, and the new
 // startup path never uses header-only block nodes as a source of block data.
+// flushToDB writes all dirty block nodes to the database. If all writes
+// succeed, this clears the dirty set.
 func (bi *blockIndex) flushToDB() error {
 	bi.Lock()
 	if len(bi.dirty) == 0 {
 		bi.Unlock()
 		return nil
 	}
-
 	err := bi.db.Update(func(dbTx database.Tx) error {
-		for node := range bi.dirty {
-			err := dbStoreBlockNode(dbTx, node)
-			if err != nil {
-				return err
-			}
-			err = dbPutHashIndex(dbTx, &node.hash, node.height)
-			if err != nil {
-				return err
-			}
-
-			// Maintain the height-to-hash mapping for nodes on the best
-			// header chain so the DB cold-read fallback can resolve evicted
-			// heights.  Side-chain rows are skipped since they must never
-			// claim a main-chain height, and rows below the window are no
-			// longer dirty because an earlier flush already persisted them.
-			if bi.bestHeaderView != nil && bi.bestHeaderView.Contains(node) {
-				err = dbPutHeightIndex(dbTx, node.height, &node.hash)
-				if err != nil {
-					return err
-				}
-			}
-		}
-
-		// Persist the best header state in the same transaction so the
-		// stored header tip is always consistent with the written block
-		// index rows.
-		if bi.bestHeaderNode != nil {
-			if tip := bi.bestHeaderNode(); tip != nil {
-				err := dbPutBestHeaderState(dbTx, &tip.hash, tip.height)
-				if err != nil {
-					return err
-				}
-			}
-		}
-		return nil
+		return bi.flushDirtyLocked(dbTx)
 	})
-
-	// If write was successful, clear the dirty set and evict the nodes
-	// that have fallen out of the in-memory header window.  Eviction is a
-	// no-op until the block index has been fully initialized and when the
-	// window is disabled.
-	//
-	// Eviction is also throttled: it scans the entire in-memory index and
-	// is O(indexSize), so deferring it to run only once every
-	// blockFlushBatchSize flushes removes the per-block O(indexSize) scan
-	// during initial block download without giving up crash consistency
-	// (which the per-block write above preserves).
 	if err == nil {
-		bi.dirty = make(map[*blockNode]struct{})
-		bi.evictCount++
-		if bi.evictCount >= blockFlushBatchSize {
-			bi.evictCount = 0
-			bi.evictWindow()
+		bi.finishFlushLocked()
+	}
+	bi.Unlock()
+	return err
+}
+
+// flushToDBTx writes all dirty block nodes into the provided database
+// transaction without committing it.  The caller is responsible for committing
+// the transaction and, once the transaction has committed, for calling
+// finishFlush to clear the in-memory dirty set and run throttled window
+// eviction.  This lets connectBlock fold the per-block block-index write into
+// the same transaction that commits the chain state (best state, spend journal,
+// UTXO consistency), so each block costs a single database commit instead of
+// two, without ever committing a chain state ahead of the block index rows it
+// points at.
+//
+// This method must be called with bi.Lock held.
+func (bi *blockIndex) flushDirtyLocked(dbTx database.Tx) error {
+	if len(bi.dirty) == 0 {
+		return nil
+	}
+	for node := range bi.dirty {
+		if err := dbStoreBlockNode(dbTx, node); err != nil {
+			return err
+		}
+		if err := dbPutHashIndex(dbTx, &node.hash, node.height); err != nil {
+			return err
+		}
+
+		// Maintain the height-to-hash mapping for nodes on the best header
+		// chain so the DB cold-read fallback can resolve evicted heights.
+		// Side-chain rows are skipped since they must never claim a
+		// main-chain height, and rows below the window are no longer dirty
+		// because an earlier flush already persisted them.
+		if bi.bestHeaderView != nil && bi.bestHeaderView.Contains(node) {
+			if err := dbPutHeightIndex(dbTx, node.height, &node.hash); err != nil {
+				return err
+			}
 		}
 	}
 
-	bi.Unlock()
-	return err
+	// Persist the best header state in the same transaction so the stored
+	// header tip is always consistent with the written block index rows.
+	if bi.bestHeaderNode != nil {
+		if tip := bi.bestHeaderNode(); tip != nil {
+			if err := dbPutBestHeaderState(dbTx, &tip.hash, tip.height); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// finalizeFlushLocked must be called (with bi.Lock held) after dirty block
+// nodes have been committed, whether through flushToDB's own transaction or
+// through flushDirtyTx + an external commit.  It clears the dirty set and evicts
+// nodes that have fallen out of the in-memory header window.
+//
+// Eviction is also throttled: it scans the entire in-memory index and is
+// O(indexSize), so deferring it to run only once every blockFlushBatchSize
+// flushes removes the per-block O(indexSize) scan during initial block download
+// without giving up crash consistency (which the per-block write preserves).
+func (bi *blockIndex) finishFlushLocked() {
+	bi.dirty = make(map[*blockNode]struct{})
+	bi.evictCount++
+	if bi.evictCount >= blockFlushBatchSize {
+		bi.evictCount = 0
+		bi.evictWindow()
+	}
 }

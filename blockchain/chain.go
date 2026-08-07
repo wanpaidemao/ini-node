@@ -640,20 +640,6 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 		}
 	}
 
-	// Write any block status changes to DB before updating best state.
-	//
-	// This flush runs on every block.  It cannot be deferred in the same way
-	// as the header index flush because connectBlock commits the chain state
-	// (best state, spend journal, UTXO consistency) for this block in a
-	// single db.Update below, and the database must therefore never lag the
-	// in-memory block index behind that committed chain state.  The pointer
-	// scalable evictWindow scan is instead throttled inside flushToDB (see
-	// evictWindow) so the per-block write stays small.
-	err := b.index.flushToDB()
-	if err != nil {
-		return err
-	}
-
 	// Generate a new best state snapshot that will be used to update the
 	// database and later memory if all database updates are successful.
 	b.stateLock.RLock()
@@ -666,8 +652,23 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 		curTotalTxns+numTxns, CalcPastMedianTime(node),
 	)
 
-	// Atomically insert info into the database.
-	err = b.db.Update(func(dbTx database.Tx) error {
+	// Write any block status changes to DB before updating best state.
+	//
+	// The block-index write for this block is folded into the same transaction
+	// that commits the chain state (best state, spend journal, UTXO
+	// consistency) below, so the database never commits a chain state ahead of
+	// the block index rows it points at -- crash consistency is preserved --
+	// while each block costs a single database commit instead of two.  The
+	// pointer-scalable evictWindow scan is still throttled to every
+	// blockFlushBatchSize commits (see blockIndex.finishFlushLocked).
+	b.index.Lock()
+	err := b.db.Update(func(dbTx database.Tx) error {
+		// Write any dirty block nodes (including this block) into the
+		// transaction being committed for the chain state.
+		if err := b.index.flushDirtyLocked(dbTx); err != nil {
+			return err
+		}
+
 		// If the pruneTarget isn't 0, we should attempt to delete older blocks
 		// from the database.
 		if b.pruneTarget != 0 {
@@ -739,8 +740,17 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 		return nil
 	})
 	if err != nil {
+		// The transaction was rolled back; releases the index lock so the
+		// dirty set is still intact for a later flush.
+		b.index.Unlock()
 		return err
 	}
+
+	// The transaction committed the block-index rows and chain state together.
+	// Clear the dirty set and run throttled window eviction now that the write
+	// is durable.
+	b.index.finishFlushLocked()
+	b.index.Unlock()
 
 	// This node is now the end of the best chain.
 	b.bestChain.SetTip(node)

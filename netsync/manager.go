@@ -1291,11 +1291,15 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 		}
 	}
 
-	// Fetch more blocks if we're still not caught up to the best header and
-	// the number of in-flight blocks has dropped below the minimum threshold.
+	// Fetch more blocks if we're still not caught up to the best header.
+	// blkDownload tops up any participating peer whose in-flight request count
+	// has drained below minInFlightBlocks.  This must not be gated on the
+	// delivering peer's own request count: the sync peer typically keeps a full
+	// in-flight window, so its block arrivals would never let blkDownload run
+	// and the remaining peers would be handed a single slice at startSync and
+	// then starved, leaving the parallel download running on one peer.
 	_, lastHeight := sm.chain.BestHeader()
-	if bmsg.block.Height() < lastHeight &&
-		len(state.requestedBlocks) < minInFlightBlocks {
+	if bmsg.block.Height() < lastHeight {
 		// Top up the delivering peer and any other drained peer in the
 		// parallel block download.
 		sm.blkDownload()
