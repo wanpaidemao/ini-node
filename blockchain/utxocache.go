@@ -5,7 +5,6 @@
 package blockchain
 
 import (
-	"container/list"
 	"fmt"
 	"sync"
 	"time"
@@ -648,60 +647,69 @@ func (b *BlockChain) InitConsistentState(tip *blockNode, interrupt <-chan struct
 	}
 
 	lastFlushNode := b.index.LookupNode(statusHash)
+
+	// With the in-memory header window, the block node for the last consistent
+	// UTXO state may fall below the window boundary and be evicted from the
+	// index.  Resolve its height via a temporary cold materialization from the
+	// database so an unclean-shutdown recovery does not fault on a nil lookup;
+	// without this a restart with windowing enabled would fail to reconstruct
+	// the UTXO set.
+	if lastFlushNode == nil {
+		lastFlushNode = b.materializeColdNode(statusHash)
+	}
+	if lastFlushNode == nil {
+		return ruleError(ErrPreviousBlockUnknown, fmt.Sprintf(
+			"last utxo consistency status block %v not found in block index",
+			statusHash))
+	}
 	log.Infof("Reconstructing UTXO state after an unclean shutdown. The UTXO state is "+
 		"consistent at block %s (%d) but the chainstate is at block %s (%d),  This may "+
 		"take a long time...", statusHash.String(), lastFlushNode.height,
 		tip.hash.String(), tip.height)
 
-	// Even though this should always be true, make sure the fetched hash is in
-	// the best chain.
-	fork := b.bestChain.FindFork(lastFlushNode)
-	if fork == nil {
-		return AssertError(fmt.Sprintf("last utxo consistency status contains "+
-			"hash that is not in best chain: %v", statusHash))
-	}
-
-	// We never disconnect blocks as they cannot be inconsistent during a reorganization.
-	// This is because The cache is flushed before the reorganization begins and the utxo
-	// set at each block disconnect is written atomically to the database.
-	node := lastFlushNode
-
-	// We replay the blocks from the last consistent state up to the best
-	// state. Iterate forward from the consistent node to the tip of the best
-	// chain.
-	attachNodes := list.New()
-	for n := tip; n.height >= 0; n = n.parent {
-		if n == fork {
-			break
-		}
-		attachNodes.PushFront(n)
-	}
-
-	for e := attachNodes.Front(); e != nil; e = e.Next() {
-		node = e.Value.(*blockNode)
-
-		var block *btcutil.Block
-		err := s.db.View(func(dbTx database.Tx) error {
-			block, err = dbFetchBlockByNode(dbTx, node)
-			if err != nil {
-				return err
-			}
-
+	// The last consistent state and everything after it is necessarily on the
+	// best chain (blocks are never disconnected during a reorganization, and
+	// the cache is flushed before a reorganization begins).  Since the in-memory
+	// parent chain may not reach back to the consistent node when windowing has
+	// evicted it, recover by walking heights forward from the consistent height
+	// instead of by following in-memory parent pointers.  The main-chain height
+	// index must therefore agree on the consistent node's height, which also
+	// re-validates that statusHash is on the best chain.
+	var consistentHeight int32
+	err = s.db.View(func(dbTx database.Tx) error {
+		hash, err := dbFetchHashByHeight(dbTx, lastFlushNode.height)
+		if err != nil {
 			return err
-		})
+		}
+		if !hash.IsEqual(statusHash) {
+			return AssertError(fmt.Sprintf("last utxo consistency status contains "+
+				"hash that fails to match best chain at height %d: %v", lastFlushNode.height, statusHash))
+		}
+		consistentHeight = lastFlushNode.height
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	// Replay the blocks from the last consistent state up to the best state.
+	// Blocks above the in-memory window are read directly from the database by
+	// height, so recovery does not require any parent links that windowing may
+	// have evicted.
+	for height := consistentHeight + 1; height <= tip.height; height++ {
+		block, err := b.fetchBlockByHeight(height)
 		if err != nil {
 			return err
 		}
 
-		err = b.utxoCache.connectTransactions(block, nil)
-		if err != nil {
+		if err := b.utxoCache.connectTransactions(block, nil); err != nil {
 			return err
 		}
 
 		// Flush the utxo cache if needed.  This will in turn update the
 		// consistent state to this block.
-		err = s.db.Update(func(dbTx database.Tx) error {
-			return s.flush(dbTx, FlushIfNeeded, &BestState{Hash: node.hash, Height: node.height})
+		err = b.db.Update(func(dbTx database.Tx) error {
+			return s.flush(dbTx, FlushIfNeeded, &BestState{Height: height, Hash: *block.Hash()})
 		})
 		if err != nil {
 			return err
@@ -709,8 +717,7 @@ func (b *BlockChain) InitConsistentState(tip *blockNode, interrupt <-chan struct
 
 		if interruptRequested(interrupt) {
 			log.Warn("UTXO state reconstruction interrupted")
-
-			return errInterruptRequested
+			break
 		}
 	}
 	log.Debug("UTXO state reconstruction done")

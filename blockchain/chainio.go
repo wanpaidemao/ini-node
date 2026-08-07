@@ -1962,6 +1962,41 @@ func (b *BlockChain) BlockByHeight(blockHeight int32) (*btcutil.Block, error) {
 	return block, err
 }
 
+// fetchBlockByHeight loads the block at the given main-chain height directly
+// from the database, using only the height index, without referencing any
+// in-memory block node.  This is used by the UTXO reconstruction path, which
+// must be able to replay blocks even when windowing has evicted every node at
+// and below the reconstruction boundary from the in-memory index.
+//
+// This function is safe for concurrent access.
+func (b *BlockChain) fetchBlockByHeight(height int32) (*btcutil.Block, error) {
+	var block *btcutil.Block
+	err := b.db.View(func(dbTx database.Tx) error {
+		hash, err := dbFetchHashByHeight(dbTx, height)
+		if err != nil {
+			return err
+		}
+		block, err = dbFetchBlockByHeightHash(dbTx, hash, height)
+		return err
+	})
+	return block, err
+}
+
+// dbFetchBlockByHeightHash loads the block for the given hash from the block
+// store and returns it with the provided height set.
+func dbFetchBlockByHeightHash(dbTx database.Tx, hash *chainhash.Hash, height int32) (*btcutil.Block, error) {
+	blockBytes, err := dbTx.FetchBlock(hash)
+	if err != nil {
+		return nil, err
+	}
+	block, err := DBBlockFromBytes(blockBytes, *hash)
+	if err != nil {
+		return nil, err
+	}
+	block.SetHeight(height)
+	return block, nil
+}
+
 // BlockByHash returns the block from the main chain with the given hash with
 // the appropriate chain height set.
 //

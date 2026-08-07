@@ -410,6 +410,14 @@ type blockIndex struct {
 	// the initial materialization of the block index.
 	ready bool
 
+	// evictCount tracks the number of successful flushToDB calls since the
+	// last window eviction.  Window eviction scans the entire in-memory
+	// index and is O(indexSize), so it is throttled to run every
+	// blockFlushBatchSize flushes rather than on every block; the per-block
+	// index write itself stays small and is required for crash consistency
+	// with the per-block chain-state commit in connectBlock.
+	evictCount int32
+
 	index map[chainhash.Hash]*blockNode
 	dirty map[*blockNode]struct{}
 }
@@ -799,9 +807,19 @@ func (bi *blockIndex) flushToDB() error {
 	// that have fallen out of the in-memory header window.  Eviction is a
 	// no-op until the block index has been fully initialized and when the
 	// window is disabled.
+	//
+	// Eviction is also throttled: it scans the entire in-memory index and
+	// is O(indexSize), so deferring it to run only once every
+	// blockFlushBatchSize flushes removes the per-block O(indexSize) scan
+	// during initial block download without giving up crash consistency
+	// (which the per-block write above preserves).
 	if err == nil {
 		bi.dirty = make(map[*blockNode]struct{})
-		bi.evictWindow()
+		bi.evictCount++
+		if bi.evictCount >= blockFlushBatchSize {
+			bi.evictCount = 0
+			bi.evictWindow()
+		}
 	}
 
 	bi.Unlock()

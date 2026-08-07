@@ -19,6 +19,11 @@ import (
 // this many headers.
 const headerFlushBatchSize = 10000
 
+// blockFlushBatchSize is the number of blocks to connect before flushing the
+// block index to the database during block sync.  Batching bounds the amount
+// of work re-processed after a restart to at most this many blocks.
+const blockFlushBatchSize = 1000
+
 // maybeAcceptBlock potentially accepts a block into the block chain and, if
 // accepted, returns whether or not it is on the main chain.  It performs
 // several validation checks which depend on its position within the block chain
