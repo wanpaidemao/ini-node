@@ -68,6 +68,13 @@ const (
 	// parallel when downloading headers during the initial block download.
 	maxHeaderSyncPeers = 8
 
+	// utxoFlushInterval is how often the UTXO cache is flushed while in
+	// initial block download mode.  It mirrors the blockchain package's
+	// periodic flush interval so that an unclean shutdown during a (long)
+	// IBD leaves the consistent UTXO state no farther than roughly this much
+	// data behind the chain tip, avoiding a huge reconstruction on restart.
+	utxoFlushInterval = 5 * time.Minute
+
 	// headerRangeStallTimeout is the amount of time an in-flight header
 	// range is allowed to remain outstanding before it is re-issued to a
 	// different peer.  This lets a slow or unresponsive peer be bypassed
@@ -319,6 +326,12 @@ type SyncManager struct {
 
 	// The following fields are used for the initial block download mode.
 	ibdMode bool
+
+	// lastUtxoFlush is the last time the UTXO cache was asked to flush.
+	// It is used to trigger periodic flushes even while in initial block
+	// download mode so that an unclean shutdown does not fall far behind the
+	// chain tip and force a long reconstruction on the next start.
+	lastUtxoFlush time.Time
 
 	// An optional fee estimator.
 	feeEstimator *mempool.FeeEstimator
@@ -1311,11 +1324,17 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 
 	// If we are not in the initial block download mode, it's a good time to
 	// periodically flush the blockchain cache because we don't expect new
-	// blocks immediately.  After that, there is nothing more to do.
-	if !sm.ibdMode {
+	// blocks immediately.  While in initial block download mode, also flush
+	// periodically so the consistent UTXO state does not fall far behind the
+	// chain tip, otherwise an unclean shutdown forces a long reconstruction
+	// on the next start.
+	if !sm.ibdMode || time.Since(sm.lastUtxoFlush) >= utxoFlushInterval {
 		if err := sm.chain.FlushUtxoCache(blockchain.FlushPeriodic); err != nil {
 			log.Errorf("Error while flushing the blockchain cache: %v", err)
 		}
+		sm.lastUtxoFlush = time.Now()
+	}
+	if !sm.ibdMode {
 		return
 	}
 
