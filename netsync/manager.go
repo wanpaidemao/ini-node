@@ -5,8 +5,10 @@
 package netsync
 
 import (
+	"fmt"
 	"math/rand"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -93,6 +95,13 @@ const (
 	// The re-issue clears the slice's hashes from the global request pool
 	// first, so the taking-over peer actually re-requests them.
 	blockSliceStallTimeout = 30 * time.Second
+
+	// syncProgressLogInterval is the interval at which an INFO progress line
+	// is logged while the node is behind the chain (initial block download
+	// or catch-up sync).  It reports the current height, the per-interval
+	// delta, the average blocks/sec, the share of the chain synced and an
+	// ETA based on the best known header height.
+	syncProgressLogInterval = time.Minute
 
 	// blockInFlightTarget is the number of blocks each participating peer in
 	// the parallel block download keeps in flight at a time.  A single
@@ -332,6 +341,11 @@ type SyncManager struct {
 	// download mode so that an unclean shutdown does not fall far behind the
 	// chain tip and force a long reconstruction on the next start.
 	lastUtxoFlush time.Time
+
+	// lastSyncProgressHeight and lastSyncProgressTime track the previous
+	// sample for the periodic sync progress log.
+	lastSyncProgressHeight int32
+	lastSyncProgressTime   time.Time
 
 	// An optional fee estimator.
 	feeEstimator *mempool.FeeEstimator
@@ -935,6 +949,72 @@ func (sm *SyncManager) handleStallSample() {
 
 	disconnectSyncPeer := sm.shouldDCStalledSyncPeer()
 	sm.updateSyncPeer(disconnectSyncPeer)
+}
+
+// logSyncProgress logs a one line INFO progress report of the block download.
+// It only logs while the node is behind the chain (not current), so the output
+// is quiet once the node reaches the tip.  The line mirrors what an operator
+// watching sync wants every minute: current height, the per-interval delta,
+// the average blocks/sec, the share of the chain synced and an ETA based on
+// the best known header height.
+func (sm *SyncManager) logSyncProgress() {
+	if atomic.LoadInt32(&sm.shutdown) != 0 {
+		return
+	}
+
+	// Only report while we are behind the chain.
+	if sm.current() {
+		sm.lastSyncProgressHeight = 0
+		sm.lastSyncProgressTime = time.Time{}
+		return
+	}
+
+	height := sm.chain.BestSnapshot().Height
+	_, tipHeight := sm.chain.BestHeader()
+	if tipHeight < height {
+		tipHeight = height
+	}
+
+	now := time.Now()
+	if sm.lastSyncProgressTime.IsZero() {
+		sm.lastSyncProgressTime = now
+		sm.lastSyncProgressHeight = height
+		return
+	}
+
+	elapsed := now.Sub(sm.lastSyncProgressTime).Seconds()
+	if elapsed <= 0 {
+		elapsed = 1
+	}
+	delta := height - sm.lastSyncProgressHeight
+	rate := float64(delta) / elapsed
+
+	var pct, etaH float64
+	if tipHeight > 0 {
+		pct = float64(height) / float64(tipHeight) * 100
+	}
+	if rate > 0 && tipHeight > height {
+		etaH = float64(tipHeight-height) / rate / 3600
+	}
+
+	parts := []string{
+		fmt.Sprintf("height=%d", height),
+		fmt.Sprintf("%+d in %.0fs", delta, elapsed),
+		fmt.Sprintf("%.2f bl/s", rate),
+	}
+	if tipHeight > 0 {
+		parts = append(parts, fmt.Sprintf("synced=%.5f%%", pct))
+	}
+	if etaH > 0 {
+		parts = append(parts, fmt.Sprintf("ETA=%.1fh", etaH))
+	} else {
+		parts = append(parts, "stalled or at tip")
+	}
+
+	log.Infof("Sync progress: %s", strings.Join(parts, "  "))
+
+	sm.lastSyncProgressTime = now
+	sm.lastSyncProgressHeight = height
 }
 
 // shouldDCStalledSyncPeer determines whether or not we should disconnect a
@@ -2519,6 +2599,8 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 func (sm *SyncManager) blockHandler() {
 	stallTicker := time.NewTicker(stallSampleInterval)
 	defer stallTicker.Stop()
+	progressTicker := time.NewTicker(syncProgressLogInterval)
+	defer progressTicker.Stop()
 
 out:
 	for {
@@ -2584,6 +2666,9 @@ out:
 
 		case <-stallTicker.C:
 			sm.handleStallSample()
+
+		case <-progressTicker.C:
+			sm.logSyncProgress()
 
 		case <-sm.quit:
 			break out
