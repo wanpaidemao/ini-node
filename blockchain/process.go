@@ -32,6 +32,19 @@ const (
 
 	// BFNone is a convenience value to specifically indicate no flags.
 	BFNone BehaviorFlags = 0
+
+	// consensusPowSkipDepth is how far below the header tip agreed on by the
+	// peers a block must be before its proof-of-work check can be skipped.
+	//
+	// During the initial block download the connected chain runs far behind
+	// the shared header chain (the "consensus anchor").  A block that
+	// connects to an already-best-chain parent more than this deep below the
+	// header tip is deep history whose hash is fixed by the header chain;
+	// such a block cannot be re-orged away, so computing its (expensive)
+	// yespower proof-of-work check is pure waste.  Blocks at or above the
+	// depth limit sit close enough to the frontier that a reorganization is
+	// still conceivable, so they keep the full check.
+	consensusPowSkipDepth = 2048
 )
 
 // blockExists determines whether a block with the given hash exists either in
@@ -163,6 +176,23 @@ func (b *BlockChain) ProcessBlock(block *btcutil.Block, flags BehaviorFlags) (bo
 	if _, exists := b.orphans[*blockHash]; exists {
 		str := fmt.Sprintf("already have block (orphan) %v", blockHash)
 		return false, false, ruleError(ErrDuplicateBlock, str)
+	}
+
+	// Consensus-anchor fast path.  A block that connects to an already
+	// known parent more than consensusPowSkipDepth below the header tip the
+	// peers agreed on is in deep history: its hash is fixed by the shared
+	// header chain and it cannot be re-orged away, so the proof-of-work
+	// check - the most expensive per-block validation - can be skipped.
+	// Blocks near the header frontier are still fully validated.  Parents
+	// below the header window (prevNode == nil) are kept fully validated as
+	// a conservative default.
+	prevNode := b.index.LookupNode(&block.MsgBlock().Header.PrevBlock)
+	if prevNode != nil {
+		height := prevNode.height + 1
+		bestHeader := b.bestHeader.Tip()
+		if height <= bestHeader.height-consensusPowSkipDepth {
+			flags |= BFNoPoWCheck
+		}
 	}
 
 	// Perform preliminary sanity checks on the block and its transactions.

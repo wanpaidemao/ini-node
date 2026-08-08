@@ -1890,9 +1890,19 @@ func (sm *SyncManager) finishHeaderSync() {
 	// bound the single-peer path used) so blocks stay close enough to connect
 	// before the orphan pool fills; slicing that window across the peers lets
 	// each peer stream a different part of it in parallel.
+	//
+	// The slice length is fixed by the maximum number of participating peers
+	// rather than the current count.  If it were derived from the live peer
+	// count, a set that temporarily shrinks to a single peer would hand that
+	// one peer the entire request window; every peer that then connects
+	// would find the window already claimed and never obtain its own slice,
+	// leaving the "parallel" download permanently single-peer until the next
+	// header sync restarts it.  A fixed slice keeps the window sub-divided
+	// into maxHeaderSyncPeers pieces at all times, so peers that join midway
+	// always claim the slice left open ahead of the current frontier.
 	bestHeight = sm.chain.BestSnapshot().Height
 	_, bestHeaderHeight := sm.chain.BestHeader()
-	sliceLen := int32(maxBlockRequestWindow) / int32(len(sm.blockSync))
+	sliceLen := int32(maxBlockRequestWindow) / maxHeaderSyncPeers
 	if sliceLen < 1 {
 		sliceLen = 1
 	}
