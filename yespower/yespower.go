@@ -12,6 +12,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"math/bits"
+	"sync"
 
 	"golang.org/x/crypto/pbkdf2"
 )
@@ -37,6 +38,8 @@ const (
 
 // Sugarchain personalization string (matches umami block.cpp perslen 74)
 const sugarPers = "Satoshi Nakamoto 31/Oct/2008 Proof-of-work is essentially one-CPU-one-vote"
+
+var sugarPersBytes = []byte(sugarPers)
 
 type pwxformCtx struct {
 	salsa20Rounds int
@@ -65,22 +68,77 @@ func newPwxformCtx() *pwxformCtx {
 	return ctx
 }
 
+// Scratch is a set of buffers reused across yespower invocations.  A single
+// PoW check needs roughly 8MB of scratch (the V array), and the node performs
+// one check per block/header during sync; pooling the scratch removes that
+// per-call allocation churn, which otherwise keeps the Go GC hot.
+//
+// Buffer lifetimes per call:
+//   - pbkdf2 output, B, V, X and the out buffer are fully (re)written every
+//     call, so they can be reused as-is.
+//   - The pwxform S-box (ctx.S) is read-before-write once it has been rebuilt
+//     and the rotating pointers s0/s1/s2/w are mutated in place, so S is
+//     zeroed and the pointers reset at the start of every call.
+type Scratch struct {
+	ctx  *pwxformCtx
+	buf  []byte // pbkdf2 output, 128*32 bytes
+	data []byte // first 128 pbkdf2 bytes
+	B    []uint32
+	V    []uint32
+	X    []uint32
+	out  []byte
+}
+
+func newScratch() *Scratch {
+	return &Scratch{
+		ctx:  newPwxformCtx(),
+		buf:  make([]byte, 128*32),
+		data: make([]byte, 128),
+		B:    make([]uint32, 128*32/4),
+		V:    make([]uint32, 128*32*2048/4),
+		X:    make([]uint32, 128*32/4),
+		out:  make([]byte, 128*32),
+	}
+}
+
+var scratchPool = sync.Pool{
+	New: func() interface{} { return newScratch() },
+}
+
 // Hash computes the Yespower 1.0 hash for Sugarchain.
 // Parameters: N=2048, r=32, personalization="Satoshi Nakamoto 31/Oct/2008..."
+//
+// The scratch buffers are taken from a sync.Pool and returned once the hash
+// is complete, so callers may invoke Hash concurrently.
 func Hash(input []byte) [HashSize]byte {
-	ctx := newPwxformCtx()
+	s := scratchPool.Get().(*Scratch)
+	res := s.hash(input)
+	scratchPool.Put(s)
+	return res
+}
+
+func (s *Scratch) hash(input []byte) [HashSize]byte {
+	ctx := s.ctx
+
+	// Reset the S-box and the rotating pointers, both mutated in place.
+	ctx.s0 = 0
+	ctx.s1 = (1 << ctx.sWidth) * pwxSimple * 2
+	ctx.s2 = 2 * ctx.s1
+	ctx.w = 0
+	for i := range ctx.S {
+		ctx.S[i] = 0
+	}
 
 	// SHA-256 of input
 	shaHash := sha256.Sum256(input)
 
 	// PBKDF2 with personalization as source
-	pBufSize := 128 * 32 // r=32
-	buf := pbkdf2.Key(shaHash[:], []byte(sugarPers), piTer, pBufSize, sha256.New)
+	buf := pbkdf2.Key(shaHash[:], sugarPersBytes, piTer, len(s.buf), sha256.New)
 
 	// Convert to uint32 array
 	BSize := len(buf) / 4
-	B := make([]uint32, BSize)
-	data := make([]byte, 128)
+	B := s.B
+	data := s.data
 	for i := 0; i < BSize; i++ {
 		B[i] = binary.LittleEndian.Uint32(buf[i*4:])
 		if i < 128 {
@@ -88,23 +146,17 @@ func Hash(input []byte) [HashSize]byte {
 		}
 	}
 
-	// Temporary storage
-	vSize := 128 * 32 * 2048 / 4 // N=2048, r=32
-	V := make([]uint32, vSize)
-	xSize := 128 * 32 / 4
-	X := make([]uint32, xSize)
-
 	// Run SMix
-	smix(B, 32, 2048, V, X, ctx)
+	smix(B, 32, 2048, s.V, s.X, ctx)
 
 	// Convert B back to bytes
-	b := make([]byte, len(B)*4)
+	out := s.out
 	for idx, val := range B {
-		binary.LittleEndian.PutUint32(b[idx*4:], val)
+		binary.LittleEndian.PutUint32(out[idx*4:], val)
 	}
 
 	// Final HMAC-SHA256
-	h := hmac.New(sha256.New, b[len(b)-64:])
+	h := hmac.New(sha256.New, out[len(out)-64:])
 	h.Write(data[:32])
 
 	var result [HashSize]byte
