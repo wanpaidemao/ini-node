@@ -47,8 +47,10 @@ const (
 	// low-height blocks needed to advance the tip and the download stalls.
 	// Capping the request horizon keeps every requested block close enough
 	// to the tip that it connects (draining its orphaned descendants) long
-	// before the pool fills.
-	maxBlockRequestWindow = 2048
+	// before the pool fills.  The bound is generous so each parallel slice
+	// stays multiple times the per-peer in-flight throttle deep ahead of the
+	// tip, letting many peers prefetch simultaneously even on a slow window.
+	maxBlockRequestWindow = 8192
 
 	// maxRequestedTxns is the maximum number of requested transactions
 	// hashes to store in memory.
@@ -2032,13 +2034,24 @@ func (sm *SyncManager) reissueStaleBlockSlices() {
 
 	now := time.Now()
 	for start, sl := range bs.slices {
-		if now.Sub(sl.assignedAt) < blockSliceStallTimeout {
+		// Only re-issue a slice whose holder has *stopped delivering* blocks.
+		// Judging by assignment time would misread a large-but-progressing
+		// slice (e.g. a 1300+ height slice) as stalled the moment 30s passed
+		// even though blocks are still flowing, re-rolling every slice to
+		// another peer every 30s and wasting bandwidth on re-downloads.  The
+		// progress clock is the last deliverance instead; a peer that keeps
+		// delivering keeps its slice until the heights all connect.
+		if last, ok := bs.lastProgress[sl.peer]; ok {
+			if now.Sub(last) < blockSliceStallTimeout {
+				continue
+			}
+		} else if now.Sub(sl.assignedAt) < blockSliceStallTimeout {
 			continue
 		}
 
-		// The slice may be entirely connected already (assignedAt was
-		// set at assignment time); only re-issue heights that are still
-		// pending, and prefer an idle peer to take over the slice.
+		// The slice may be entirely connected already; only re-issue heights
+		// that are still pending, and prefer an idle peer to take over the
+		// slice.
 		if _, ok := bs.peerSlice[sl.peer]; !ok {
 			continue
 		}

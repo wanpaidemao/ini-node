@@ -1841,6 +1841,71 @@ func TestReissueStalledBlockPeer(t *testing.T) {
 		"healthy peer should not be refreshed")
 }
 
+// TestReissueStaleBlockSlicesKeepsProgressing verifies that the stale-slice
+// handler only re-issues a slice whose holder has stopped delivering.  A large
+// slice that is still actively delivering (fresh lastProgress) must keep its
+// slice even after the assignment timeout, otherwise a wide request window
+// would roll every large slice to a new peer every stall interval, burning
+// bandwidth re-downloading what the original owner is still working through.
+func TestReissueStaleBlockSlicesKeepsProgressing(t *testing.T) {
+	params := chaincfg.RegressionNetParams
+	params.Checkpoints = nil
+
+	sm, tearDown := makeMockSyncManager(t, &params)
+	defer tearDown()
+
+	const numBlocks = 60
+	for _, hdr := range makeTestHeaderChain(t, &params, numBlocks) {
+		_, err := sm.chain.ProcessBlockHeader(hdr, blockchain.BFNoPoWCheck, false)
+		require.NoError(t, err)
+	}
+
+	peers := newHeaderSyncPeers(t, sm, 3, numBlocks)
+	sm.ibdMode = true
+	sm.blockSync = append([]*peer.Peer(nil), peers...)
+	sm.blockSyncState = &blockSyncState{
+		nextAssign:   1,
+		target:       numBlocks,
+		slices:       make(map[int32]*blockSlice),
+		peerSlice:    make(map[*peer.Peer]*blockSlice),
+		sliceLen:     10,
+		lastProgress: make(map[*peer.Peer]time.Time),
+	}
+	sm.requestedBlocks = make(map[chainhash.Hash]struct{})
+
+	// peers[0] owns [1,11) but has not delivered anything for well past the
+	// stall timeout.
+	sm.blockSyncState.slices[1] = &blockSlice{start: 1, end: 11,
+		peer: peers[0], assignedAt: time.Now().Add(-2 * blockSliceStallTimeout)}
+	sm.blockSyncState.peerSlice[peers[0]] = sm.blockSyncState.slices[1]
+	sm.blockSyncState.lastProgress[peers[0]] =
+		time.Now().Add(-2 * blockSliceStallTimeout)
+
+	// peers[1] owns [11,21) and, although it was assigned equally long ago, is
+	// still delivering (it connected blocks a few seconds ago).
+	sm.blockSyncState.slices[11] = &blockSlice{start: 11, end: 21,
+		peer: peers[1], assignedAt: time.Now().Add(-2 * blockSliceStallTimeout)}
+	sm.blockSyncState.peerSlice[peers[1]] = sm.blockSyncState.slices[11]
+	sm.blockSyncState.lastProgress[peers[1]] = time.Now().Add(-10 * time.Second)
+
+	sm.reissueStaleBlockSlices()
+
+	// The still-delivering peer must keep its slice untouched.
+	require.Same(t, sm.blockSyncState.slices[11],
+		sm.blockSyncState.peerSlice[peers[1]],
+		"progressing slice must not be re-issued")
+	require.Equal(t, peers[1], sm.blockSyncState.slices[11].peer)
+
+	// The truly stalled slice must be taken off peers[0] and handed to the
+	// idle peer peers[2].
+	require.Nil(t, sm.blockSyncState.peerSlice[peers[0]],
+		"stalled slice should be taken from its non-delivering peer")
+	require.NotNil(t, sm.blockSyncState.peerSlice[peers[2]],
+		"stalled slice should be re-issued to the idle peer")
+	require.Equal(t, peers[2], sm.blockSyncState.slices[1].peer,
+		"reissued slice should be owned by the taking over peer")
+}
+
 // TestBlockInFlightThrottle verifies that a single buildBlockRequest only tops
 // the peer's in-flight set up to blockInFlightTarget instead of draining its
 // whole slice at once.  Draining a whole slice starved every peer but the

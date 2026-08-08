@@ -30,7 +30,7 @@ const (
 	// orphans to be evicted as fast as they arrive, stalling the download at
 	// the tip, so the pool is sized to absorb a full in-flight request batch
 	// (plus headroom).
-	maxOrphanBlocks = 4096
+	maxOrphanBlocks = 16384
 )
 
 // BlockLocator is used to help locate a specific block.  The algorithm for
