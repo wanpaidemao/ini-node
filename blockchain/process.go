@@ -183,14 +183,44 @@ func (b *BlockChain) ProcessBlock(block *btcutil.Block, flags BehaviorFlags) (bo
 	// peers agreed on is in deep history: its hash is fixed by the shared
 	// header chain and it cannot be re-orged away, so the proof-of-work
 	// check - the most expensive per-block validation - can be skipped.
-	// Blocks near the header frontier are still fully validated.  Parents
-	// below the header window (prevNode == nil) are kept fully validated as
-	// a conservative default.
-	prevNode := b.index.LookupNode(&block.MsgBlock().Header.PrevBlock)
-	if prevNode != nil {
+	// Blocks near the header frontier are still fully validated.
+	//
+	// Parents below the in-memory header window (prevNode == nil) fall back
+	// to the cold header index on disk: if the hash already stored at the
+	// block's height equals this block's hash, the block is exactly on the
+	// agreed header chain and its PoW was validated when the corresponding
+	// block was processed at connect time; a mismatch (side chain / re-org
+	// candidate) keeps the block fully validated.
+	parentHash := &block.MsgBlock().Header.PrevBlock
+	if prevNode := b.index.LookupNode(parentHash); prevNode != nil {
 		height := prevNode.height + 1
 		bestHeader := b.bestHeader.Tip()
 		if height <= bestHeader.height-consensusPowSkipDepth {
+			flags |= BFNoPoWCheck
+		}
+	} else {
+		// Parent is below the in-memory header window: resolve the block's
+		// height through the cold hash index, then verify the hash already
+		// stored at that height matches this block so the proof-of-work
+		// check can be skipped.  A mismatch (side chain / re-org block)
+		// keeps the block fully validated.
+		skipPoW := false
+		err := b.db.View(func(dbTx database.Tx) error {
+			prevHeight, err := dbFetchHeightByHash(dbTx, parentHash)
+			if err != nil {
+				return nil
+			}
+			headerHash, err := dbFetchHashByHeight(
+				dbTx, prevHeight+1)
+			if err == nil && headerHash.IsEqual(blockHash) {
+				skipPoW = true
+			}
+			return nil
+		})
+		if err != nil {
+			return false, false, err
+		}
+		if skipPoW {
 			flags |= BFNoPoWCheck
 		}
 	}
