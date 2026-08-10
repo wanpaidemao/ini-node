@@ -1,6 +1,8 @@
 ﻿<script lang="ts">
-  import { app, navigate } from "./lib/store.svelte";
-  import { t, setLang, loadLang, LANG_NAMES, LANGS } from "./lib/i18n";
+  import { onMount, onDestroy } from "svelte";
+  import { app, navigate, setConnected } from "./lib/store.svelte";
+  import { Services } from "./lib/services";
+  import { t, setLang, LANG_NAMES, LANGS } from "./lib/i18n";
   import type { Route } from "./lib/types";
   import Dashboard from "./pages/Dashboard.svelte";
   import Internals from "./pages/Internals.svelte";
@@ -48,6 +50,17 @@
   let collapsible = $state(false);
   let langOpen = $state(false);
   let lang = $state<keyof typeof LANG_NAMES>("en");
+  let connAddr = $state("—");
+  let debugLevel = $state("info");
+
+  async function loadConnAddr() {
+    try {
+      const cfg = await Services.getConfig();
+      connAddr = cfg.rpcEndpoint.replace(/^https?:\/\//, "");
+    } catch {
+      /* keep "—" */
+    }
+  }
 
   function go(r: Route) {
     navigate(r);
@@ -73,33 +86,54 @@
       navigate("internals");
     }
   }
+
+  let healthTimer: ReturnType<typeof setInterval> | undefined;
+
+  async function checkHealth() {
+    if (!app.connected) app.connecting = true;
+    try {
+      const [s, d] = await Promise.all([Services.getSyncStatus(), Services.getDebugLevel()]);
+      debugLevel = d;
+      setConnected({ connected: true, syncing: s.blocks < s.headers });
+    } catch {
+      setConnected({ connected: false, syncing: false });
+    } finally {
+      app.connecting = false;
+    }
+  }
+
+  onMount(() => {
+    checkHealth();
+    loadConnAddr();
+    healthTimer = setInterval(checkHealth, 5000);
+  });
+  onDestroy(() => clearInterval(healthTimer));
 </script>
 
 <svelte:head>
-  <title>{t("app.name")}</title>
+  <title>{t(titles[app.route])}</title>
 </svelte:head>
 
-<div class="shell">
+<div class="shell" class:collapsed={collapsible}>
   <a class="skip-link" href="#main">Skip to content</a>
 
   <aside class="rail" class:collapsed={collapsible}>
-    <div class="brand">
-      <span class="brand-mark" aria-hidden="true">
-        <svg viewBox="0 0 32 32" width="20" height="20" fill="none">
-          <rect x="2" y="6" width="28" height="20" rx="5" stroke="currentColor" stroke-width="1.8" fill="none" />
-          <path d="M10 12 15 16l-5 4M22 12l-5 4 5 4" stroke="currentColor" stroke-width="1.8" fill="none" />
-        </svg>
-      </span>
-      <span class="brand-name">{t("app.name")}</span>
+    <div class="rail-top">
       <button
         class="collapse-btn"
         aria-label={collapsible ? "Expand navigation" : "Collapse navigation"}
+        title={collapsible ? "Expand navigation" : "Collapse navigation"}
         onclick={() => (collapsible = !collapsible)}
       >
-        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="4" y1="7" x2="20" y2="7" /><line x1="4" y1="12" x2="20" y2="12" /><line x1="4" y1="17" x2="20" y2="17" /></svg>
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          {#if collapsible}
+            <polyline points="9 6 15 12 9 18" />
+          {:else}
+            <polyline points="15 6 9 12 15 18" />
+          {/if}
+        </svg>
       </button>
     </div>
-
     <nav>
       {#each sections as section}
         <p class="section-head">{t(section.title)}</p>
@@ -150,13 +184,13 @@
         </div>
 
         <button class="chip debug-chip" onclick={jumpDebug} title={t("shell.debug")}>
-          <span class="dot" aria-hidden="true"></span> debug 路 info
+          <span class="dot" aria-hidden="true"></span> debug · {debugLevel}
         </button>
 
         <div class="conn-chip {connBadge().cls}" role="status">
           <span class="dot" aria-hidden="true"></span>
           <span>{t(connBadge().key)}</span>
-          <span class="conn-addr mono">{app.connected ? "127.0.0.1:8334" : "—"}</span>
+          <span class="conn-addr mono">{app.connected ? connAddr : "—"}</span>
         </div>
       </div>
     </header>
@@ -194,11 +228,15 @@
     overflow: hidden;
     background: var(--ink);
     color: var(--ink-fg);
+    transition: grid-template-columns 0.15s ease;
+  }
+  .shell.collapsed {
+    grid-template-columns: 48px 1fr;
   }
 
   .rail {
     grid-row: 1;
-    background: linear-gradient(180deg, #141120 0%, #181226 100%);
+    background: var(--violet);
     border-right: 1px solid var(--line);
     display: flex;
     flex-direction: column;
@@ -206,54 +244,47 @@
     overflow-y: auto;
     min-width: 0;
   }
-  .rail.collapsed {
-    width: 56px;
+  .rail-top {
+    display: flex;
+    align-items: center;
+    padding: 2px 4px 8px;
+    flex: none;
   }
-  .rail.collapsed .brand-name,
+  .collapse-btn {
+    background: none;
+    border: none;
+    color: var(--mist);
+    padding: 5px;
+    cursor: pointer;
+    border-radius: var(--r-8);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .collapse-btn:hover {
+    color: var(--ink-fg);
+    background: rgba(0, 0, 0, 0.07);
+  }
+  .collapse-btn:focus-visible {
+    outline: none;
+    box-shadow: var(--focus);
+  }
   .rail.collapsed .section-head,
   .rail.collapsed .nav-text {
     display: none;
-  }
-  .rail.collapsed .nav-item {
-    justify-content: center;
-    padding: 9px 0;
   }
   .rail.collapsed nav ul {
     display: flex;
     flex-direction: column;
     align-items: center;
   }
-
-  .brand {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 4px 6px 16px;
-    color: var(--straw);
-    flex: none;
+  .rail.collapsed .nav-item {
+    justify-content: center;
+    padding: 9px 0;
   }
-  .brand-name {
-    font-family: var(--font-display);
-    font-weight: 800;
-    font-size: 15px;
-    color: var(--ink-fg);
-  }
-  .collapse-btn {
-    margin-left: auto;
-    background: none;
-    border: none;
-    color: var(--mist);
-    padding: 4px;
-    cursor: pointer;
-    border-radius: var(--r-8);
-  }
-  .collapse-btn:hover {
-    color: var(--ink-fg);
-    background: rgba(160, 156, 181, 0.12);
-  }
-  .collapse-btn:focus-visible {
-    outline: none;
-    box-shadow: var(--focus);
+  .rail.collapsed .rail-top {
+    justify-content: center;
+    padding: 2px 0 8px;
   }
 
   .section-head {
@@ -286,7 +317,7 @@
     touch-action: manipulation;
   }
   .nav-item:hover {
-    background: rgba(160, 156, 181, 0.12);
+    background: rgba(0, 0, 0, 0.07);
     color: var(--ink-fg);
   }
   .nav-item:focus-visible {
@@ -295,7 +326,7 @@
   }
   .nav-item.active {
     color: var(--ink-fg);
-    background: linear-gradient(90deg, rgba(255, 107, 157, 0.22), rgba(255, 107, 157, 0.05));
+    background: var(--violet-2);
   }
   .nav-dot {
     width: 6px;
@@ -303,11 +334,9 @@
     border-radius: 50%;
     background: var(--mist);
     flex: none;
-    transition: background 0.12s ease;
   }
   .nav-item.active .nav-dot {
     background: var(--straw);
-    box-shadow: 0 0 6px rgba(255, 107, 157, 0.9);
   }
 
   .main-col {
@@ -323,7 +352,7 @@
     justify-content: space-between;
     padding: 0 16px;
     border-bottom: 1px solid var(--line);
-    background: rgba(26, 22, 37, 0.78);
+    background: var(--ink);
     z-index: 5;
   }
   .topbar-title {
@@ -348,7 +377,7 @@
   .lang-chip:hover,
   .debug-chip:hover {
     color: var(--ink-fg);
-    border-color: rgba(160, 156, 181, 0.4);
+    border-color: rgba(0, 0, 0, 0.2);
   }
   .lang-chip:focus-visible,
   .debug-chip:focus-visible {
@@ -360,7 +389,7 @@
     position: absolute;
     top: calc(100% + 8px);
     right: 0;
-    background: var(--violet);
+    background: var(--ink);
     border: 1px solid var(--line);
     border-radius: var(--r-12);
     box-shadow: var(--shadow);
@@ -381,7 +410,7 @@
     font-size: 13px;
   }
   .lang-panel button:hover {
-    background: rgba(160, 156, 181, 0.12);
+    background: rgba(0, 0, 0, 0.07);
     color: var(--ink-fg);
   }
   .lang-panel button.active {
@@ -413,22 +442,21 @@
     flex: none;
   }
   .conn-chip.on {
-    border-color: rgba(74, 222, 128, 0.45);
+    border-color: var(--mint);
     color: var(--mint);
   }
   .conn-chip.on .dot {
     background: var(--mint);
-    box-shadow: 0 0 8px rgba(74, 222, 128, 0.9);
   }
   .conn-chip.sync {
-    border-color: rgba(255, 201, 60, 0.45);
+    border-color: var(--honey);
     color: var(--honey);
   }
   .conn-chip.sync .dot {
     background: var(--honey);
   }
   .conn-chip.off {
-    border-color: rgba(160, 156, 181, 0.5);
+    border-color: rgba(0, 0, 0, 0.25);
     color: var(--ink-dim);
   }
   .conn-addr {
@@ -459,6 +487,13 @@
     .shell {
       grid-template-columns: 1fr;
       grid-template-rows: auto 1fr;
+    }
+    .shell.collapsed {
+      grid-template-columns: 1fr;
+    }
+    .rail-top,
+    .collapse-btn {
+      display: none;
     }
     .rail {
       flex-direction: row;

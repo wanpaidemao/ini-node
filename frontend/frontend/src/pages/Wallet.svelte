@@ -15,6 +15,7 @@
   onMount(async () => {
     w = await Services.getWallet();
     txs = await Services.getHistory();
+    locked = w?.locked ?? true;
   });
 
   async function unlock() {
@@ -82,8 +83,8 @@
       <p class="eyebrow">{t("wal.receive_addr")}</p>
       <div class="qr" aria-hidden="true">
         <svg viewBox="0 0 21 21" width="92" height="92" aria-hidden="true">
-          <rect width="21" height="21" fill="#2d2840" />
-          <g fill="#f2eef8" shape-rendering="crispEdges">
+          <rect width="21" height="21" fill="#ffffff" />
+          <g fill="#1a1a1a" shape-rendering="crispEdges">
             <!-- pseudo QR pattern -->
             {#each [1,2,3,0,1,4,5,6,7,0,3,2,1,0,5,7,6,3,2,4,1,6,0,7,5,2,3,1,4,6,7,5,0,2,1,3,6,5,4] as c, i}
               <rect x={(i % 7) + c} y={Math.floor(i / 7)} width="1" height="1" />
@@ -251,7 +252,7 @@
   .qr {
     border-radius: var(--r-8);
     padding: 6px;
-    background: #2d2840;
+    background: #fff;
     border: 1px solid var(--line);
   }
   .addr {
@@ -299,7 +300,7 @@
   }
   .tab:hover {
     color: var(--ink-fg);
-    background: rgba(160, 156, 181, 0.08);
+    background: #eee;
   }
   .tab.active {
     color: var(--straw);

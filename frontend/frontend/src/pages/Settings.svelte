@@ -10,7 +10,6 @@
   let applied = $state(false);
   let migratePct = $state<number | null>(null);
   let migrateBusy = $state(false);
-  let credEdit = $state(false);
 
   onMount(async () => {
     cfg = await Services.getConfig();
@@ -38,6 +37,18 @@
     if (!cfg) return;
     const dir = await Services.pickDataDir();
     if (dir) cfg.dataDir = dir;
+  }
+
+  let savingConn = $state(false);
+
+  async function saveConnection() {
+    if (!cfg || savingConn) return;
+    savingConn = true;
+    try {
+      await Services.saveConfig(cfg);
+    } finally {
+      savingConn = false;
+    }
   }
 
   async function migrate() {
@@ -104,8 +115,8 @@
         </div>
         {#if !cfg.credFromIni}
           <div class="field-row">
-            <input placeholder={t("set.user")} aria-label={t("set.user")} autocomplete="off" />
-            <input type="password" placeholder={t("set.pass")} aria-label={t("set.pass")} autocomplete="off" />
+            <input bind:value={cfg.rpcUser} placeholder={t("set.user")} aria-label={t("set.user")} autocomplete="off" />
+            <input bind:value={cfg.rpcPass} type="password" placeholder={t("set.pass")} aria-label={t("set.pass")} autocomplete="off" />
           </div>
         {/if}
       </div>
@@ -113,6 +124,13 @@
       <div class="field">
         <label class="field-label" for="wapi">{t("set.wallet_api")}</label>
         <input id="wapi" class="mono" bind:value={cfg.walletApi} autocomplete="off" spellcheck="false" />
+      </div>
+
+      <div class="field">
+        <button class="btn btn-primary" onclick={saveConnection} disabled={savingConn}>
+          {#if savingConn}<span class="spin" aria-hidden="true"></span>{/if}
+          {t("g.apply")}
+        </button>
       </div>
     </div>
 
@@ -338,13 +356,12 @@
     min-width: 120px;
     height: 8px;
     border-radius: 4px;
-    background: rgba(160, 156, 181, 0.12);
+    background: #e0e0e0;
     overflow: hidden;
   }
   .migrate-bar span {
     display: block;
     height: 100%;
-    background: linear-gradient(90deg, var(--straw), var(--honey));
-    transition: width 0.3s ease;
+    background: var(--straw);
   }
 </style>

@@ -11,29 +11,27 @@
   let curve = $state<{ t: number; height: number }[]>([]);
   let live = $state(false);
   let infoOpen = $state(false);
-  let err = $state(false);
   let timer: ReturnType<typeof setInterval> | undefined;
   let lastAt = $state<number | null>(null);
+  let debugLevel = $state("info");
 
   async function poll() {
-    try {
-      const [s, i, p, c] = await Promise.all([
-        Services.getSyncStatus(),
-        Services.getNodeInfo(),
-        Services.getPeers(),
-        Services.getSyncHistory(60),
-      ]);
+    const [s, i, p, c, d] = await Promise.all([
+      Services.getSyncStatus().catch(() => null),
+      Services.getNodeInfo().catch(() => null),
+      Services.getPeers().catch(() => null),
+      Services.getSyncHistory(60).catch(() => null),
+      Services.getDebugLevel().catch(() => "info"),
+    ]);
+    if (s) {
       status = s;
-      info = i;
-      peers = p;
-      curve = c;
-      lastAt = Date.now();
-      err = false;
       live = true;
-    } catch {
-      err = true;
-      live = false;
+      lastAt = Date.now();
     }
+    if (i) info = i;
+    if (p) peers = p;
+    if (c) curve = c;
+    if (d) debugLevel = d;
   }
 
   onMount(() => {
@@ -98,17 +96,9 @@
     </div>
     <span class="live-badge" class:off={!live}>
       <span class="dot" aria-hidden="true"></span>
-      {live ? t("dash.rate", { rate: status?.rateBlPerSec ?? 0 }) : t("dash.not_connected")}
+      {t("dash.rate", { rate: status?.rateBlPerSec ?? 0 })}
     </span>
   </div>
-
-  {#if err || !live}
-    <div class="card offline-card" role="status">
-      <div class="dot off" aria-hidden="true"></div>
-      <span>{t("dash.not_connected")}</span>
-      <button class="btn" onclick={poll}>{t("dash.retry")}</button>
-    </div>
-  {/if}
 
   <!-- stat cards -->
   <div class="stat-grid">
@@ -133,17 +123,24 @@
   <div class="card ribbon-card" aria-label={t("dash.sync_progress")}>
     <div class="ribbon-head">
       <span class="h-card">{t("dash.sync_progress")}</span>
-      <span class="chip mono" translate="no">
-        {(status?.blocks ?? 0).toLocaleString()} / {(status?.headers ?? 0).toLocaleString()}
-      </span>
+      {#if status}
+        <span class="ribbon-pct mono">{pct().toFixed(2)}%</span>
+      {/if}
     </div>
-    <div class="ribbon-scale">
-      <span class="scale-label">0</span>
-      <span class="scale-label scale-end">
-        <span class="mono" translate="no">{(status?.headers ?? 0).toLocaleString()}</span>
-        <span>100%</span>
-      </span>
-    </div>
+    {#if status}
+      <div class="ribbon-heights">
+        <span class="chip">
+          <span class="dot mint" aria-hidden="true"></span>
+          <span class="mono" translate="no">{fmt(status.blocks)}</span>
+          {t("dash.current_height")}
+        </span>
+        <span class="chip honey">
+          <span class="dot" aria-hidden="true"></span>
+          <span class="mono" translate="no">{fmt(status.headers)}</span>
+          {t("dash.target_height")}
+        </span>
+      </div>
+    {/if}
     <div class="ribbon" role="img" aria-label={t("dash.sync_progress")}>
       {#each Array.from({ length: 100 }, (_, i) => i) as i}
         <span class="link" class:filled={i < Math.floor(pct())} class:winning={absWin(i)} aria-hidden="true"></span>
@@ -151,9 +148,14 @@
       <span class="drag-ghost" style:left={`calc(${pct()}% - 1px)`} aria-hidden="true"></span>
       <span class="win-mark" style:left={`calc(${(pct() + ribbon().winPct).toFixed(3)}% )`} aria-hidden="true"></span>
     </div>
+    <div class="ribbon-legend">
+      <span class="lg"><span class="sw filled" aria-hidden="true"></span>{t("dash.legend_synced")}</span>
+      <span class="lg"><span class="sw" aria-hidden="true"></span>{t("dash.legend_pending")}</span>
+      <span class="lg"><span class="sw win" aria-hidden="true"></span>{t("dash.legend_window")}</span>
+    </div>
     <div class="ribbon-footer">
-      <span class="mono" translate="no">blocks {fmt(status?.blocks ?? 0)}</span>
       {#if status}
+        <span class="mono" translate="no">blocks {fmt(status.blocks)}</span>
         <span class="chip">
           <span class="dot mint" aria-hidden="true"></span>
           {t("dash.rate", { rate: status.rateBlPerSec })}
@@ -218,9 +220,9 @@
       <div class="shortcuts">
         <button class="btn" onclick={() => navigate("internals")}>{t("dash.view_internals")}</button>
         <button class="btn" onclick={() => navigate("settings")}>
-          {t("dash.sync_peers")} <span class="mono">{app.connected ? "8▾" : "—"}</span>
+          {t("dash.sync_peers")} <span class="mono">{app.connected ? peers.length : "—"}</span>
         </button>
-        <button class="btn" onclick={() => navigate("settings")}>DebugLevel: info▾</button>
+        <button class="btn" onclick={() => navigate("settings")}>DebugLevel: {debugLevel}▾</button>
       </div>
     </div>
   </div>
@@ -271,13 +273,12 @@
     gap: 7px;
     font-size: 12px;
     color: var(--mint);
-    border: 1px solid rgba(74, 222, 128, 0.4);
+    border: 1px solid var(--mint);
     border-radius: 999px;
     padding: 4px 12px;
   }
   .live-badge .dot {
     background: var(--mint);
-    box-shadow: 0 0 8px rgba(74, 222, 128, 0.9);
   }
   .live-badge.off {
     color: var(--mist);
@@ -288,16 +289,6 @@
     box-shadow: none;
   }
 
-  .offline-card {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    border-color: rgba(255, 107, 157, 0.5);
-  }
-  .dot.off {
-    background: var(--straw);
-  }
-
   .stat-grid {
     display: grid;
     grid-template-columns: repeat(3, 1fr);
@@ -305,23 +296,12 @@
   }
   .stat {
     position: relative;
-    overflow: hidden;
-  }
-  .stat::after {
-    content: "";
-    position: absolute;
-    inset: auto 0 0 0;
-    height: 2px;
-    background: linear-gradient(90deg, var(--straw), transparent 70%);
-    opacity: 0.6;
   }
   .stat-num {
-    font-family: var(--font-display);
-    font-weight: 800;
+    font-weight: 700;
     font-size: 26px;
     margin: 6px 0 2px;
     font-variant-numeric: tabular-nums;
-    letter-spacing: -0.5px;
   }
   .stat-num-warn {
     color: var(--honey);
@@ -341,20 +321,54 @@
   }
   .ribbon-head,
   .ribbon-footer,
-  .ribbon-scale {
+  .ribbon-heights,
+  .ribbon-legend {
     display: flex;
     align-items: center;
-    justify-content: space-between;
     gap: 10px;
   }
-  .ribbon-scale {
-    padding: 14px 4px 6px;
+  .ribbon-head {
+    justify-content: space-between;
+  }
+  .ribbon-pct {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--straw);
+  }
+  .ribbon-heights {
+    margin: 12px 0 4px;
+  }
+  .ribbon-heights .chip .dot {
+    background: var(--mint);
+  }
+  .ribbon-heights .chip.honey .dot {
+    background: var(--honey);
+  }
+  .ribbon-heights .chip .mono {
+    font-weight: 700;
+  }
+  .ribbon-legend {
+    margin-top: 8px;
     font-size: 11px;
     color: var(--ink-dim);
   }
-  .scale-end {
+  .lg {
     display: inline-flex;
-    gap: 6px;
+    align-items: center;
+    gap: 5px;
+  }
+  .sw {
+    width: 9px;
+    height: 9px;
+    border-radius: 2px;
+    background: #d5d5d5;
+    display: inline-block;
+  }
+  .sw.filled {
+    background: var(--straw);
+  }
+  .sw.win {
+    background: var(--honey);
   }
   .ribbon {
     position: relative;
@@ -364,7 +378,7 @@
     align-items: center;
     padding: 0 4px;
     border-radius: var(--r-12);
-    background: linear-gradient(180deg, rgba(160, 156, 181, 0.08), rgba(160, 156, 181, 0.03));
+    background: #f0f0f0;
     border: 1px solid var(--line);
     overflow: hidden;
   }
@@ -372,26 +386,23 @@
     flex: 1 1 0;
     height: 12px;
     border-radius: 3px;
-    background: rgba(160, 156, 181, 0.14);
-    transition: background 0.3s ease;
+    background: #d5d5d5;
   }
   .link.filled {
-    background: linear-gradient(180deg, var(--straw), #d94f7d);
+    background: var(--straw);
   }
   .link.winning {
-    background: linear-gradient(180deg, var(--honey), #dca31f);
-    box-shadow: 0 0 10px rgba(255, 201, 60, 0.5);
+    background: var(--honey);
   }
   .drag-ghost {
     position: absolute;
     top: 4px;
     bottom: 4px;
     width: 2px;
-    background: #fff;
-    opacity: 0.85;
+    background: var(--ink-fg);
+    opacity: 0.6;
     border-radius: 2px;
     pointer-events: none;
-    animation: pulse 1.2s ease-in-out infinite;
   }
   .win-mark {
     position: absolute;
@@ -401,10 +412,6 @@
     background: var(--honey);
     opacity: 0.55;
     pointer-events: none;
-  }
-  @keyframes pulse {
-    0%, 100% { opacity: 0.9; }
-    50% { opacity: 0.4; }
   }
   .ribbon-footer {
     margin-top: 10px;
@@ -416,7 +423,7 @@
   }
   .chip.honey {
     color: var(--honey);
-    border-color: rgba(255, 201, 60, 0.4);
+    border-color: var(--honey);
   }
 
   .mid-grid {

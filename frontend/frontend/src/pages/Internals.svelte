@@ -205,7 +205,6 @@
   }
   .live .dot {
     background: var(--mint);
-    box-shadow: 0 0 8px rgba(74, 222, 128, 0.8);
   }
   .card-head {
     display: flex;
@@ -224,7 +223,7 @@
     position: relative;
     height: 46px;
     border-radius: var(--r-12);
-    background: linear-gradient(180deg, rgba(160, 156, 181, 0.07), rgba(160, 156, 181, 0.03));
+    background: #f0f0f0;
     border: 1px solid var(--line);
     overflow: hidden;
     margin-bottom: 8px;
@@ -232,8 +231,8 @@
   .b-chain {
     position: absolute;
     inset: 0;
-    background: repeating-linear-gradient(90deg, rgba(255, 107, 157, 0.12) 0, rgba(255, 107, 157, 0.12) 2px, transparent 2px, transparent 12%);
-    opacity: 0.5;
+    background: repeating-linear-gradient(90deg, var(--straw) 0, var(--straw) 2px, transparent 2px, transparent 12%);
+    opacity: 0.15;
   }
   .b-boundary {
     position: absolute;
@@ -248,17 +247,17 @@
     top: 8px;
     bottom: 8px;
     min-width: 3px;
-    background: linear-gradient(90deg, rgba(255, 107, 157, 0.85), rgba(255, 201, 60, 0.6));
+    background: var(--straw);
+    opacity: 0.85;
     border-radius: 4px;
-    box-shadow: 0 0 14px rgba(255, 107, 157, 0.4);
   }
   .b-tip {
     position: absolute;
     top: 4px;
     bottom: 4px;
     width: 2px;
-    background: #fff;
-    opacity: 0.9;
+    background: var(--ink-fg);
+    opacity: 0.6;
   }
   .b-hmark {
     position: absolute;
@@ -289,7 +288,7 @@
   }
   .bar {
     flex: 1;
-    background: linear-gradient(180deg, var(--straw), #b43a63);
+    background: var(--straw);
     border-radius: 2px 2px 0 0;
     opacity: 0.85;
   }
@@ -319,13 +318,13 @@
     position: relative;
     height: 14px;
     border-radius: 4px;
-    background: rgba(160, 156, 181, 0.12);
+    background: #e0e0e0;
     overflow: hidden;
   }
   .lane-done {
     position: absolute;
     inset: 0 auto 0 0;
-    background: linear-gradient(90deg, var(--straw), var(--honey));
+    background: var(--straw);
     border-radius: 4px;
   }
   .lane-slot {
@@ -334,7 +333,8 @@
     bottom: 2px;
     left: 78%;
     width: 2px;
-    background: rgba(255, 255, 255, 0.6);
+    background: var(--ink-fg);
+    opacity: 0.3;
   }
   .lane-vals {
     color: var(--ink-dim);
@@ -367,11 +367,11 @@
     color: var(--ink-dim);
   }
   .seg.done {
-    border-color: rgba(74, 222, 128, 0.5);
+    border-color: var(--mint);
     color: var(--mint);
   }
   .seg.inflight {
-    border-color: rgba(255, 201, 60, 0.55);
+    border-color: var(--honey);
     color: var(--honey);
   }
   .kv {
@@ -395,14 +395,14 @@
   .mem-bar {
     height: 8px;
     border-radius: 4px;
-    background: rgba(160, 156, 181, 0.12);
+    background: #e0e0e0;
     margin-top: 12px;
     overflow: hidden;
   }
   .mem-bar span {
     display: block;
     height: 100%;
-    background: linear-gradient(90deg, var(--straw), var(--honey));
+    background: var(--straw);
     border-radius: 4px;
   }
 

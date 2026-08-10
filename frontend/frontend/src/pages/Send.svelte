@@ -243,7 +243,6 @@
   }
   input.invalid {
     border-color: var(--straw);
-    box-shadow: 0 0 0 3px rgba(255, 107, 157, 0.2);
   }
   .err {
     display: flex;
@@ -270,7 +269,7 @@
   .coin {
     border: 1px solid var(--line);
     border-radius: var(--r-12);
-    background: rgba(160, 156, 181, 0.05);
+    background: #f0f0f0;
   }
   .coin-sum {
     display: flex;
@@ -353,7 +352,7 @@
     gap: 10px;
     color: var(--straw);
     font-size: 12px;
-    border: 1px solid rgba(255, 107, 157, 0.4);
+    border: 1px solid var(--straw);
     border-radius: var(--r-8);
     padding: 8px 12px;
   }

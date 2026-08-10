@@ -209,7 +209,7 @@
 
   .mnemonic {
     margin-top: 14px;
-    background: rgba(160, 156, 181, 0.06);
+    background: #f0f0f0;
     border: 1px solid var(--line);
     border-radius: var(--r-12);
     padding: 14px;
@@ -236,7 +236,7 @@
     font-size: 12px;
     padding: 5px 7px;
     border-radius: 6px;
-    background: rgba(160, 156, 181, 0.08);
+    background: #e5e5e5;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -276,7 +276,7 @@
   }
   .tab:hover {
     color: var(--ink-fg);
-    background: rgba(160, 156, 181, 0.08);
+    background: #eee;
   }
   .tab.active {
     color: var(--straw);
@@ -341,7 +341,7 @@
   }
   .mini.danger {
     color: var(--straw);
-    border-color: rgba(255, 107, 157, 0.5);
+    border-color: var(--straw);
   }
 
   @media (max-width: 880px) {

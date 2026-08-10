@@ -1,6 +1,6 @@
-{
+﻿{
   "lang.name": "English",
-  "app.name": "ini-node",
+  "app.name": "SugarChain",
   "app.tag": "SugarChain desktop node",
 
   "nav.section.node": "Node",
@@ -26,6 +26,10 @@
   "dash.sync_pct": "Synced {pct}%",
   "dash.headers_caught": "header caught up",
   "dash.sync_progress": "Sync progress",
+  "dash.legend_synced": "Synced",
+  "dash.legend_pending": "To sync",
+  "dash.legend_window": "Active window",
+  "dash.legend": "blue = synced · grey = to sync · yellow = active download window",
   "dash.sync_caption": "Blocks: {blocks:,} / {headers:,}",
   "dash.rate": "Rate {rate} bl/s",
   "dash.eta": "ETA {eta}",

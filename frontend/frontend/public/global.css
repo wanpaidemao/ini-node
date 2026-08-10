@@ -1,60 +1,38 @@
 :root {
-  /* ── ini-node design tokens ─────────────────────────── */
-  --ink: #1a1625;          /* app background (夜空) */
-  --violet: #252135;       /* card / layer */
-  --violet-2: #2d2840;     /* raised layer / hover */
-  --straw: #ff6b9d;        /* primary action (草莓酱) */
-  --straw-soft: rgba(255, 107, 157, 0.25);
-  --honey: #ffc93c;        /* emphasis / online marker */
-  --mint: #4ade80;         /* success / syncing-active */
-  --mist: #a09cb5;         /* secondary text / placeholder */
+  /* ── plain light theme ──────────────────────────── */
+  --ink: #ffffff;          /* app background */
+  --violet: #f6f6f6;       /* card / layer */
+  --violet-2: #ececec;     /* raised layer / hover */
+  --straw: #2563eb;        /* primary action */
+  --straw-soft: rgba(37, 99, 235, 0.15);
+  --honey: #b45309;        /* emphasis / warning */
+  --mint: #059669;         /* success */
+  --mist: #6b7280;         /* secondary text */
 
-  --ink-fg: #f2eef8;       /* primary text */
-  --ink-dim: rgba(242, 238, 248, 0.62);
-  --line: rgba(160, 156, 181, 0.18);
+  --ink-fg: #1a1a1a;       /* primary text */
+  --ink-dim: #666666;      /* dimmed text */
+  --line: rgba(0, 0, 0, 0.14);
 
   --r-8: 8px;
   --r-12: 12px;
   --r-20: 20px;
-  --shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
   --focus: 0 0 0 3px var(--straw-soft);
 
-  --font-display: "Nunito", "Segoe UI", system-ui, sans-serif;
-  --font-body: "Segoe UI", system-ui, -apple-system, sans-serif;
-  --font-mono: "Cascadia Code", ui-monospace, "SF Mono", Consolas, monospace;
+  --font-display: system-ui, "Segoe UI", sans-serif;
+  --font-body: system-ui, "Segoe UI", -apple-system, sans-serif;
+  --font-mono: ui-monospace, "Cascadia Code", Consolas, monospace;
 
   /* layout shell */
   --rail-w: 200px;
   --top-h: 48px;
 
-  color-scheme: dark;
+  color-scheme: light;
   background: var(--ink);
   color: var(--ink-fg);
   font-family: var(--font-body);
   font-size: 14px;
   line-height: 1.5;
-}
-
-@font-face {
-  font-family: "Nunito";
-  src: url("/fonts/nunito-latin-800-normal.woff2") format("woff2");
-  font-weight: 800;
-  font-style: normal;
-  font-display: swap;
-}
-@font-face {
-  font-family: "Nunito";
-  src: url("/fonts/nunito-latin-600-normal.woff2") format("woff2");
-  font-weight: 600;
-  font-style: normal;
-  font-display: swap;
-}
-@font-face {
-  font-family: "Nunito";
-  src: url("/fonts/nunito-v16-latin-regular.woff2") format("woff2");
-  font-weight: 400;
-  font-style: normal;
-  font-display: swap;
 }
 
 * {
@@ -88,20 +66,11 @@ select,
 textarea {
   font: inherit;
   color: var(--ink-fg);
-  background: rgba(160, 156, 181, 0.1);
+  background: #fff;
   border: 1px solid var(--line);
   border-radius: var(--r-8);
   padding: 7px 10px;
   min-height: 34px;
-  transition: border-color 0.12s ease, box-shadow 0.12s ease, background 0.12s ease;
-}
-input::-webkit-calendar-picker-indicator {
-  filter: invert(0.7);
-}
-input:hover,
-select:hover,
-textarea:hover {
-  border-color: rgba(160, 156, 181, 0.35);
 }
 input:focus-visible,
 select:focus-visible,
@@ -114,22 +83,12 @@ textarea:focus-visible {
   color: var(--ink-dim);
 }
 
-select {
-  appearance: none;
-  background-image: linear-gradient(45deg, transparent 50%, var(--mist) 50%),
-    linear-gradient(135deg, var(--mist) 50%, transparent 50%);
-  background-position: calc(100% - 14px) 55%, calc(100% - 9px) 55%;
-  background-size: 5px 5px;
-  background-repeat: no-repeat;
-  padding-right: 26px;
-}
-
 ::-webkit-scrollbar {
   width: 10px;
   height: 10px;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(160, 156, 181, 0.3);
+  background: rgba(0, 0, 0, 0.25);
   border-radius: 6px;
   border: 2px solid var(--ink);
 }
@@ -143,12 +102,11 @@ select {
   border: 1px solid var(--line);
   border-radius: var(--r-12);
   padding: 16px;
-  box-shadow: var(--shadow);
 }
 
 .btn {
   appearance: none;
-  border: 1px solid transparent;
+  border: 1px solid var(--line);
   border-radius: var(--r-8);
   background: var(--violet-2);
   color: var(--ink-fg);
@@ -159,14 +117,10 @@ select {
   align-items: center;
   gap: 7px;
   font-weight: 600;
-  transition: background 0.12s ease, transform 0.06s ease, border-color 0.12s ease;
   touch-action: manipulation;
 }
 .btn:hover {
-  background: #36304c;
-}
-.btn:active {
-  transform: translateY(1px);
+  background: #e0e0e0;
 }
 .btn:focus-visible {
   outline: none;
@@ -174,30 +128,29 @@ select {
 }
 .btn-primary {
   background: var(--straw);
+  border-color: var(--straw);
   color: #fff;
 }
 .btn-primary:hover {
-  background: #ff7faa;
+  background: #1d4ed8;
 }
 .btn-ghost {
-  background: transparent;
-  border-color: var(--line);
+  background: #fff;
 }
 .btn-ghost:hover {
-  background: rgba(160, 156, 181, 0.12);
+  background: #f0f0f0;
 }
 .btn-danger {
-  background: transparent;
-  border-color: rgba(255, 107, 157, 0.55);
+  background: #fff;
+  border-color: var(--straw);
   color: var(--straw);
 }
 .btn-danger:hover {
-  background: rgba(255, 107, 157, 0.14);
+  background: rgba(37, 99, 235, 0.06);
 }
 .btn[disabled] {
   opacity: 0.45;
   cursor: not-allowed;
-  transform: none;
 }
 
 .chip {
@@ -209,7 +162,7 @@ select {
   padding: 3px 10px;
   font-size: 12px;
   color: var(--ink-dim);
-  background: rgba(160, 156, 181, 0.08);
+  background: #fff;
 }
 
 .dot {
@@ -218,6 +171,7 @@ select {
   border-radius: 50%;
   display: inline-block;
   flex: none;
+  background: var(--mist);
 }
 
 .eyebrow {
@@ -229,10 +183,8 @@ select {
 }
 
 .h-card {
-  font-family: var(--font-display);
-  font-weight: 800;
+  font-weight: 700;
   font-size: 15px;
-  text-wrap: balance;
 }
 
 .mono {

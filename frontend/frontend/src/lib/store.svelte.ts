@@ -1,15 +1,20 @@
-// ── ini-node app store: route, language, connection ──
+// ── app store: route, language, connection ──
 // Svelte 5 runes module — reactive from anywhere, import { app } directly.
 import type { Route } from "./types";
 
 export const app = $state({
   route: "dashboard" as Route,
-  connected: true,
+  connected: false,
   connecting: false,
   syncing: true,
   // cross-page hints
   shortcut: {} as Record<string, unknown>,
 });
+
+export function setConnected(state: { connected: boolean; syncing: boolean }): void {
+  app.connected = state.connected;
+  app.syncing = state.syncing;
+}
 
 export function navigate(route: Route): void {
   app.route = route;

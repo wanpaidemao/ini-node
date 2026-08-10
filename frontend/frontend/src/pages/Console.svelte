@@ -2,17 +2,17 @@
   import { onMount } from "svelte";
   import { fmt, t } from "../lib/i18n";
   import { Services } from "../lib/services";
+  import { navigate } from "../lib/store.svelte";
   import type { Peer, RpcResult } from "../lib/types";
 
   let cmd = $state("");
   let argsRaw = $state("");
   let history = $state<RpcResult[]>([]);
-  let historyIdx = $state<string[]>([]);
   let connected = $state(true);
   let peers = $state<Peer[]>([]);
   let busy = $state(false);
   let format = $state(true);
-  let onlyValue = $state(false);
+  let copied = $state(false);
 
   const methods = [
     "getblockchaininfo", "getblockcount", "getbestblockhash", "getblock", "getblockhash",
@@ -29,8 +29,25 @@
   ];
 
   onMount(() => {
-    Services.getPeers().then((p) => (peers = p));
+    refreshPeers();
   });
+
+  async function refreshPeers() {
+    try {
+      peers = await Services.getPeers();
+      connected = true;
+    } catch {
+      connected = false;
+    }
+  }
+
+  async function copyOutput() {
+    const text = history.map((r) => r.output).join("\n\n");
+    if (!text) return;
+    navigator.clipboard?.writeText(text);
+    copied = true;
+    setTimeout(() => (copied = false), 1500);
+  }
 
   function matchedMethods() {
     if (!cmd.trim()) return methods.slice(0, 5);
@@ -53,14 +70,9 @@
       }
       const res = await Services.rpcCall(method, params);
       history = [res, ...history].slice(0, 50);
-      historyIdx = [method, ...historyIdx].slice(0, 30);
     } finally {
       busy = false;
     }
-  }
-
-  function peekHist(dir: 1 | -1) {
-    void dir;
   }
 
   const sumOutbound = () => peers.filter((p) => p.dir === "outbound").length;
@@ -149,7 +161,7 @@
           <input type="checkbox" bind:checked={format} />
           <span>{t("con.format")}</span>
         </label>
-        <button class="btn btn-ghost se">{t("g.copy")}</button>
+        <button class="btn btn-ghost se" onclick={copyOutput}>{copied ? "✓" : t("g.copy")}</button>
       </div>
     </div>
     {#if history.length === 0}
@@ -171,13 +183,15 @@
   <div class="card">
     <div class="card-head">
       <span class="h-card">{t("con.conn_state")}</span>
-      <span class="chip"><span class="dot mint" aria-hidden="true"></span> {t("g.connected")}</span>
+      <span class="chip" class:offline={!connected}>
+        <span class="dot mint" aria-hidden="true"></span> {connected ? t("g.connected") : t("con.not_connected")}
+      </span>
     </div>
     <div class="conn-metrics">
       <span class="metric">{t("con.dynamic_peers", { used: peers.length, cap: 8 })}</span>
       <span class="metric">{t("dash.outbound", { n: sumOutbound() })}</span>
       <span class="metric">{t("dash.inbound", { n: sumInbound() })}</span>
-      <span class="metric mono">{t("con.net_eq", { n: 50, m: 125 })}</span>
+      <span class="metric mono">{t("con.net_eq", { n: 8, m: 8 })}</span>
       <span class="metric mono">{t("con.latency_median", { n: medianLatency() })}</span>
     </div>
     <table class="peer-t">
@@ -231,7 +245,7 @@
         {t("con.reset_peers")}
       </button>
       <span class="spacer"></span>
-      <button class="btn btn-ghost">{t("nav.internals")} →</button>
+      <button class="btn btn-ghost" onclick={() => navigate("internals")}>{t("nav.internals")} →</button>
     </div>
   </div>
 </section>
@@ -263,13 +277,12 @@
   }
   .live .dot {
     background: var(--mint);
-    box-shadow: 0 0 8px rgba(74, 222, 128, 0.8);
   }
   .banner {
     display: flex;
     align-items: center;
     gap: 10px;
-    border-color: rgba(255, 107, 157, 0.5);
+    border-color: var(--straw);
   }
   .dot.off {
     background: var(--straw);
@@ -308,7 +321,7 @@
     margin-top: 8px;
   }
   .sug-item {
-    background: rgba(160, 156, 181, 0.1);
+    background: #fff;
     border: 1px solid var(--line);
     border-radius: 6px;
     color: var(--ink-dim);
@@ -385,7 +398,7 @@
     word-break: break-word;
     font-size: 12px;
     line-height: 1.55;
-    background: rgba(26, 22, 37, 0.6);
+    background: #f4f4f4;
     border-radius: var(--r-8);
     padding: 10px 12px;
     border: 1px solid var(--line);
@@ -408,6 +421,13 @@
     gap: 8px;
     flex-wrap: wrap;
     margin-bottom: 12px;
+  }
+  .chip.offline {
+    border-color: var(--straw);
+    color: var(--straw);
+  }
+  .dot.mint {
+    background: var(--mint);
   }
   .metric {
     font-size: 12px;
@@ -447,8 +467,8 @@
     color: var(--mint);
   }
   .mini.danger {
-    background: none;
-    border: 1px solid rgba(255, 107, 157, 0.5);
+    background: #fff;
+    border: 1px solid var(--straw);
     color: var(--straw);
     border-radius: 6px;
     padding: 2px 8px;
@@ -456,7 +476,7 @@
     cursor: pointer;
   }
   .mini.danger:hover {
-    background: rgba(255, 107, 157, 0.14);
+    background: rgba(37, 99, 235, 0.06);
   }
   .conn-actions {
     display: flex;

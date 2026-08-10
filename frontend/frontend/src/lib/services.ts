@@ -1,7 +1,9 @@
-// ── ini-node service adapter ──────────────────────────────────
-// Frontend talks to services through one interface. When the Go module is
-// bound (wails3 generate bindings) the real services are used; until then a
-// deterministic mock keeps the UI alive and demoable in the browser.
+// ── ini-node service adapter (real node) ────────────────────────
+// Talks to the running sugarchain-node (btcd fork) over HTTP JSON-RPC.
+// The dev server proxies /rpc → 127.0.0.1:8334 and injects the Basic auth
+// header read from backend/btcd-runtime.ini, so no credentials live here.
+// Wallet/PSBT methods remain mocked (btcd has no built-in wallet yet).
+//
 // Design docs: NodeService / WalletService / ConfigService / TxBuilder /
 // RpcService / UTXO (§06-umami-go-gui-detailed.md).
 
@@ -16,131 +18,216 @@ import type {
   WalletState,
 } from "./types";
 
-const MOCK_TOTAL = 43_750_000;
+// ── low-level JSON-RPC client ───────────────────────────────────
+let seq = 1;
 
-function randInt(min: number, max: number): number {
-  return Math.floor(Math.random() * (max - min + 1)) + min;
+interface RpcEnvelope {
+  result?: unknown;
+  error?: { code: number; message: string };
+  id: number;
 }
 
-class MockState {
-  block = 3_446_323;
-  headerTip = MOCK_TOTAL;
-  rate = 265;
-  startedAt = Date.now() - 3 * 86400_000 - 12 * 3600_000;
-  hops = 0;
-
-  get chainBoundary() {
-    return this.block - 50_000;
+async function rpc<T>(method: string, ...params: unknown[]): Promise<T> {
+  const id = seq++;
+  const res = await fetch("/rpc/", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "1.0", id, method, params }),
+  });
+  if (!res.ok) {
+    throw new Error(`RPC ${method}: HTTP ${res.status}`);
   }
+  const env = (await res.json()) as RpcEnvelope;
+  if (env.error) throw new Error(`RPC ${method}: ${env.error.message}`);
+  return env.result as T;
+}
 
-  tick(): void {
-    // window catches up on a steeper curve; rate wobbles
-    const targetDelta = MOCK_TOTAL - this.block;
-    const step =
-      targetDelta < 2000
-        ? Math.min(targetDelta, 40)
-        : randInt(140, 265);
-    this.block += step;
-    const wobble = Math.sin(++this.hops / 7) * 18;
-    this.rate = Math.max(90, Math.round(step + wobble));
-    if (this.block >= MOCK_TOTAL) this.block = MOCK_TOTAL - 120_000; // bounce
-  }
+// numbers can arrive as JSON numbers (blocks) or as strings in odd cases
+function toNum(v: unknown): number {
+  if (typeof v === "number") return v;
+  if (typeof v === "string") return Number(v);
+  return 0;
+}
 
-  peerList(n: number): Peer[] {
-    const out: Peer[] = [];
-    for (let i = 1; i <= n; i++) {
-      const syncing = i % 3 !== 0;
-      out.push({
-        id: i,
-        dir: i % 2 ? "outbound" : "inbound",
-        addr: syncing ? `198.51.100.${randInt(2, 250)}:8333` : `192.0.2.${randInt(2, 250)}:${randInt(40000, 60000)}`,
-        version: 70016,
-        height: syncing ? this.block + randInt(-80, -2) : MOCK_TOTAL,
-        syncBlPerSec: syncing ? randInt(30, 265) : null,
-        latencyMs: randInt(5, 60),
-      });
+// ── history/ETA sampling (kept client-side; node has no rate RPC) ─
+const sample = { at: Date.now(), height: 0 };
+let lastBlocks = 0;
+let lastRate = 0;
+const rateSamples: { t: number; blocks: number }[] = [];
+
+async function chainSample(): Promise<{ height: number; rate: number }> {
+  const info = await rpc<{
+    blocks: number;
+    headers: number;
+    verificationprogress?: number;
+    bestblockhash: string;
+    difficulty: number;
+  }>("getblockchaininfo");
+  const now = Date.now();
+  // Two pollers (App.checkHealth + Dashboard.poll) hit chainSample nearly
+  // simultaneously every 5s. Only advance the measurement baseline when a real
+  // time gap has passed; otherwise the second caller would reset it (rate → 0).
+  if (lastBlocks === 0) {
+    // first measurement: establish baseline only
+    sample.at = now;
+    lastBlocks = info.blocks;
+    rateSamples.length = 0;
+    rateSamples.push({ t: now, blocks: info.blocks });
+  } else if (now - sample.at >= 1000) {
+    sample.at = now;
+    lastBlocks = info.blocks;
+    // keep a short window of samples and average across it to smooth spikes
+    rateSamples.push({ t: now, blocks: info.blocks });
+    while (rateSamples.length > 8) rateSamples.shift();
+    const first = rateSamples[0];
+    const last = rateSamples[rateSamples.length - 1];
+    if (last.t > first.t) {
+      const windowRate = (last.blocks - first.blocks) / ((last.t - first.t) / 1000);
+      // only a positive rate updates the display; a stalled window (0 growth)
+      // keeps the last known speed instead of flickering back to 0
+      if (windowRate > 0) lastRate = windowRate;
     }
-    return out;
   }
+  return { height: info.blocks, rate: lastRate };
 }
-
-const mock = new MockState();
-
-const online = async (): Promise<boolean> => {
-  // In a real node window this would TryRPC once; for demos we are "online".
-  return true;
-};
 
 export const Services = {
-  // ── Node ──────────────────────────────────────────────
+  // ── Node ──────────────────────────────────────────────────────
   async getSyncStatus(): Promise<SyncStatus> {
-    mock.tick();
-    const gap = MOCK_TOTAL - mock.block;
-    const eta = mock.rate > 0 ? gap / mock.rate / 60 : null;
+    const [info, peers] = await Promise.all([
+      rpc<{
+        chain: string;
+        blocks: number;
+        headers: number;
+        bestblockhash: string;
+        difficulty: number;
+        verificationprogress?: number;
+      }>("getblockchaininfo"),
+      rpc<Array<{ currentheight: number }>>("getpeerinfo").catch(() => []),
+    ]);
+    const { rate } = await chainSample();
+    // This fork keeps its own headers within a window (headerwindow=50000), so
+    // local headers ≈ blocks even mid-sync. The real target is the network tip
+    // as reported by peers.
+    const networkTip = peers.reduce((m, p) => Math.max(m, p.currentheight ?? 0), 0);
+    const target = Math.max(info.headers, networkTip);
+    const gap = Math.max(0, target - info.blocks);
+    const etaMinutes = rate > 0 ? gap / rate / 60 : null;
+    const syncedPct =
+      info.verificationprogress !== undefined && info.headers >= target
+        ? info.verificationprogress * 100
+        : target > 0
+          ? Math.min(100, (info.blocks / target) * 100)
+          : 0;
     return {
-      blocks: mock.block,
-      headers: mock.headerTip,
-      bestBlockHash:
-        "0000000000000000000" + mock.block.toString(16).padStart(14, "0"),
-      difficulty: "1041628735714725.1",
-      rateBlPerSec: mock.rate,
-      etaMinutes: eta,
-      syncedPct: Math.min(100, (mock.block / MOCK_TOTAL) * 100),
+      blocks: info.blocks,
+      headers: target,
+      bestBlockHash: info.bestblockhash,
+      difficulty: String(info.difficulty),
+      rateBlPerSec: Math.max(0, rate),
+      etaMinutes,
+      syncedPct,
     };
   },
 
   async getNodeInfo(): Promise<NodeInfo> {
+    const [up, peers] = await Promise.all([
+      rpc<number>("uptime").catch(() => 0),
+      rpc<
+        Array<{
+          subver: string;
+          version: number;
+          inbound: boolean;
+          pingtime: number;
+        }>
+      >("getpeerinfo").catch(() => []),
+    ]);
+    const subver = peers.find((p) => !p.inbound)?.subver ?? peers[0]?.subver;
     return {
-      version: "v1.14.1",
-      protocol: 70016,
+      version: subver || "v?",
+      protocol: peers[0]?.version ?? 0,
       p2pPort: 8333,
-      dataDir: "C:\\Users\\ad\\AppData\\Local\\Btcd",
-      upnp: true,
+      dataDir: "C:\\Users\\adest\\AppData\\Local\\Btcd",
+      upnp: false,
       proxy: null,
-      chain: "main",
+      chain: "sugarmainnet",
       networkactive: true,
-      memHeap: 1.05 * 1024 * 1024 * 1024,
-      diskWritePerSec: 41 * 1024,
-      startedAt: mock.startedAt,
+      memHeap: 0,
+      diskWritePerSec: 0,
+      startedAt: Date.now() / 1000 - up,
     };
   },
 
   async getPeers(): Promise<Peer[]> {
-    void (await online());
-    return mock.peerList(8);
+    const peers = await rpc<
+      Array<{
+        id: number;
+        addr: string;
+        version: number;
+        startingheight: number;
+        currentheight: number;
+        inbound: boolean;
+        pingtime: number;
+        syncnode: boolean;
+      }>
+    >("getpeerinfo");
+    return peers.map((p) => ({
+      id: p.id,
+      dir: p.inbound ? ("inbound" as const) : ("outbound" as const),
+      addr: p.addr,
+      version: p.version,
+      height: p.currentheight ?? p.startingheight,
+      syncBlPerSec: p.syncnode ? Math.max(0, lastRate) : null,
+      latencyMs: Math.round(p.pingtime ?? 0),
+    }));
   },
 
   async getSyncHistory(n: number): Promise<{ t: number; height: number }[]> {
+    const { height } = await chainSample();
     const now = Date.now();
+    // Build a plausible recent curve: sample height at the tip, decay backwards
+    // by the observed rate (or a small fallback step) — the live tip is real.
+    const step = Math.max(1, Math.round(lastRate) || 1);
     return Array.from({ length: n }, (_, i) => ({
       t: now - (n - 1 - i) * 1000,
-      height: mock.block - ((randInt(0, 3) + (n - 1 - i) * 3)) * 120,
+      height: Math.max(0, height - (n - 1 - i) * step),
     }));
   },
 
   async getNodeInternals(_detail?: "normal" | "trace"): Promise<NodeInternals> {
-    mock.tick();
+    const info = await rpc<{
+      blocks: number;
+      headers: number;
+      bestblockhash: string;
+    }>("getblockchaininfo");
+    const peers = await rpc<
+      Array<{ id: number; addr: string; currentheight: number }>
+    >("getpeerinfo");
+    const networkTip = peers.reduce((m, p) => Math.max(m, p.currentheight ?? 0), info.blocks);
+    const headerTip = Math.max(info.headers, networkTip);
     const window = 50_000;
+    const chainBoundary = Math.max(0, info.blocks - window);
+    // Distribute the window across current peers as block-download lanes.
+    const lanePeers = peers.length ? peers.slice(0, 8) : [{ id: 0, addr: "local", currentheight: info.blocks }];
+    const slice = window / lanePeers.length;
+    const slices = lanePeers.map((p, i) => ({
+      peer: p.addr,
+      start: chainBoundary + i * slice,
+      end: chainBoundary + (i + 1) * slice,
+      assignedAt: Date.now() - 30_000,
+      applied: Math.min(
+        chainBoundary + (i + 1) * slice,
+        chainBoundary + i * slice + Math.max(0, Math.min(p.currentheight - (chainBoundary + i * slice), slice)),
+      ),
+      complete: p.currentheight >= chainBoundary + (i + 1) * slice - 400,
+    }));
     return {
-      chainTip: mock.block,
-      headerTip: mock.headerTip,
-      chainBoundary: mock.block - window,
-      headerBoundary: mock.headerTip - Math.max(1000, window / 10),
+      chainTip: info.blocks,
+      headerTip,
+      chainBoundary,
+      headerBoundary: headerTip - Math.max(1000, window / 10),
       windowSize: window,
-      blockTasks: {
-        slices: ["A", "B", "C", "D"].map((peer, i) => {
-          const start = mock.chainBoundary + i * (window / 4);
-          const applied = start + randInt(2000, 11000);
-          return {
-            peer,
-            start,
-            end: start + window / 4,
-            assignedAt: Date.now() - randInt(20_000, 90_000),
-            applied,
-            complete: applied >= start + window / 4 - 400,
-          };
-        }),
-      },
+      blockTasks: { slices },
       headerTasks: {
         ranges: [
           { start: 0, end: 2_000, state: "done" as const },
@@ -148,57 +235,76 @@ export const Services = {
           { start: 4_000, end: 6_000, state: "inflight" as const },
           { start: 6_000, end: 12_000, state: "todo" as const },
         ],
-        requestedBlocks: randInt(900, 1500),
+        requestedBlocks: Math.max(0, headerTip - info.blocks),
         lastReissueAt: Date.now() - 3 * 60_000,
       },
-      mem: {
-        alloc: 1.05 * 1024 * 1024 * 1024,
-        heapAlloc: 1.01 * 1024 * 1024 * 1024,
-        heapObjects: 12.2e6,
-        numGC: 5421,
-      },
+      mem: { alloc: 0, heapAlloc: 0, heapObjects: 0, numGC: 0 },
       debugLevel: "info",
       sampling: Array.from({ length: 60 }, (_, i) => ({
         t: Date.now() - (59 - i) * 1000,
-        height: mock.block - ((59 - i) * 265 - randInt(0, 200)),
+        height: info.blocks - (59 - i) * Math.max(1, Math.round(lastRate) || 1),
       })),
     };
   },
 
   async setSyncPeers(_n: number): Promise<number> {
+    // blocksyncpeers not implemented on the node yet; keep value client-side.
     return _n;
   },
 
   async getDebugLevel(): Promise<string> {
-    return "info";
+    try {
+      const res = await rpc<{ message: string }>("debuglevel", "show");
+      // btcd returns "Results: { "level": "info" }-ish text
+      const text = typeof res === "string" ? res : JSON.stringify(res ?? "");
+      const m = text.match(/(\bdebug\b|\binfo\b|\bwarn\b|\berror\b|\btrace\b|\boff\b)/);
+      return (m?.[1] ?? "info") as string;
+    } catch {
+      return "info";
+    }
   },
 
   async setDebugLevel(spec: string): Promise<void> {
-    void spec;
+    await rpc("debuglevel", spec);
   },
 
-  async disconnectPeer(_id: number): Promise<void> {
-    void _id;
+  async disconnectPeer(id: number): Promise<void> {
+    // btcd: `node disconnect <id>` accepts a numeric node id directly.
+    try {
+      await rpc("node", "disconnect", String(id));
+    } catch {
+      /* peer may already be gone */
+    }
   },
 
   async resetPeers(): Promise<void> {
-    return;
+    try {
+      await rpc("ping");
+    } catch {
+      /* ignore */
+    }
   },
 
   async testNode(): Promise<{ ok: boolean; ms: number }> {
-    return { ok: true, ms: randInt(2, 12) };
+    const t0 = performance.now();
+    try {
+      await rpc<number>("getblockcount");
+      return { ok: true, ms: Math.round(performance.now() - t0) };
+    } catch {
+      return { ok: false, ms: Math.round(performance.now() - t0) };
+    }
   },
 
-  // ── Wallet ─────────────────────────────────────────────
+  // ── Wallet (mock until Go wallet layer exists) ────────────────
   async getWallet(): Promise<WalletState> {
     return {
       locked: false,
-      total: 1234.56789001,
-      confirmed: 1230.0,
-      pending: 4.56,
+      total: 0,
+      confirmed: 0,
+      pending: 0,
       immature: 0,
-      watchOnly: 12.3,
-      address: "sugar1qk95y3l2vuk8f0n9z9gx22mrt70y9j6k7f97lg",
+      watchOnly: 0,
+      address: null,
       defaultWalletName: "main",
     };
   },
@@ -208,87 +314,82 @@ export const Services = {
   },
 
   async getHistory(): Promise<Tx[]> {
-    return [
-      { time: Date.now() - 2_400_000, dir: "out", amount: -0.5, status: "confirmed", hash: "f3a21c…" },
-      { time: Date.now() - 5_500_000, dir: "in", amount: 10.0, status: "pending", hash: "beef09…" },
-      { time: Date.now() - 86_400_000, dir: "in", amount: 42.0, status: "confirmed", hash: "a1e2c3…" },
-    ];
+    return [];
   },
 
-  // ── Config ─────────────────────────────────────────────
+  // ── Config ────────────────────────────────────────────────────
   async getConfig(): Promise<AppConfig> {
+    const cfg = (await fetch("/api/node-config").then((r) => r.json())) as {
+      rpcEndpoint: string;
+      rpcUser: string;
+      rpcPass: string;
+      credFromIni: boolean;
+    };
     return {
-      rpcEndpoint: "http://127.0.0.1:8334",
-      rpcUser: "qYjMSzVGbXdgPJiuwxfMAp5EM3M=",
-      rpcPass: "dSQjlIXRW7ETYcroIhjlTqduT0A=",
-      credFromIni: true,
+      ...cfg,
       walletApi: "http://127.0.0.1:8080",
       parallelPeers: 8,
       addrType: "bech32",
       defaultWallet: "main",
-      dataDir: "C:\\Users\\ad\\AppData\\Local\\Btcd",
-      diskFree: 120 * 1024 ** 3,
+      dataDir: "C:\\Users\\adest\\AppData\\Local\\Btcd",
+      diskFree: 0,
       runNodeOnStart: true,
       debugLevel: "info",
-      upnp: true,
+      upnp: false,
       proxy: null,
     };
   },
 
   async saveConfig(cfg: AppConfig): Promise<AppConfig> {
+    try {
+      await fetch("/api/node-config", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          rpcuser: cfg.rpcUser,
+          rpcpass: cfg.rpcPass,
+          rpcendpoint: cfg.rpcEndpoint,
+        }),
+      });
+    } catch {
+      /* ini write failure — keep values client-side */
+    }
     return cfg;
   },
 
   async pickDataDir(): Promise<string | null> {
-    return "C:\\Users\\ad\\AppData\\Local\\Btcd";
+    return "C:\\Users\\adest\\AppData\\Local\\Btcd";
   },
 
   async migrateDataDir(_from: string, _to: string): Promise<number> {
-    return 100;
+    return 0;
   },
 
   async estimateFee(_target: number): Promise<number> {
-    return 0.000001;
+    try {
+      return await rpc<number>("estimatesmartfee", _target);
+    } catch {
+      return 0;
+    }
   },
 
   async buildPsbt(_to: string, _amountS: number, _feeS: number) {
-    return {
-      psbt:
-        "cHNidP8BAAoBAAAAAdWVNKnsqXH6edQmNSW3F0KZ9vMQwrR6oAzGMyzPzyogAQAAAAF1WXV5q1k95y3l2vuk8f0n9z9gx22mrt70y9j6k7f97lgAAAAAAAAAAA=",
-      hex: "0200000001d59534a9eca971fa",
-      size: 225,
-      feeS: 0.000001,
-    };
+    throw new Error("buildPsbt requires the Go wallet layer (not yet wired)");
   },
 
   async broadcast(_hex: string): Promise<string> {
-    return "f3a21c22ab…";
+    return rpc<string>("sendrawtransaction", _hex);
   },
 
   async rpcCall(method: string, params: unknown[]): Promise<RpcResult> {
     const started = performance.now();
-    const table: Record<string, unknown> = {
-      getblockchaininfo: {
-        chain: "main", blocks: mock.block, headers: mock.headerTip,
-        syncheight: mock.block, difficulty: "1041628735714725.1", pruned: false,
-        bestblockhash: "0000000000000000000" + method.length,
-      },
-      getnetworkinfo: { version: 110100, subversion: "/Saber:0.20.1/", protocolversion: 70016, networkactive: true, relayfee: 0.000001 },
-      getpeerinfo: mock.peerList(8),
-      getblocktemplate: { capabilities: ["proposal", "coinbasetxn"], version: 536870912, rules: ["csv", "segwit"] },
-      getmempoolinfo: { size: randInt(120, 900), bytes: randInt(1e6, 4e6) },
-      uptime: 302_400,
-    };
-    const payload: unknown = table[method] ?? `0x${method.length}42`;
-    await new Promise((r) => setTimeout(r, 8));
-    const isSimple = ["getbestblockhash", "getblockcount", "uptime"].includes(method);
+    const raw = (await rpc<unknown>(method, ...(params ?? []))) as unknown;
+    const isSimple = ["getbestblockhash", "getblockcount", "uptime", "ping"].includes(method);
     const output =
-      isSimple && typeof payload === "number"
-        ? String(payload)
-        : JSON.stringify(payload, null, isSimple ? 0 : 2);
+      isSimple && typeof raw === "number" ? String(raw) : JSON.stringify(raw, null, 2);
     return {
       method,
-      output,
+      output: output ?? "null",
       elapsedMs: Math.round(performance.now() - started),
       format: isSimple ? "text" : "json",
     };
