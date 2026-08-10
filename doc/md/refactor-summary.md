@@ -1,7 +1,7 @@
-# umami (Sugarchain) Go 重构 — 阶段总结
+﻿# umami (Sugarchain) Go 重构 — 阶段总结
 
 > 仓库：`sugarchain-node`（btcd v0.26.2 fork）
-> 对照参考：`umami/`（Sugarchain 基于 Bitcoin Core 25 的 C++ 客户端）
+> 对照参考：`../../../backend/umami/`（Sugarchain 基于 Bitcoin Core 25 的 C++ 客户端）
 > 更新时间：2026-08-03
 
 ## 项目目标
@@ -19,7 +19,7 @@
 
 - N=2048, r=32, personalization =
   `"Satoshi Nakamoto 31/Oct/2008 Proof-of-work is essentially one-CPU-one-vote"`
-  （74 字节，与 `umami/src/primitives/block.cpp` GetPoWHash 的 perslen 一致）
+  （74 字节，与 `../../../backend/umami/src/primitives/block.cpp` GetPoWHash 的 perslen 一致）
 - 复用 `pbkdf2`/`crypto/hmac` 标准库，SIMD 版 salsa20/8 核心
 - **正确性由已知答案测试证明**：`pow/pow_kat_test.go`
   `TestTestnetGenesisPoW` 用 C++ testnet genesis 头断言 PoW hash
@@ -67,7 +67,7 @@
 ### 5. IBD 性能 — 镜像 umami PR #122
 
 - C++ 在 IBD header 下载期跳过 `CheckBlockHeader` 的 PoW 检查
-  （`umami/src/validation.cpp:3985`），仅在非 IBD 时全量校验
+  （`../../../backend/umami/src/validation.cpp:3985`），仅在非 IBD 时全量校验
 - Go 对应：`netsync/manager.go` `handleHeadersMsg` 在 `ibdMode` 下传
   `blockchain.BFNoPoWCheck`，否则 `BFNone`
 - 效果：header 同步 ~35/s → **~500-870 headers/s**
@@ -81,7 +81,7 @@
    - 与 api.sugarchain.org 独立交叉验证一致：
      height 1 `ce8a0df3…`、height 2 `67d3e607…`、height 100 `982f01d3…`、genesis `7d5eaec2…`
 4. 未通过的单测均为 **btcd 原厂测试数据与 Sugar 参数不兼容**导致
-   （见 `Plan/PENDING_TESTS.md`），非回归
+   （见 `doc/md/PENDING_TESTS.md`），非回归
 
 ## 尚未完成
 

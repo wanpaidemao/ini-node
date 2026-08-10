@@ -1,4 +1,4 @@
-# 地址 RPC 契约审计 / Address RPC Contract Audit
+﻿# 地址 RPC 契约审计 / Address RPC Contract Audit
 
 > 状态:已确认 · 更新时间:2026-08-03
 > 结论:wallet-api-server 对齐 **umami** 节点的地址 RPC 契约。
@@ -8,7 +8,7 @@
 wallet-api-server(Go 重写的原 Python api-server)通过 `rpc.Client` 调用节点地址索引 RPC。
 节点候选有两个 C++ 实现,契约部分不一致:
 
-- **umami**(`umami/src/rpc/index.cpp`)——新参考实现,btcd 重写节点(sugarchain-node)以其为镜像目标。
+- **umami**(`../../../backend/umami/src/rpc/index.cpp`)——新参考实现,btcd 重写节点(sugarchain-node)以其为镜像目标。
 - **sugarchain**(`sugarchain/src/rpc/misc.cpp`)——旧 C++ 节点,`getspentinfo` 于 2020-06-04 被重写为数组式(commit `37a137ef0`)。
 
 决策:对齐 **umami**。理由:btcd 重写全套逻辑(难度、PoW、IBD)都以 umami 为参照,
@@ -32,7 +32,7 @@ wallet-api-server 最终要跑在 btcd 之上;对齐 umami = Go 服务与底层�
 
 ## 修复 / Fix
 
-文件:`wallet-api-server/internal/service/esplora.go` → `Outspends`
+文件:`../../../backend/wallet-api-server/internal/service/esplora.go` → `Outspends`
 
 - 请求:`getspentinfo [{"txid": thash, "index": n}]`(按每个 vout 一次)
 - 响应:解析单对象 `{txid, index, height}`,未花费 RPC 抛错 → 置 `spent:false`

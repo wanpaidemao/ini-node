@@ -256,12 +256,15 @@ curl -u ini:ini -H "Content-Type: application/json" `
   （`pow.BlockPoWHash`），两者分工与 C++ umami 的 `GetHash()`/`GetPoWHash()` 一致。
 - **IBD 期间 header 下载会跳过 PoW 全量检查**（镜像 umami PR #122，提速 ~35/s → ~870/s），
   区块下载阶段会做全量验证。
-- **header-only 节点目前不持久化**：每次重启需重新下载 header（详见 `../Plan/PENDING_TESTS.md`）。
+- **header-only 节点目前不持久化**：每次重启需重新下载 header（详见 `doc/md/PENDING_TESTS.md`）。
 - 主网全量同步约 4,360 万个区块，header 阶段约需 14 小时（网络/机器而定）。
 
 ## 相关文档
 
-- `../Plan/PENDING_TESTS.md` — 待测试项
+- `doc/md/PENDING_TESTS.md` — 待测试项
+- `doc/md/CHANGELOG.md` — 开发变更日志
+- `doc/md/RUNTIME_SYNC_PEERS.md` — 运行时可调并行 peer 方案
+- `doc/md/ARCHITECTURE.md` — 存储架构
 - `../dev/refactor-summary.md` — 重构总结
 - `../dev/sync-verification.md` — 主网 header 同步与交叉验证记录
-- 参考实现：`../umami/`（C++，基于 Bitcoin Core 25）
+- 参考实现：`../backend/umami/`（C++，基于 Bitcoin Core 25）

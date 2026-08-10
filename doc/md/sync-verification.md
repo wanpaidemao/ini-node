@@ -1,4 +1,4 @@
-# 主网 Header 同步与交叉验证记录
+﻿# 主网 Header 同步与交叉验证记录
 
 > 2026-08-03 · 目标：证明 Go 节点接受的 header 链与 C++/官方主网字节级一致
 
@@ -49,7 +49,7 @@
 
 ## 参考链接
 
-- C++ 断言：`umami/src/kernel/chainparams.cpp`
+- C++ 断言：`../../../backend/umami/src/kernel/chainparams.cpp`
   （`0032f49a…` testnet genesis PoW；powLimit `003fffff…`；regtest `0f0f0f0f…`）
-- PR #122：`umami/src/validation.cpp:3985`
+- PR #122：`../../../backend/umami/src/validation.cpp:3985`
 - API 文档：https://api.sugarchain.org/ （本机直连被拒，经检索获取）
