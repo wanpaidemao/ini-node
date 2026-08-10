@@ -2120,13 +2120,45 @@ func initDB(ldb *leveldb.DB) error {
 // it substantially reduces the file count and the compaction churn (and
 // therefore the write amplification) at the cost of somewhat larger compaction
 // buffers and longer individual compaction pauses.
-const defaultCompactionTableSize = 16 * 1024 * 1024 // 16 MB
+const defaultCompactionTableSize = 32 * 1024 * 1024 // 32 MB
 
 // defaultWriteBuffer is the maximum size of a leveldb memtable before it is
 // flushed to a level-0 table.  It is raised alongside the compaction table
 // size so the initial sorted tables are also large instead of only growing
-// during later compactions.
-const defaultWriteBuffer = 8 * 1024 * 1024 // 8 MB
+// during later compactions.  Together with the larger table size it cuts the
+// number of level-0 files produced by each cache flush, which drastically
+// reduces the cascading L0->L1->L2 compactions and the resulting write
+// amplification on the metadata database.
+const defaultWriteBuffer = 32 * 1024 * 1024 // 32 MB
+
+// defaultL0CompactionTrigger is the number of level-0 sorted tables that must
+// accumulate before compaction starts.  It is raised so a whole batch of
+// level-0 files produced by a single metadata cache flush are compacted
+// together instead of one file at a time.
+const defaultL0CompactionTrigger = 8
+
+// defaultWriteL0SlowdownTrigger / defaultWriteL0PauseTrigger are the number of
+// level-0 tables at which new writes are slowed down or paused entirely.  They
+// are raised alongside the compaction trigger so a large flush does not stall
+// the block ingestion pipeline while background compactions catch up.
+const defaultWriteL0SlowdownTrigger = 24
+const defaultWriteL0PauseTrigger = 48
+
+// defaultCompactionTotalSize is the total on-disk size budget for level-1
+// before it is compacted into level-2.  The metadata keys are sha256 hashes
+// and therefore land at random positions in the key space, so a fresh cache
+// flush overlaps essentially the whole dataset and every compaction rewrites
+// large tables.  Raising the budget means level-1 absorbs far more data before
+// a compaction run is forced, which cuts the number of full-table rewrites (and
+// the sustained write throughput) dramatically at the expense of a somewhat
+// larger on-disk database while it grows into the raised budgets.
+const defaultCompactionTotalSize = 512 * 1024 * 1024 // 512 MB
+
+// defaultCompactionTotalSizeMultiplier is the per-level growth factor applied
+// to the level-1 budget to derive the budgets of the deeper levels.  Keeping it
+// at the goleveldb default of 10.0 spans the 10+ GB database across deep levels
+// so each new random key is rewritten only a handful of times on its way down.
+const defaultCompactionTotalSizeMultiplier = 10.0
 
 // openDB opens the database at the provided path.  database.ErrDbDoesNotExist
 // is returned if the database doesn't exist and the create flag is not set.
@@ -2149,12 +2181,17 @@ func openDB(dbPath string, network wire.BitcoinNet, create bool) (database.DB, e
 
 	// Open the metadata database (will create it if needed).
 	opts := opt.Options{
-		ErrorIfExist:        create,
-		Strict:              opt.DefaultStrict,
-		Compression:         opt.NoCompression,
-		Filter:              filter.NewBloomFilter(10),
-		WriteBuffer:         defaultWriteBuffer,
-		CompactionTableSize: defaultCompactionTableSize,
+		ErrorIfExist:           create,
+		Strict:                 opt.DefaultStrict,
+		Compression:            opt.NoCompression,
+		Filter:                 filter.NewBloomFilter(10),
+		WriteBuffer:            defaultWriteBuffer,
+		CompactionTableSize:    defaultCompactionTableSize,
+		CompactionTotalSize:    defaultCompactionTotalSize,
+		CompactionTotalSizeMultiplier: defaultCompactionTotalSizeMultiplier,
+		CompactionL0Trigger:    defaultL0CompactionTrigger,
+		WriteL0SlowdownTrigger: defaultWriteL0SlowdownTrigger,
+		WriteL0PauseTrigger:    defaultWriteL0PauseTrigger,
 	}
 	ldb, err := leveldb.OpenFile(metadataDbPath, &opts)
 	if err != nil {
