@@ -1,0 +1,297 @@
+:root {
+  /* ── ini-node design tokens ─────────────────────────── */
+  --ink: #1a1625;          /* app background (夜空) */
+  --violet: #252135;       /* card / layer */
+  --violet-2: #2d2840;     /* raised layer / hover */
+  --straw: #ff6b9d;        /* primary action (草莓酱) */
+  --straw-soft: rgba(255, 107, 157, 0.25);
+  --honey: #ffc93c;        /* emphasis / online marker */
+  --mint: #4ade80;         /* success / syncing-active */
+  --mist: #a09cb5;         /* secondary text / placeholder */
+
+  --ink-fg: #f2eef8;       /* primary text */
+  --ink-dim: rgba(242, 238, 248, 0.62);
+  --line: rgba(160, 156, 181, 0.18);
+
+  --r-8: 8px;
+  --r-12: 12px;
+  --r-20: 20px;
+  --shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+  --focus: 0 0 0 3px var(--straw-soft);
+
+  --font-display: "Nunito", "Segoe UI", system-ui, sans-serif;
+  --font-body: "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-mono: "Cascadia Code", ui-monospace, "SF Mono", Consolas, monospace;
+
+  /* layout shell */
+  --rail-w: 200px;
+  --top-h: 48px;
+
+  color-scheme: dark;
+  background: var(--ink);
+  color: var(--ink-fg);
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+@font-face {
+  font-family: "Nunito";
+  src: url("/fonts/nunito-latin-800-normal.woff2") format("woff2");
+  font-weight: 800;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Nunito";
+  src: url("/fonts/nunito-latin-600-normal.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Nunito";
+  src: url("/fonts/nunito-v16-latin-regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  background: var(--ink);
+  overscroll-behavior: none;
+}
+
+html {
+  -webkit-tap-highlight-color: transparent;
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+}
+
+input,
+select,
+textarea {
+  font: inherit;
+  color: var(--ink-fg);
+  background: rgba(160, 156, 181, 0.1);
+  border: 1px solid var(--line);
+  border-radius: var(--r-8);
+  padding: 7px 10px;
+  min-height: 34px;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease, background 0.12s ease;
+}
+input::-webkit-calendar-picker-indicator {
+  filter: invert(0.7);
+}
+input:hover,
+select:hover,
+textarea:hover {
+  border-color: rgba(160, 156, 181, 0.35);
+}
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: none;
+  border-color: var(--straw);
+  box-shadow: var(--focus);
+}
+::placeholder {
+  color: var(--ink-dim);
+}
+
+select {
+  appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--mist) 50%),
+    linear-gradient(135deg, var(--mist) 50%, transparent 50%);
+  background-position: calc(100% - 14px) 55%, calc(100% - 9px) 55%;
+  background-size: 5px 5px;
+  background-repeat: no-repeat;
+  padding-right: 26px;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(160, 156, 181, 0.3);
+  border-radius: 6px;
+  border: 2px solid var(--ink);
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ── primitives ─────────────────────────────── */
+.card {
+  background: var(--violet);
+  border: 1px solid var(--line);
+  border-radius: var(--r-12);
+  padding: 16px;
+  box-shadow: var(--shadow);
+}
+
+.btn {
+  appearance: none;
+  border: 1px solid transparent;
+  border-radius: var(--r-8);
+  background: var(--violet-2);
+  color: var(--ink-fg);
+  padding: 8px 14px;
+  min-height: 34px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-weight: 600;
+  transition: background 0.12s ease, transform 0.06s ease, border-color 0.12s ease;
+  touch-action: manipulation;
+}
+.btn:hover {
+  background: #36304c;
+}
+.btn:active {
+  transform: translateY(1px);
+}
+.btn:focus-visible {
+  outline: none;
+  box-shadow: var(--focus);
+}
+.btn-primary {
+  background: var(--straw);
+  color: #fff;
+}
+.btn-primary:hover {
+  background: #ff7faa;
+}
+.btn-ghost {
+  background: transparent;
+  border-color: var(--line);
+}
+.btn-ghost:hover {
+  background: rgba(160, 156, 181, 0.12);
+}
+.btn-danger {
+  background: transparent;
+  border-color: rgba(255, 107, 157, 0.55);
+  color: var(--straw);
+}
+.btn-danger:hover {
+  background: rgba(255, 107, 157, 0.14);
+}
+.btn[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 12px;
+  color: var(--ink-dim);
+  background: rgba(160, 156, 181, 0.08);
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  flex: none;
+}
+
+.eyebrow {
+  font-size: 11px;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: var(--mist);
+  font-weight: 700;
+}
+
+.h-card {
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: 15px;
+  text-wrap: balance;
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.field-label {
+  display: block;
+  font-size: 12px;
+  color: var(--ink-dim);
+  margin-bottom: 5px;
+}
+
+/* spinner */
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.spin {
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  border: 2px solid var(--straw-soft);
+  border-top-color: var(--straw);
+  animation: spin 0.7s linear infinite;
+  flex: none;
+}
+
+/* a11y */
+.sr-only {
+  position: absolute !important;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: 100;
+  padding: 8px 14px;
+  background: var(--straw);
+  color: #fff;
+  border-radius: 0 0 var(--r-8) 0;
+}
+.skip-link:focus-visible {
+  left: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
