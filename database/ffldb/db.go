@@ -2152,7 +2152,12 @@ const defaultWriteL0PauseTrigger = 48
 // a compaction run is forced, which cuts the number of full-table rewrites (and
 // the sustained write throughput) dramatically at the expense of a somewhat
 // larger on-disk database while it grows into the raised budgets.
-const defaultCompactionTotalSize = 512 * 1024 * 1024 // 512 MB
+//
+// A 512MB budget was considered, but 128MB already raises the upstream 10MB
+// default 12.8x and captures most of the write-amplification win at a much
+// smaller space cost.  Tune upward from here only after measuring the actual
+// write-amplification improvement on a live block-sync run.
+const defaultCompactionTotalSize = 128 * 1024 * 1024 // 128 MB
 
 // defaultCompactionTotalSizeMultiplier is the per-level growth factor applied
 // to the level-1 budget to derive the budgets of the deeper levels.  Keeping it
