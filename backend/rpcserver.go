@@ -38,6 +38,7 @@ import (
 	"github.com/btcsuite/btcd/mempool"
 	"github.com/btcsuite/btcd/mining"
 	"github.com/btcsuite/btcd/mining/cpuminer"
+	"github.com/btcsuite/btcd/netsync"
 	"github.com/btcsuite/btcd/peer"
 	"github.com/btcsuite/btcd/sugarindex"
 	"github.com/btcsuite/btcd/txscript/v2"
@@ -150,6 +151,7 @@ var rpcHandlersBeforeInit = map[string]commandHandler{
 	"getblockcount":          handleGetBlockCount,
 	"getblockhash":           handleGetBlockHash,
 	"getblockheader":         handleGetBlockHeader,
+	"getblocksyncstatus":     handleGetBlockSyncStatus,
 	"getblocktemplate":       handleGetBlockTemplate,
 	"getchaintips":           handleGetChainTips,
 	"getcfilter":             handleGetCFilter,
@@ -2625,6 +2627,45 @@ func handleGetPeerInfo(s *rpcServer, cmd interface{}, closeChan <-chan struct{})
 	return infos, nil
 }
 
+// handleGetBlockSyncStatus implements the getblocksyncstatus command.  It
+// returns an immutable snapshot of the sync manager's parallel initial
+// download state, exposing the header range and block slice currently assigned
+// to each participating peer so an operator can watch per-node progress.
+func handleGetBlockSyncStatus(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (interface{}, error) {
+	st := s.cfg.SyncMgr.SyncStatus()
+	result := &btcjson.GetBlockSyncStatusResult{
+		Current:          st.Current,
+		IBD:              st.IBD,
+		BestChainHeight:  st.BestChainHeight,
+		HeaderTip:        st.HeaderTip,
+		HeaderTarget:     st.HeaderTarget,
+		HeaderNextAssign: st.HeaderNextAssign,
+		BlockTarget:      st.BlockTarget,
+		BlockNextAssign:  st.BlockNextAssign,
+		BlockWindow:      st.BlockWindow,
+		Peers:            make([]btcjson.PeerSyncStatusResult, 0, len(st.Peers)),
+	}
+	for _, p := range st.Peers {
+		result.Peers = append(result.Peers, btcjson.PeerSyncStatusResult{
+			ID:                     p.ID,
+			Addr:                   p.Addr,
+			SyncNode:               p.SyncNode,
+			SyncCandidate:          p.SyncCandidate,
+			CurrentHeight:          p.CurrentHeight,
+			SliceStart:             p.SliceStart,
+			SliceEnd:               p.SliceEnd,
+			SliceAssignedAt:        p.SliceAssignedAt,
+			HeaderRangeStart:       p.HeaderRangeStart,
+			HeaderRangeEnd:         p.HeaderRangeEnd,
+			HeaderRangeReceived:    p.HeaderRangeReceived,
+			HeaderRangeAssignedAt:  p.HeaderRangeAssignedAt,
+			InFlightBlocks:         p.InFlightBlocks,
+			LastBlockAt:            p.LastBlockAt,
+		})
+	}
+	return result, nil
+}
+
 // handleGetRawMempool implements the getrawmempool command.
 func handleGetRawMempool(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (interface{}, error) {
 	c := cmd.(*btcjson.GetRawMempoolCmd)
@@ -4804,6 +4845,10 @@ type rpcserverSyncManager interface {
 	// SyncPeerID returns the ID of the peer that is currently the peer being
 	// used to sync from or 0 if there is none.
 	SyncPeerID() int32
+
+	// SyncStatus returns an immutable snapshot of the parallel initial
+	// download state (per-peer header ranges and block slices).
+	SyncStatus() *netsync.SyncStatus
 
 	// LocateHeaders returns the headers of the blocks after the first known
 	// block in the provided locators until the provided stop hash or the

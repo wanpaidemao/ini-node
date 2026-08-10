@@ -52,13 +52,17 @@ export interface NodeInternals {
   headerBoundary: number;
   windowSize: number;
   blockTasks: {
+    total: number;
+    synced: number;
     slices: {
       peer: string;
       start: number;
       end: number;
-      assignedAt: number;
-      applied: number;
+      pct: number;
       complete: boolean;
+      inFlight: number;
+      syncNode: boolean;
+      lastActiveAt: number;
     }[];
   };
   headerTasks: {

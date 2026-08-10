@@ -195,54 +195,102 @@ export const Services = {
   },
 
   async getNodeInternals(_detail?: "normal" | "trace"): Promise<NodeInternals> {
-    const info = await rpc<{
-      blocks: number;
-      headers: number;
-      bestblockhash: string;
-    }>("getblockchaininfo");
-    const peers = await rpc<
-      Array<{ id: number; addr: string; currentheight: number }>
-    >("getpeerinfo");
-    const networkTip = peers.reduce((m, p) => Math.max(m, p.currentheight ?? 0), info.blocks);
-    const headerTip = Math.max(info.headers, networkTip);
-    const window = 50_000;
-    const chainBoundary = Math.max(0, info.blocks - window);
-    // Distribute the window across current peers as block-download lanes.
-    const lanePeers = peers.length ? peers.slice(0, 8) : [{ id: 0, addr: "local", currentheight: info.blocks }];
-    const slice = window / lanePeers.length;
-    const slices = lanePeers.map((p, i) => ({
-      peer: p.addr,
-      start: chainBoundary + i * slice,
-      end: chainBoundary + (i + 1) * slice,
-      assignedAt: Date.now() - 30_000,
-      applied: Math.min(
-        chainBoundary + (i + 1) * slice,
-        chainBoundary + i * slice + Math.max(0, Math.min(p.currentheight - (chainBoundary + i * slice), slice)),
-      ),
-      complete: p.currentheight >= chainBoundary + (i + 1) * slice - 400,
-    }));
+    const [info, sync] = await Promise.all([
+      rpc<{
+        blocks: number;
+        headers: number;
+        bestblockhash: string;
+      }>("getblockchaininfo"),
+      rpc<{
+        current: boolean;
+        ibd: boolean;
+        best_chain_height: number;
+        header_tip: number;
+        header_target: number;
+        header_next_assign: number;
+        block_target: number;
+        block_next_assign: number;
+        block_window: number;
+        peers: Array<{
+          id: number;
+          addr: string;
+          sync_node: boolean;
+          sync_candidate: boolean;
+          current_height: number;
+          slice_start: number;
+          slice_end: number;
+          slice_assigned_at: number;
+          header_range_start: number;
+          header_range_end: number;
+          header_range_received: boolean;
+          header_range_assigned_at: number;
+          in_flight_blocks: number;
+          last_block_at: number;
+        }>;
+      }>("getblocksyncstatus"),
+    ]);
+    const chainTip = info.blocks;
+    // The node reports the highest known header tip directly; fall back to the
+    // local header count / network tip from peers if it ever reports zero.
+    const headerTip = Math.max(sync.header_tip, info.headers);
+    const windowSize = Math.max(0, sync.block_window);
+    // The active download frontier is where the block assignment hands off next.
+    const chainBoundary = Math.max(chainTip, sync.block_next_assign - windowSize);
+
+    // Real per-peer slices: each peer owns a disjoint [start, end) range of the
+    // chain. Progress is how much of that range the connected chain has caught
+    // up to (blocks connect in order, so a slice is done once best_chain_height
+    // reaches its end).
+    const slices = sync.peers
+      .filter((p) => p.slice_end > p.slice_start)
+      .map((p) => {
+        const len = p.slice_end - p.slice_start;
+        const pct = len > 0 ? Math.min(100, Math.max(0, ((chainTip - p.slice_start) / len) * 100)) : 100;
+        return {
+          peer: p.addr,
+          start: p.slice_start,
+          end: p.slice_end,
+          pct,
+          complete: chainTip >= p.slice_end,
+          inFlight: p.in_flight_blocks,
+          syncNode: p.sync_node,
+          lastActiveAt: p.last_block_at * 1000,
+        };
+      })
+      .sort((a, b) => a.start - b.start);
+
+    // Header download state: once the parallel header download has finished the
+    // whole reported range is done; while it is active the assigned frontier is
+    // in-flight and the rest is pending.
+    const headerRanges =
+      sync.header_target > chainTip
+        ? [
+            { start: 0, end: sync.header_next_assign, state: "done" as const },
+            { start: sync.header_next_assign, end: sync.header_target, state: "inflight" as const },
+          ]
+        : [{ start: 0, end: headerTip, state: "done" as const }];
+
     return {
-      chainTip: info.blocks,
+      chainTip,
       headerTip,
       chainBoundary,
-      headerBoundary: headerTip - Math.max(1000, window / 10),
-      windowSize: window,
-      blockTasks: { slices },
+      headerBoundary: sync.header_target > chainTip ? sync.header_target : headerTip,
+      windowSize,
+      blockTasks: {
+        total: Math.max(0, headerTip - chainTip),
+        synced: chainTip,
+        slices,
+      },
       headerTasks: {
-        ranges: [
-          { start: 0, end: 2_000, state: "done" as const },
-          { start: 2_000, end: 4_000, state: "done" as const },
-          { start: 4_000, end: 6_000, state: "inflight" as const },
-          { start: 6_000, end: 12_000, state: "todo" as const },
-        ],
-        requestedBlocks: Math.max(0, headerTip - info.blocks),
+        ranges: headerRanges,
+        requestedBlocks: Math.max(0, sync.block_target - chainTip),
         lastReissueAt: Date.now() - 3 * 60_000,
       },
       mem: { alloc: 0, heapAlloc: 0, heapObjects: 0, numGC: 0 },
       debugLevel: "info",
       sampling: Array.from({ length: 60 }, (_, i) => ({
         t: Date.now() - (59 - i) * 1000,
-        height: info.blocks - (59 - i) * Math.max(1, Math.round(lastRate) || 1),
+        height: chainTip - (59 - i) * Math.max(1, Math.round(lastRate) || 1),
       })),
     };
   },

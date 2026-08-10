@@ -506,6 +506,37 @@ var helpDescsEnUS = map[string]string{
 	// GetPeerInfoCmd help.
 	"getpeerinfo--synopsis": "Returns data about each connected network peer as an array of json objects.",
 
+	// GetBlockSyncStatusCmd help.
+	"getblocksyncstatus--synopsis": "Returns an immutable snapshot of the sync manager's parallel initial download state, including the header range and block slice assigned to each participating peer.",
+
+	// GetBlockSyncStatusResult help.
+	"getblocksyncstatusresult-current":            "Whether or not the node believes it is synced with the connected peers",
+	"getblocksyncstatusresult-ibd":                "Whether or not the node is in initial block download mode",
+	"getblocksyncstatusresult-best_chain_height":  "The height of the connected best chain",
+	"getblocksyncstatusresult-header_tip":         "The highest known header height",
+	"getblocksyncstatusresult-header_target":      "The height the parallel header download is driving toward (0 if none)",
+	"getblocksyncstatusresult-header_next_assign": "The next height the header download will hand to a peer (0 if none)",
+	"getblocksyncstatusresult-block_target":       "The height the parallel block download is driving toward (0 if none)",
+	"getblocksyncstatusresult-block_next_assign":  "The next height the block download will hand to a peer (0 if none)",
+	"getblocksyncstatusresult-block_window":       "The request horizon ahead of the connected chain the block download may prefetch",
+	"getblocksyncstatusresult-peers":              "Every connected peer with its sync role and assigned work",
+
+	// PeerSyncStatusResult help.
+	"peersyncstatusresult-id":                   "The peer's unique node ID",
+	"peersyncstatusresult-addr":                 "The ip address and port of the peer",
+	"peersyncstatusresult-sync_node":            "Whether or not the peer is the current sync peer",
+	"peersyncstatusresult-sync_candidate":       "Whether or not the peer is a candidate for downloading blocks",
+	"peersyncstatusresult-current_height":       "The latest block height known to the peer",
+	"peersyncstatusresult-slice_start":          "The start height of the block slice currently assigned to the peer (equals slice_end when none)",
+	"peersyncstatusresult-slice_end":            "The end height of the block slice currently assigned to the peer (exclusive)",
+	"peersyncstatusresult-slice_assigned_at":    "Unix seconds when the current block slice was assigned",
+	"peersyncstatusresult-header_range_start":   "The start height of the header range currently assigned to the peer (equals header_range_end when none)",
+	"peersyncstatusresult-header_range_end":     "The end height of the header range currently assigned to the peer (exclusive)",
+	"peersyncstatusresult-header_range_received": "Whether or not the assigned header range has been received",
+	"peersyncstatusresult-header_range_assigned_at": "Unix seconds when the current header range was assigned",
+	"peersyncstatusresult-in_flight_blocks":     "The number of blocks requested from this peer that have not yet been delivered",
+	"peersyncstatusresult-last_block_at":        "Unix seconds the peer last delivered a block (0 if never)",
+
 	// GetRawMempoolVerboseResult help.
 	"getrawmempoolverboseresult-size":             "Transaction size in bytes",
 	"getrawmempoolverboseresult-fee":              "Transaction fee in bitcoins",
@@ -777,6 +808,7 @@ var rpcResultTypes = map[string][]interface{}{
 	"getblockheader":         {(*string)(nil), (*btcjson.GetBlockHeaderVerboseResult)(nil)},
 	"getblocktemplate":       {(*btcjson.GetBlockTemplateResult)(nil), (*string)(nil), nil},
 	"getblockchaininfo":      {(*btcjson.GetBlockChainInfoResult)(nil)},
+	"getblocksyncstatus":     {(*btcjson.GetBlockSyncStatusResult)(nil)},
 	"getchaintips":           {(*[]btcjson.GetChainTipsResult)(nil)},
 	"getcfilter":             {(*string)(nil)},
 	"getcfilterheader":       {(*string)(nil)},

@@ -195,6 +195,13 @@ type isCurrentMsg struct {
 	reply chan bool
 }
 
+// getSyncStatusMsg is a message type to be sent across the message channel
+// for requesting a snapshot of the in-progress parallel initial download
+// (per-peer header ranges / block slices) for the RPC layer.
+type getSyncStatusMsg struct {
+	reply chan *SyncStatus
+}
+
 // pauseMsg is a message type to be sent across the message channel for
 // pausing the sync manager.  This effectively provides the caller with
 // exclusive access over the manager until a receive is performed on the
@@ -270,6 +277,64 @@ type blockSyncState struct {
 	sliceLen    int32                         // max height span handed to a peer at once
 	lastReissue time.Time                     // last time a stale slice was reissued
 	lastProgress map[*peerpkg.Peer]time.Time  // last time each peer delivered a block
+}
+
+// PeerSyncStatus describes one peer's role in an in-progress parallel initial
+// download.  It is an immutable snapshot built inside the blockHandler
+// goroutine for the RPC layer.
+type PeerSyncStatus struct {
+	ID            int32  `json:"id"`
+	Addr          string `json:"addr"`
+	SyncNode      bool   `json:"sync_node"`
+	SyncCandidate bool   `json:"sync_candidate"`
+	CurrentHeight int32  `json:"current_height"`
+	// Block slice currently assigned to the peer.  Start == End means no
+	// block slice is currently assigned (or no parallel block download is
+	// running).
+	SliceStart       int32 `json:"slice_start"`
+	SliceEnd         int32 `json:"slice_end"`
+	SliceAssignedAt  int64 `json:"slice_assigned_at"`
+	// Header range currently assigned during a parallel header download.
+	// Start == End means none is assigned.
+	HeaderRangeStart      int32 `json:"header_range_start"`
+	HeaderRangeEnd        int32 `json:"header_range_end"`
+	HeaderRangeReceived   bool  `json:"header_range_received"`
+	HeaderRangeAssignedAt int64 `json:"header_range_assigned_at"`
+	// In-flight blocks this peer has been asked for but not yet delivered.
+	InFlightBlocks int `json:"in_flight_blocks"`
+	// Last time this peer delivered a block (unix seconds, 0 if never).
+	LastBlockAt int64 `json:"last_block_at"`
+}
+
+// SyncStatus is an immutable snapshot of the sync manager's parallel initial
+// download state, built inside the blockHandler goroutine and handed to the
+// RPC layer.
+type SyncStatus struct {
+	// Current mirrors the sync manager's current() result.
+	Current bool `json:"current"`
+	// IBD is true while the node is in initial block download mode.
+	IBD bool `json:"ibd"`
+	// BestChainHeight is the connected best chain height.
+	BestChainHeight int32 `json:"best_chain_height"`
+	// HeaderTip is the highest known header height.
+	HeaderTip int32 `json:"header_tip"`
+	// HeaderTarget is the highest height a parallel header download is
+	// driving toward (0 when no header download is in progress).
+	HeaderTarget int32 `json:"header_target"`
+	// HeaderNextAssign is the next height the header download will hand to a
+	// peer (0 when no header download is in progress).
+	HeaderNextAssign int32 `json:"header_next_assign"`
+	// BlockTarget is the highest height the parallel block download is
+	// driving toward (0 when no block download is in progress).
+	BlockTarget int32 `json:"block_target"`
+	// BlockNextAssign is the next height the block download will hand to a
+	// peer (0 when no block download is in progress).
+	BlockNextAssign int32 `json:"block_next_assign"`
+	// BlockWindow is the request horizon (maxBlockRequestWindow) ahead of the
+	// connected chain that the parallel block download may prefetch.
+	BlockWindow int32 `json:"block_window"`
+	// Peers lists every connected peer with its sync role and assigned work.
+	Peers []PeerSyncStatus `json:"peers"`
 }
 
 // limitAdd is a helper function for maps that require a maximum limit by
@@ -2637,6 +2702,9 @@ out:
 				}
 				msg.reply <- peerID
 
+			case getSyncStatusMsg:
+				msg.reply <- sm.syncStatusSnapshot()
+
 			case processBlockMsg:
 				_, isOrphan, err := sm.chain.ProcessBlock(
 					msg.block, msg.flags)
@@ -2893,6 +2961,76 @@ func (sm *SyncManager) SyncPeerID() int32 {
 	reply := make(chan int32)
 	sm.msgChan <- getSyncPeerMsg{reply: reply}
 	return <-reply
+}
+
+// SyncStatus returns a snapshot of the sync manager's parallel initial
+// download state, including the header range and block slice assigned to each
+// participating peer.  It is safe for concurrent access: the snapshot is built
+// inside the blockHandler goroutine so it does not require any locking and does
+// not perturb the download path beyond a single extra channel message.
+func (sm *SyncManager) SyncStatus() *SyncStatus {
+	reply := make(chan *SyncStatus)
+	sm.msgChan <- getSyncStatusMsg{reply: reply}
+	return <-reply
+}
+
+// syncStatusSnapshot builds the per-peer SyncStatus snapshot.  It must be
+// called from the blockHandler goroutine.  The cost is O(number of peers):
+// it walks peerStates once and consults the assigned-slice/range maps, so it
+// adds no measurable work to the download path.
+func (sm *SyncManager) syncStatusSnapshot() *SyncStatus {
+	_, tip := sm.chain.BestHeader()
+	status := &SyncStatus{
+		Current:         sm.current(),
+		IBD:             sm.ibdMode,
+		BestChainHeight: sm.chain.BestSnapshot().Height,
+		HeaderTip:       tip,
+	}
+
+	if hs := sm.headerSync; hs != nil {
+		status.HeaderTarget = hs.target
+		status.HeaderNextAssign = hs.nextAssign
+	}
+	if bs := sm.blockSyncState; bs != nil {
+		status.BlockTarget = bs.target
+		status.BlockNextAssign = bs.nextAssign
+		status.BlockWindow = maxBlockRequestWindow
+	}
+
+	status.Peers = make([]PeerSyncStatus, 0, len(sm.peerStates))
+	for peer, state := range sm.peerStates {
+		ps := PeerSyncStatus{
+			ID:             peer.ID(),
+			Addr:           peer.Addr(),
+			SyncNode:       sm.syncPeer == peer,
+			SyncCandidate:  state.syncCandidate,
+			CurrentHeight:  peer.LastBlock(),
+			InFlightBlocks: len(state.requestedBlocks),
+		}
+
+		if hs := sm.headerSync; hs != nil {
+			if hr, ok := hs.peerRange[peer]; ok && hr != nil {
+				ps.HeaderRangeStart = hr.start
+				ps.HeaderRangeEnd = hr.start + int32(len(hr.headers))
+				ps.HeaderRangeReceived = hr.received
+				ps.HeaderRangeAssignedAt = hr.assignedAt.Unix()
+			}
+		}
+		if bs := sm.blockSyncState; bs != nil {
+			if sl, ok := bs.peerSlice[peer]; ok && sl != nil {
+				ps.SliceStart = sl.start
+				ps.SliceEnd = sl.end
+				ps.SliceAssignedAt = sl.assignedAt.Unix()
+			}
+			if last, ok := bs.lastProgress[peer]; ok {
+				ps.LastBlockAt = last.Unix()
+			}
+		}
+
+		status.Peers = append(status.Peers, ps)
+	}
+
+	return status
 }
 
 // ProcessBlock makes use of ProcessBlock on an internal instance of a block

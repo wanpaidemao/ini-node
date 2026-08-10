@@ -277,6 +277,15 @@ func (b *rpcSyncMgr) SyncPeerID() int32 {
 	return b.syncMgr.SyncPeerID()
 }
 
+// SyncStatus returns an immutable snapshot of the parallel initial download
+// state (per-peer header ranges and block slices).
+//
+// This function is safe for concurrent access and is part of the
+// rpcserverSyncManager interface implementation.
+func (b *rpcSyncMgr) SyncStatus() *netsync.SyncStatus {
+	return b.syncMgr.SyncStatus()
+}
+
 // LocateHeaders returns the hashes of the blocks after the first known block in
 // the provided locators until the provided stop hash or the current tip is
 // reached, up to a max of wire.MaxBlockHeadersPerMsg hashes.

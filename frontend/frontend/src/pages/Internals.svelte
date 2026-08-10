@@ -13,7 +13,6 @@
   async function poll() {
     try {
       dat = await Services.getNodeInternals(detail && debug === "trace" ? "trace" : "normal");
-      debug = await Services.getDebugLevel();
     } catch {
       /* keep */
     }
@@ -27,18 +26,17 @@
 
   function applyDebug(ev: Event) {
     const v = (ev.target as HTMLSelectElement).value;
-    Services.setDebugLevel(v).then(() => {
-      debug = v;
-    });
+    debug = v;
+    Services.setDebugLevel(v);
   }
 
   // position of things on 0..total
   const total = () => dat?.headerTip ?? 43_750_000;
   const pos = (h: number) => (total() ? (h / total()) * 100 : 0);
-  // block task lane fill
-  function sliceFill(s: { start: number; end: number; applied: number; complete: boolean }) {
-    const w = s.end - s.start || 1;
-    return Math.min(100, ((s.applied - s.start) / w) * 100);
+  // overall sync progress across the whole chain
+  function taskPct() {
+    if (!dat) return 0;
+    return dat.headerTip > 0 ? Math.min(100, (dat.blockTasks.synced / dat.headerTip) * 100) : 0;
   }
 </script>
 
@@ -99,21 +97,29 @@
       <div class="card">
         <div class="card-head">
           <span class="h-card">{t("int.tasks_blocks")}</span>
+          <span class="chip mono" translate="no">{fmt(dat.blockTasks.total)} blocks to go</span>
+        </div>
+        <div class="task-total">
+          <span class="mono" translate="no">{fmt(dat.blockTasks.synced)} / {fmt(dat.headerTip)}</span>
+          <div class="total-bar" aria-hidden="true">
+            <span style:width={`${taskPct()}%`}></span>
+          </div>
+          <span class="mono">{taskPct().toFixed(1)}%</span>
         </div>
         {#each dat.blockTasks.slices as s}
           <div class="lane">
-            <span class="lane-name mono">peer {s.peer}</span>
+            <span class="lane-name mono">{s.peer}{#if s.syncNode}<span class="lane-star" title="sync node"> ★</span>{/if}</span>
             <div class="lane-bar" aria-hidden="true">
-              <span class="lane-done" style:width={`${sliceFill(s)}%`}></span>
-              <span class="lane-slot"></span>
+              <span class="lane-done" style:width={`${s.pct}%`}></span>
+              {#if s.inFlight > 0}<span class="lane-inflight" style:width={`${Math.min(100 - s.pct, 12)}%`} style:left={`${s.pct}%`}></span>{/if}
             </div>
-            <span class="lane-vals mono" translate="no">{fmt(s.start)}→{fmt(s.end)} {s.complete ? "✓" : "…"}</span>
+            <span class="lane-vals mono" translate="no">{fmt(s.start)}→{fmt(s.end)} · {s.pct.toFixed(0)}%</span>
             {#if detail}
-              <span class="lane-time mono" translate="no">{fmtAgo(s.assignedAt)} ago</span>
+              <span class="lane-time mono" title="in-flight / last block at">{s.inFlight}↕ · {s.lastActiveAt ? fmtAgo(s.lastActiveAt) : "—"}</span>
             {/if}
           </div>
         {/each}
-        <p class="legend mono" aria-hidden="true">▓ allocated  ░ in-flight</p>
+        <p class="legend mono" aria-hidden="true">▓ downloaded  ░ in-flight</p>
       </div>
 
       <div class="card">
@@ -303,9 +309,37 @@
     grid-template-columns: 1fr 1fr;
     gap: 14px;
   }
+  .task-total {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    align-items: center;
+    gap: 6px 10px;
+    font-size: 12px;
+    color: var(--ink-dim);
+    margin-bottom: 10px;
+  }
+  .total-bar {
+    grid-column: 1 / -1;
+    grid-row: 1;
+    height: 8px;
+    border-radius: 4px;
+    background: #e0e0e0;
+    overflow: hidden;
+  }
+  .total-bar span {
+    display: block;
+    height: 100%;
+    background: var(--straw);
+    border-radius: 4px;
+  }
+  .task-total > .mono:nth-child(2) {
+    justify-self: end;
+    color: var(--straw);
+    font-weight: 700;
+  }
   .lane {
     display: grid;
-    grid-template-columns: 62px 1fr 170px;
+    grid-template-columns: 150px 1fr 150px;
     align-items: center;
     gap: 10px;
     padding: 6px 0;
@@ -313,6 +347,12 @@
   }
   .lane-name {
     color: var(--ink-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .lane-star {
+    color: var(--honey);
   }
   .lane-bar {
     position: relative;
@@ -327,23 +367,23 @@
     background: var(--straw);
     border-radius: 4px;
   }
-  .lane-slot {
+  .lane-inflight {
     position: absolute;
-    top: 2px;
-    bottom: 2px;
-    left: 78%;
-    width: 2px;
-    background: var(--ink-fg);
-    opacity: 0.3;
+    top: 0;
+    bottom: 0;
+    min-width: 2px;
+    background: var(--honey);
+    border-radius: 0 4px 4px 0;
   }
   .lane-vals {
     color: var(--ink-dim);
     font-variant-numeric: tabular-nums;
     min-width: 0;
+    text-align: right;
   }
   .lane-time {
-    grid-column: 3;
     color: var(--mist);
+    text-align: right;
   }
   .legend {
     margin: 8px 0 0;
@@ -445,10 +485,11 @@
       grid-template-columns: 1fr;
     }
     .lane {
-      grid-template-columns: 52px 1fr;
+      grid-template-columns: 120px 1fr;
     }
     .lane-vals {
       grid-column: 2;
+      text-align: left;
     }
     .lane-time {
       grid-column: 2;

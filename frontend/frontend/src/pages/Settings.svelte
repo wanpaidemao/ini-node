@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { fmt, fmtBytes, LANG_NAMES, LANGS, setLang, t } from "../lib/i18n";
   import { Services } from "../lib/services";
+  import { app } from "../lib/store.svelte";
   import type { AppConfig } from "../lib/types";
 
   let cfg = $state<AppConfig | null>(null);
@@ -11,9 +12,23 @@
   let migratePct = $state<number | null>(null);
   let migrateBusy = $state(false);
 
+  let connAddr = $state("—");
+
   onMount(async () => {
     cfg = await Services.getConfig();
+    try {
+      connAddr = cfg.rpcEndpoint.replace(/^https?:\/\//, "");
+    } catch {
+      /* keep "—" */
+    }
   });
+
+  function connBadge() {
+    if (app.connecting) return { cls: "busy", key: "shell.connecting" };
+    if (!app.connected) return { cls: "off", key: "shell.offline" };
+    if (app.syncing) return { cls: "sync", key: "shell.syncing" };
+    return { cls: "on", key: "shell.connected" };
+  }
 
   async function doTest() {
     testing = true;
@@ -84,7 +99,14 @@
 
   {#if cfg}
     <div class="card">
-      <h2 class="h-card">{t("set.connection")}</h2>
+      <div class="conn-head">
+        <h2 class="h-card">{t("set.connection")}</h2>
+        <span class="conn-chip {connBadge().cls}" role="status">
+          <span class="dot" aria-hidden="true"></span>
+          <span>{t(connBadge().key)}</span>
+          <span class="conn-addr mono">{app.connected ? connAddr : "—"}</span>
+        </span>
+      </div>
       <div class="field">
         <label class="field-label" for="rpc">{t("set.rpc_endpoint")}</label>
         <div class="field-row">
@@ -274,6 +296,53 @@
   .h-card {
     margin: 0 0 16px;
     font-size: 14px;
+  }
+  .conn-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+  .conn-head .h-card {
+    margin: 0;
+  }
+  .conn-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    border-radius: 999px;
+    padding: 4px 12px;
+    font-size: 12px;
+    border: 1px solid var(--line);
+    color: var(--ink-dim);
+    transition: border-color 0.12s ease, color 0.12s ease;
+  }
+  .conn-chip .dot {
+    background: var(--mist);
+    flex: none;
+  }
+  .conn-chip.on {
+    border-color: var(--mint);
+    color: var(--mint);
+  }
+  .conn-chip.on .dot {
+    background: var(--mint);
+  }
+  .conn-chip.sync {
+    border-color: var(--honey);
+    color: var(--honey);
+  }
+  .conn-chip.sync .dot {
+    background: var(--honey);
+  }
+  .conn-chip.off {
+    border-color: rgba(0, 0, 0, 0.25);
+    color: var(--ink-dim);
+  }
+  .conn-addr {
+    opacity: 0.65;
+    font-size: 11px;
   }
   .field {
     display: flex;

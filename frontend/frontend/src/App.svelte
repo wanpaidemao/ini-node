@@ -50,17 +50,7 @@
   let collapsible = $state(false);
   let langOpen = $state(false);
   let lang = $state<keyof typeof LANG_NAMES>("en");
-  let connAddr = $state("—");
   let debugLevel = $state("info");
-
-  async function loadConnAddr() {
-    try {
-      const cfg = await Services.getConfig();
-      connAddr = cfg.rpcEndpoint.replace(/^https?:\/\//, "");
-    } catch {
-      /* keep "—" */
-    }
-  }
 
   function go(r: Route) {
     navigate(r);
@@ -71,13 +61,6 @@
     setLang(l);
     lang = l;
     langOpen = false;
-  }
-
-  function connBadge() {
-    if (app.connecting) return { cls: "busy", key: "shell.connecting" };
-    if (!app.connected) return { cls: "off", key: "shell.offline" };
-    if (app.syncing) return { cls: "sync", key: "shell.syncing" };
-    return { cls: "on", key: "shell.connected" };
   }
 
   function jumpDebug() {
@@ -104,7 +87,6 @@
 
   onMount(() => {
     checkHealth();
-    loadConnAddr();
     healthTimer = setInterval(checkHealth, 5000);
   });
   onDestroy(() => clearInterval(healthTimer));
@@ -186,12 +168,6 @@
         <button class="chip debug-chip" onclick={jumpDebug} title={t("shell.debug")}>
           <span class="dot" aria-hidden="true"></span> debug · {debugLevel}
         </button>
-
-        <div class="conn-chip {connBadge().cls}" role="status">
-          <span class="dot" aria-hidden="true"></span>
-          <span>{t(connBadge().key)}</span>
-          <span class="conn-addr mono">{app.connected ? connAddr : "—"}</span>
-        </div>
       </div>
     </header>
 
@@ -426,44 +402,6 @@
     background: var(--honey);
   }
 
-  .conn-chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 7px;
-    border-radius: 999px;
-    padding: 4px 12px;
-    font-size: 12px;
-    border: 1px solid var(--line);
-    color: var(--ink-dim);
-    transition: border-color 0.12s ease, color 0.12s ease;
-  }
-  .conn-chip .dot {
-    background: var(--mist);
-    flex: none;
-  }
-  .conn-chip.on {
-    border-color: var(--mint);
-    color: var(--mint);
-  }
-  .conn-chip.on .dot {
-    background: var(--mint);
-  }
-  .conn-chip.sync {
-    border-color: var(--honey);
-    color: var(--honey);
-  }
-  .conn-chip.sync .dot {
-    background: var(--honey);
-  }
-  .conn-chip.off {
-    border-color: rgba(0, 0, 0, 0.25);
-    color: var(--ink-dim);
-  }
-  .conn-addr {
-    opacity: 0.65;
-    font-size: 11px;
-  }
-
   .page {
     overflow-y: auto;
     padding: 20px 24px 40px;
@@ -503,7 +441,6 @@
       padding: 8px;
       overflow-x: auto;
     }
-    .brand,
     .section-head {
       display: none;
     }
