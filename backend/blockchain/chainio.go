@@ -1824,7 +1824,7 @@ func (b *BlockChain) initChainState() error {
 	// As we might have updated the index after it was loaded, we'll
 	// attempt to flush the index to the DB. This will only result in a
 	// write if the elements are dirty, so it'll usually be a noop.
-	return b.index.flushToDB()
+	return b.index.flushToDB(true)
 }
 
 // deserializeBlockRow parses a value in the block index bucket into a block

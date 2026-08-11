@@ -110,7 +110,7 @@ func TestFlushToDB(t *testing.T) {
 				tip = node
 			}
 
-			err = bi.flushToDB()
+			err = bi.flushToDB(false)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}

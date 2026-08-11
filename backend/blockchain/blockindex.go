@@ -758,9 +758,14 @@ func (bi *blockIndex) InactiveTips(bestChain *chainView) []*blockNode {
 // available as well.  That assumption is only relied upon by initChainState
 // when converting an old db without the best header state key, and the new
 // startup path never uses header-only block nodes as a source of block data.
-// flushToDB writes all dirty block nodes to the database. If all writes
-// succeed, this clears the dirty set.
-func (bi *blockIndex) flushToDB() error {
+//
+// forceEvict runs window eviction immediately after the flush regardless of
+// the throttling counter.  It must be set for the batched header-sync flush:
+// that flush fires only once every headerFlushBatchSize headers, so the
+// blockFlushBatchSize throttle would otherwise let the in-memory index grow by
+// blockFlushBatchSize*headerFlushBatchSize (10M) nodes between evictions,
+// blowing past the --headerwindow memory bound.
+func (bi *blockIndex) flushToDB(forceEvict bool) error {
 	bi.Lock()
 	if len(bi.dirty) == 0 {
 		bi.Unlock()
@@ -770,7 +775,7 @@ func (bi *blockIndex) flushToDB() error {
 		return bi.flushDirtyLocked(dbTx)
 	})
 	if err == nil {
-		bi.finishFlushLocked()
+		bi.finishFlushLocked(forceEvict)
 	}
 	bi.Unlock()
 	return err
@@ -832,8 +837,18 @@ func (bi *blockIndex) flushDirtyLocked(dbTx database.Tx) error {
 // O(indexSize), so deferring it to run only once every blockFlushBatchSize
 // flushes removes the per-block O(indexSize) scan during initial block download
 // without giving up crash consistency (which the per-block write preserves).
-func (bi *blockIndex) finishFlushLocked() {
+//
+// When forceEvict is true the throttle is bypassed and eviction runs on every
+// flush.  The batched header-sync flush passes true because its flush cadence
+// (every headerFlushBatchSize headers) is far too coarse for the block-oriented
+// throttle, and the index must be trimmed back to the window on each batch to
+// keep header sync memory bounded.
+func (bi *blockIndex) finishFlushLocked(forceEvict bool) {
 	bi.dirty = make(map[*blockNode]struct{})
+	if forceEvict {
+		bi.evictWindow()
+		return
+	}
 	bi.evictCount++
 	if bi.evictCount >= blockFlushBatchSize {
 		bi.evictCount = 0

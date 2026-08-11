@@ -749,7 +749,7 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 	// The transaction committed the block-index rows and chain state together.
 	// Clear the dirty set and run throttled window eviction now that the write
 	// is durable.
-	b.index.finishFlushLocked()
+	b.index.finishFlushLocked(false)
 	b.index.Unlock()
 
 	// This node is now the end of the best chain.
@@ -804,7 +804,7 @@ func (b *BlockChain) disconnectBlock(node *blockNode, block *btcutil.Block, view
 	}
 
 	// Write any block status changes to DB before updating best state.
-	err = b.index.flushToDB()
+	err = b.index.flushToDB(false)
 	if err != nil {
 		return err
 	}
@@ -1226,7 +1226,7 @@ func (b *BlockChain) connectBestChain(node *blockNode, block *btcutil.Block, fla
 		// it fails to write, it's not the end of the world. If the block is
 		// valid, we flush in connectBlock and if the block is invalid, the
 		// worst that can happen is we revalidate the block after a restart.
-		if writeErr := b.index.flushToDB(); writeErr != nil {
+		if writeErr := b.index.flushToDB(false); writeErr != nil {
 			log.Warnf("Error flushing block index changes to disk: %v",
 				writeErr)
 		}
@@ -1385,7 +1385,7 @@ func (b *BlockChain) connectBestChain(node *blockNode, block *btcutil.Block, fla
 	// changes to the block index, so flush regardless of whether there was an
 	// error. The index would only be dirty if the block failed to connect, so
 	// we can ignore any errors writing.
-	if writeErr := b.index.flushToDB(); writeErr != nil {
+	if writeErr := b.index.flushToDB(false); writeErr != nil {
 		log.Warnf("Error flushing block index changes to disk: %v", writeErr)
 	}
 
@@ -1473,7 +1473,7 @@ func (b *BlockChain) FlushBlockIndex() error {
 	b.chainLock.Lock()
 	defer b.chainLock.Unlock()
 
-	return b.index.flushToDB()
+	return b.index.flushToDB(false)
 }
 
 // BestChainHeaderForkHeight returns the height of the fork point between the
@@ -2161,7 +2161,7 @@ func (b *BlockChain) InvalidateBlock(hash *chainhash.Hash) error {
 			}
 		}
 
-		if writeErr := b.index.flushToDB(); writeErr != nil {
+		if writeErr := b.index.flushToDB(false); writeErr != nil {
 			return fmt.Errorf("Error flushing block index "+
 				"changes to disk: %v", writeErr)
 		}
@@ -2198,7 +2198,7 @@ func (b *BlockChain) InvalidateBlock(hash *chainhash.Hash) error {
 		return err
 	}
 
-	if writeErr := b.index.flushToDB(); writeErr != nil {
+	if writeErr := b.index.flushToDB(false); writeErr != nil {
 		log.Warnf("Error flushing block index changes to disk: %v", writeErr)
 	}
 
@@ -2237,7 +2237,7 @@ func (b *BlockChain) InvalidateBlock(hash *chainhash.Hash) error {
 	detachNodes, attachNodes := b.getReorganizeNodes(bestTip)
 	err = b.reorganizeChain(detachNodes, attachNodes)
 
-	if writeErr := b.index.flushToDB(); writeErr != nil {
+	if writeErr := b.index.flushToDB(false); writeErr != nil {
 		log.Warnf("Error flushing block index changes to disk: %v", writeErr)
 	}
 
@@ -2321,7 +2321,7 @@ func (b *BlockChain) ReconsiderBlock(hash *chainhash.Hash) error {
 	// The block status changes here without being flushed so we immediately flush
 	// the blockindex after we call this function.
 	_, _, _, err := b.verifyReorganizationValidity(detachNodes, attachNodes)
-	if writeErr := b.index.flushToDB(); writeErr != nil {
+	if writeErr := b.index.flushToDB(false); writeErr != nil {
 		log.Warnf("Error flushing block index changes to disk: %v", writeErr)
 	}
 	if err != nil {

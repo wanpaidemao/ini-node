@@ -104,7 +104,7 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
 		newNode.status = statusDataStored | statusHeaderStored
 		b.index.AddNode(newNode)
 	}
-	err = b.index.flushToDB()
+	err = b.index.flushToDB(false)
 	if err != nil {
 		return false, err
 	}
@@ -302,7 +302,12 @@ func (b *BlockChain) maybeAcceptBlockHeader(header *wire.BlockHeader,
 	b.headerFlushCount++
 	if b.headerFlushCount >= headerFlushBatchSize {
 		b.headerFlushCount = 0
-		err = b.index.flushToDB()
+		// forceEvict: this batch flush is the only eviction point during a
+		// header sync (once per headerFlushBatchSize headers).  Without it the
+		// blockFlushBatchSize throttle would defer eviction for millions of
+		// headers, letting the in-memory index grow unbounded past the
+		// --headerwindow bound.
+		err = b.index.flushToDB(true)
 		if err != nil {
 			return false, err
 		}
