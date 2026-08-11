@@ -211,21 +211,24 @@
     return blocks;
   });
   // Dark "filling" overlay: for ~1.5s after a peer's bar fills, the just-finished
-  // slice renders dark at its position, then fades to the green done square
-  // underneath. This is the moment the top square reacts to the lane below.
+  // slice first turns dark at its position, then slides left into the green done
+  // pile. This is the moment the top square reacts to the lane below.
   const hdrJustBlocks = $derived.by(() => {
+    if (!dat) return [];
     const l = hdrLeft();
     const r = hdrRight();
     const span = r - l;
     if (span <= 0) return [];
-    const out: { peer: string; l: number; w: number }[] = [];
+    const minStart = dat.headerTasks.hdrPeers.length > 0 ? Math.min(...dat.headerTasks.hdrPeers.map((p) => p.start)) : dat.headerTip;
+    const targetL = hdrFrac(minStart);
+    const out: { peer: string; ts: number; l: number; w: number; gl: number }[] = [];
     for (const [peer, v] of hdrJustDone) {
       if (Date.now() - v.ts < 1500) {
         const ls = Math.max(v.start, l);
         const rs = Math.min(v.end, r);
         const lf = ((ls - l) / span) * 100;
         const rf = ((rs - l) / span) * 100;
-        if (rf > lf) out.push({ peer, l: lf, w: rf - lf });
+        if (rf > lf) out.push({ peer, ts: v.ts, l: lf, w: rf - lf, gl: Math.min(targetL, lf) });
       }
     }
     return out;
@@ -244,11 +247,7 @@
       dat.headerTasks.nextAssign,
       ...dat.headerTasks.hdrPeers.map((p) => p.end),
     );
-    const sliceLen = dat.headerTasks.sliceLen || 2000;
-    // Breathe: right after a slice completes, pull the frontier one notch left,
-    // then it slides back to the new frontier on the next poll.
-    const just = [...hdrJustDone.values()].some((v) => Date.now() - v.ts < 1500);
-    return hdrFrac(just ? Math.max(dat.headerTip, frontier - sliceLen) : frontier);
+    return hdrFrac(frontier);
   });
   const hdrBands = $derived.by(() => {
     if (!dat) return [];
@@ -421,20 +420,22 @@
           {#each hdrTodoBlocks as b}
             <span class="hdr-todo-block" style:left={`${b.l}%`} style:width={`${b.w}%`} title={`${t("int.todo")} ${fmt(b.start)}`} aria-hidden="true"></span>
           {/each}
-          {#each hdrDoneBlocks as b}
+          {#each hdrDoneBlocks as b (b.start)}
             <span class="hdr-done-block" style:left={`${b.l}%`} style:width={`${b.w}%`} title={`${b.peer} ${fmt(b.start)}→${fmt(b.start + (dat.headerTasks.sliceLen || 2000))} · ${t("int.done")}`} aria-hidden="true"></span>
           {/each}
-          {#each hdrJustBlocks as j}
+          {#each hdrJustBlocks as j (j.peer + ":" + j.ts)}
             <span
               class="hdr-just-block"
               style:--pc={`var(--peer${((peerColor.get(j.peer) ?? 0) % 6) + 1})`}
+              style:--jl={`${j.l}%`}
+              style:--gl={`${j.gl}%`}
               style:left={`${j.l}%`}
               style:width={`${j.w}%`}
               title={`${j.peer} filling → ${t("int.done")}`}
               aria-hidden="true"
             ></span>
           {/each}
-          {#each hdrBands as b}
+          {#each hdrBands as b (b.peer)}
             <span
               class="ws hdr-band"
               class:accent={b.received}
@@ -639,7 +640,7 @@
     top: 0;
     bottom: 0;
     width: 2px;
-    transition: left 0.7s cubic-bezier(0.22, 1, 0.36, 1);
+    transition: left 1s cubic-bezier(0.22, 1, 0.36, 1);
     pointer-events: none;
   }
   .hdr-right-line {
@@ -674,15 +675,22 @@
     border-radius: 5px;
     background: var(--pc);
     border: 1px solid color-mix(in srgb, var(--pc) 65%, #000);
-    animation: hdr-fade 1.4s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+    animation: hdr-settle 1.5s cubic-bezier(0.22, 1, 0.36, 1) forwards;
     pointer-events: none;
   }
-  @keyframes hdr-fade {
-    from {
-      background: var(--pc);
+  @keyframes hdr-settle {
+    0% {
+      left: var(--jl, 0%);
+      background: color-mix(in srgb, var(--pc) 72%, #000);
       opacity: 1;
     }
-    to {
+    45% {
+      left: var(--jl, 0%);
+      background: color-mix(in srgb, var(--pc) 72%, #000);
+      opacity: 1;
+    }
+    100% {
+      left: var(--gl, var(--jl, 0%));
       background: var(--mint);
       opacity: 0.95;
     }
