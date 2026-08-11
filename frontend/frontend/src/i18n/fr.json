@@ -1,4 +1,4 @@
-﻿{
+{
   "lang.name": "Français",
   "app.name": "SugarChain",
   "app.tag": "Nœud de bureau SugarChain",
@@ -92,6 +92,17 @@
   "int.not_connected": "Non connecté",
   "int.window_size": "fenêtre {n}",
   "int.caught_up": "rattrapé",
+  "int.legend_handed": "▒ distribué",
+  "int.retain": "Rétention de fenêtre",
+  "int.handed_out": "distribués",
+  "int.prefetch": "Fenêtre de préchargement",
+  "int.active_slice": "tranche active (celle que la chaîne connectée vérifie actuellement)",
+  "int.to_go": "restants",
+  "int.ranges": "{n} segments",
+  "int.inflight": "Blocs en transit",
+  "int.legend_verify": "▓ vérifié",
+  "int.eta": "ETA {eta}",
+  "int.legend_inflight": "▏ en transit",
 
   "wal.title": "Portefeuille",
   "wal.total": "Solde total",

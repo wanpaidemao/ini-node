@@ -1,4 +1,4 @@
-﻿{
+{
   "lang.name": "繁體中文",
   "app.name": "SugarChain",
   "app.tag": "SugarChain 桌面節點",
@@ -92,6 +92,17 @@
   "int.not_connected": "未連線",
   "int.window_size": "窗口 {n}",
   "int.caught_up": "已追上",
+  "int.legend_handed": "▒ 已派發",
+  "int.retain": "窗口駐留",
+  "int.handed_out": "已派發",
+  "int.prefetch": "預取窗口",
+  "int.active_slice": "活躍分片（區塊正在此片內連接驗證）",
+  "int.to_go": "待同步",
+  "int.ranges": "{n} 段",
+  "int.inflight": "在途區塊",
+  "int.legend_verify": "▓ 已連接",
+  "int.eta": "预计 {eta}",
+  "int.legend_inflight": "▏ 在途",
 
   "wal.title": "錢包",
   "wal.total": "總餘額",

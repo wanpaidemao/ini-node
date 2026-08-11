@@ -54,6 +54,7 @@ export interface NodeInternals {
   blockTasks: {
     total: number;
     synced: number;
+    inflight: number;
     slices: {
       peer: string;
       start: number;
@@ -63,16 +64,18 @@ export interface NodeInternals {
       inFlight: number;
       syncNode: boolean;
       lastActiveAt: number;
+      assignedAt: number;
     }[];
   };
   headerTasks: {
     ranges: { start: number; end: number; state: "done" | "inflight" | "todo" }[];
+    recent: { start: number; end: number; peer: string; assignedAt: number }[];
+    sliceLen: number;
     requestedBlocks: number;
     lastReissueAt: number;
   };
-  mem: { alloc: number; heapAlloc: number; heapObjects: number; numGC: number };
+  mem: { gap: number; window: number; inflight: number };
   debugLevel: string;
-  sampling: { t: number; height: number }[];
 }
 
 export interface Tx {

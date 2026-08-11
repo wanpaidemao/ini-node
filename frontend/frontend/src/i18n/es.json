@@ -1,4 +1,4 @@
-﻿{
+{
   "lang.name": "Español",
   "app.name": "SugarChain",
   "app.tag": "Nodo de escritorio SugarChain",
@@ -92,6 +92,17 @@
   "int.not_connected": "Sin conexión",
   "int.window_size": "ventana {n}",
   "int.caught_up": "al día",
+  "int.legend_handed": "▒ entregado",
+  "int.retain": "Retención de ventana",
+  "int.handed_out": "entregado",
+  "int.prefetch": "Ventana de precarga",
+  "int.active_slice": "rebanada activa (la que la cadena conectada verifica ahora)",
+  "int.to_go": "pendientes",
+  "int.ranges": "{n} rangos",
+  "int.inflight": "Bloques en tránsito",
+  "int.legend_verify": "▓ verificado",
+  "int.eta": "ETA {eta}",
+  "int.legend_inflight": "▏ en tránsito",
 
   "wal.title": "Cartera",
   "wal.total": "Balance total",

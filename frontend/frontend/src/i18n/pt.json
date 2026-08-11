@@ -1,4 +1,4 @@
-﻿{
+{
   "lang.name": "Português",
   "app.name": "SugarChain",
   "app.tag": "Nó de desktop SugarChain",
@@ -92,6 +92,17 @@
   "int.not_connected": "Não conectado",
   "int.window_size": "janela {n}",
   "int.caught_up": "atualizado",
+  "int.legend_handed": "▒ distribuído",
+  "int.retain": "Retenção da janela",
+  "int.handed_out": "distribuídos",
+  "int.prefetch": "Janela de pré-busca",
+  "int.active_slice": "fatia ativa (a que a cadeia conectada está verificando agora)",
+  "int.to_go": "restantes",
+  "int.ranges": "{n} faixas",
+  "int.inflight": "Blocos em trânsito",
+  "int.legend_verify": "▓ verificado",
+  "int.eta": "ETA {eta}",
+  "int.legend_inflight": "▏ em trânsito",
 
   "wal.title": "Carteira",
   "wal.total": "Saldo total",

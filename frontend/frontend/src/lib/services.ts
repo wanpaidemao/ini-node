@@ -211,6 +211,13 @@ export const Services = {
         block_target: number;
         block_next_assign: number;
         block_window: number;
+        header_slice_len: number;
+        header_recent_ranges: Array<{
+          start: number;
+          end: number;
+          peer: string;
+          assigned_at: number;
+        }>;
         peers: Array<{
           id: number;
           addr: string;
@@ -220,6 +227,7 @@ export const Services = {
           slice_start: number;
           slice_end: number;
           slice_assigned_at: number;
+          slice_received: number;
           header_range_start: number;
           header_range_end: number;
           header_range_received: boolean;
@@ -234,18 +242,25 @@ export const Services = {
     // local header count / network tip from peers if it ever reports zero.
     const headerTip = Math.max(sync.header_tip, info.headers);
     const windowSize = Math.max(0, sync.block_window);
-    // The active download frontier is where the block assignment hands off next.
+    // The active download frontier is where the block assignment hands off next:
+    // every height below it has been handed out to some peer (received or still
+    // in flight), everything above it has not been requested yet.
     const chainBoundary = Math.max(chainTip, sync.block_next_assign - windowSize);
 
     // Real per-peer slices: each peer owns a disjoint [start, end) range of the
-    // chain. Progress is how much of that range the connected chain has caught
-    // up to (blocks connect in order, so a slice is done once best_chain_height
-    // reaches its end).
-    const slices = sync.peers
+    // chain whose blocks it fetches in parallel.  The node reports slice_received
+    // (the highest height this peer has actually delivered in its slice), so a
+    // lane fills as *that peer* downloads — every bar moves instead of only the
+    // one holding the connected chain tip.  Blocks connect in order, which is
+    // why connected progress (chainTip) looks sequential while downloads run
+    // ahead of it in parallel.
+    const slices = (sync.peers ?? [])
       .filter((p) => p.slice_end > p.slice_start)
       .map((p) => {
         const len = p.slice_end - p.slice_start;
-        const pct = len > 0 ? Math.min(100, Math.max(0, ((chainTip - p.slice_start) / len) * 100)) : 100;
+        const low = p.slice_start;
+        const recv = p.slice_received ?? low - 1;
+        const pct = len > 0 ? Math.min(100, Math.max(0, ((recv - low + 1) / len) * 100)) : 100;
         return {
           peer: p.addr,
           start: p.slice_start,
@@ -255,20 +270,49 @@ export const Services = {
           inFlight: p.in_flight_blocks,
           syncNode: p.sync_node,
           lastActiveAt: p.last_block_at * 1000,
+          assignedAt: p.slice_assigned_at * 1000,
         };
       })
       .sort((a, b) => a.start - b.start);
 
-    // Header download state: once the parallel header download has finished the
-    // whole reported range is done; while it is active the assigned frontier is
-    // in-flight and the rest is pending.
-    const headerRanges =
-      sync.header_target > chainTip
-        ? [
-            { start: 0, end: sync.header_next_assign, state: "done" as const },
-            { start: sync.header_next_assign, end: sync.header_target, state: "inflight" as const },
-          ]
-        : [{ start: 0, end: headerTip, state: "done" as const }];
+    // Header download state is exposed per peer: each peer carries the range it
+    // is currently receiving. Received ranges are done, the ones still being
+    // pulled are in-flight, and whatever has not been handed out yet is pending.
+    const hdrPeers = (sync.peers ?? []).filter((p) => p.header_range_end > p.header_range_start);
+    const headerRanges: { start: number; end: number; state: "done" | "inflight" | "todo" }[] = [];
+    if (sync.header_target > chainTip) {
+      if (hdrPeers.length > 0) {
+        for (const p of hdrPeers) {
+          headerRanges.push({
+            start: p.header_range_start,
+            end: p.header_range_end,
+            state: p.header_range_received ? "done" : "inflight",
+          });
+        }
+        const assignedMax = Math.max(chainTip, ...hdrPeers.map((p) => p.header_range_end));
+        if (sync.header_target > assignedMax) {
+          headerRanges.push({ start: assignedMax, end: sync.header_target, state: "todo" });
+        }
+      } else if (sync.header_next_assign < sync.header_target) {
+        headerRanges.push(
+          { start: 0, end: sync.header_next_assign, state: "done" },
+          { start: sync.header_next_assign, end: sync.header_target, state: "inflight" },
+        );
+      } else {
+        // Header download already finished: the whole span is done.
+        headerRanges.push({ start: 0, end: headerTip, state: "done" });
+      }
+    } else {
+      headerRanges.push({ start: 0, end: headerTip, state: "done" });
+    }
+
+    // "lastReissue" = the most recent time any slice/header range was handed to
+    // a peer (the node reports it per peer in unix seconds).
+    const lastAssignAt = (sync.peers ?? []).reduce(
+      (m, p) => Math.max(m, Math.max(p.header_range_assigned_at, p.slice_assigned_at)),
+      0,
+    );
+    const inflightTotal = (sync.peers ?? []).reduce((m, p) => m + p.in_flight_blocks, 0);
 
     return {
       chainTip,
@@ -279,19 +323,27 @@ export const Services = {
       blockTasks: {
         total: Math.max(0, headerTip - chainTip),
         synced: chainTip,
+        inflight: inflightTotal,
         slices,
       },
       headerTasks: {
         ranges: headerRanges,
+        recent: (sync.header_recent_ranges ?? []).map((r) => ({
+          start: r.start,
+          end: r.end,
+          peer: r.peer,
+          assignedAt: r.assigned_at * 1000,
+        })),
+        sliceLen: sync.header_slice_len ?? 0,
         requestedBlocks: Math.max(0, sync.block_target - chainTip),
-        lastReissueAt: Date.now() - 3 * 60_000,
+        lastReissueAt: lastAssignAt > 0 ? lastAssignAt * 1000 : Date.now(),
       },
-      mem: { alloc: 0, heapAlloc: 0, heapObjects: 0, numGC: 0 },
-      debugLevel: "info",
-      sampling: Array.from({ length: 60 }, (_, i) => ({
-        t: Date.now() - (59 - i) * 1000,
-        height: chainTip - (59 - i) * Math.max(1, Math.round(lastRate) || 1),
-      })),
+      mem: {
+        gap: Math.max(0, headerTip - chainTip),
+        window: windowSize,
+        inflight: inflightTotal,
+      },
+      debugLevel: await Services.getDebugLevel().catch(() => "info"),
     };
   },
 

@@ -1,4 +1,4 @@
-﻿{
+{
   "lang.name": "Deutsch",
   "app.name": "SugarChain",
   "app.tag": "SugarChain-Desktopnode",
@@ -92,6 +92,17 @@
   "int.not_connected": "Nicht verbunden",
   "int.window_size": "Fenster {n}",
   "int.caught_up": "aufgeholt",
+  "int.legend_handed": "▒ vergeben",
+  "int.retain": "Fenster-Erhalt",
+  "int.handed_out": "vergeben",
+  "int.prefetch": "Vorausschau-Fenster",
+  "int.active_slice": "aktives Segment (das, das die verbundene Kette gerade verifiziert)",
+  "int.to_go": "verbleibend",
+  "int.ranges": "{n} Bereiche",
+  "int.inflight": "Blöcke unterwegs",
+  "int.legend_verify": "▓ verifiziert",
+  "int.eta": "ETA {eta}",
+  "int.legend_inflight": "▏ unterwegs",
 
   "wal.title": "Wallet",
   "wal.total": "Gesamtsaldo",

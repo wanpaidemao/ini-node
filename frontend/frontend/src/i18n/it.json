@@ -1,4 +1,4 @@
-﻿{
+{
   "lang.name": "Italiano",
   "app.name": "SugarChain",
   "app.tag": "Nodo desktop SugarChain",
@@ -92,6 +92,17 @@
   "int.not_connected": "Non connesso",
   "int.window_size": "finestra {n}",
   "int.caught_up": "aggiornato",
+  "int.legend_handed": "▒ assegnato",
+  "int.retain": "Ritenzione della finestra",
+  "int.handed_out": "assegnati",
+  "int.prefetch": "Finestra di prefetch",
+  "int.active_slice": "fetta attiva (quella che la catena connessa sta verificando ora)",
+  "int.to_go": "da sincronizzare",
+  "int.ranges": "{n} intervalli",
+  "int.inflight": "Blocchi in transito",
+  "int.legend_verify": "▓ verificato",
+  "int.eta": "ETA {eta}",
+  "int.legend_inflight": "▏ in transito",
 
   "wal.title": "Portafoglio",
   "wal.total": "Saldo totale",

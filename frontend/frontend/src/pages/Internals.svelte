@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
-  import { t, fmt, fmtBytes, fmtAgo } from "../lib/i18n";
+  import { t, fmt, fmtAgo } from "../lib/i18n";
   import { Services } from "../lib/services";
   import type { NodeInternals } from "../lib/types";
 
@@ -8,11 +8,26 @@
   let trace = $state(false);
   let detail = $state(false);
   let debug = $state("info");
+  let metric = $state("height");
   let timer: ReturnType<typeof setInterval> | undefined;
+
+  // Client-side sampling of the poll stream so the speed/ETA numbers are real,
+  // computed from the live chain tip / boundary instead of placeholders.
+  interface Sample {
+    t: number;
+    tip: number;
+    boundary: number;
+  }
+  const hist = $state<Sample[]>([]);
 
   async function poll() {
     try {
       dat = await Services.getNodeInternals(detail && debug === "trace" ? "trace" : "normal");
+      if (dat) {
+        const now = Date.now();
+        hist.push({ t: now, tip: dat.chainTip, boundary: dat.chainBoundary });
+        if (hist.length > 30) hist.shift();
+      }
     } catch {
       /* keep */
     }
@@ -30,14 +45,86 @@
     Services.setDebugLevel(v);
   }
 
-  // position of things on 0..total
-  const total = () => dat?.headerTip ?? 43_750_000;
-  const pos = (h: number) => (total() ? (h / total()) * 100 : 0);
+  // Text keeps the whole-chain totals; the track zooms into the active window.
+  const total = () => dat?.headerBoundary ?? dat?.headerTip ?? 43_750_000;
+  const winLeft = () => dat?.chainBoundary ?? 0;
+  const winRight = () => {
+    const r = winLeft() + (dat?.windowSize ?? 0);
+    return Math.max(winLeft() + 1, Math.min(r, total()));
+  };
+  const winFrac = (h: number) => {
+    const l = winLeft();
+    const r = winRight();
+    return r > l ? Math.min(100, Math.max(0, ((h - l) / (r - l)) * 100)) : 0;
+  };
+  // Each task slice is drawn as a band spanning its [start, end) inside the
+  // window; s.fill is how much of that band its owner has actually downloaded.
+  const winSlices = $derived.by(() => {
+    if (!dat) return [];
+    const l = winLeft();
+    const r = winRight();
+    if (r <= l) return [];
+    const slices = dat.blockTasks.slices;
+    return slices
+      .map((s) => {
+        const ls = Math.max(s.start, l);
+        const rs = Math.min(s.end, r);
+        const lf = ((ls - l) / (r - l)) * 100;
+        const rf = ((rs - l) / (r - l)) * 100;
+        if (rf <= lf) return null;
+        return { ...s, l: lf, w: rf - lf };
+      })
+      .filter((s) => s !== null) as (typeof slices[number] & { l: number; w: number })[];
+  });
+
   // overall sync progress across the whole chain
   function taskPct() {
     if (!dat) return 0;
     return dat.headerTip > 0 ? Math.min(100, (dat.blockTasks.synced / dat.headerTip) * 100) : 0;
   }
+
+  function headerPieces() {
+    if (!dat || dat.headerTasks.sliceLen <= 0) return 0;
+    return Math.max(1, Math.ceil(dat.headerTip / dat.headerTasks.sliceLen));
+  }
+
+  // live speed / ETA derived from successive polls
+  const rate = $derived.by(() => {
+    if (!dat || hist.length < 2) return { v: 0, etaMin: null as number | null };
+    const a = hist[0];
+    const b = hist[hist.length - 1];
+    const dt = (b.t - a.t) / 1000;
+    if (dt <= 0) return { v: 0, etaMin: null };
+    const dv = metric === "boundary" ? b.boundary - a.boundary : b.tip - a.tip;
+    const v = Math.max(0, dv / dt);
+    const remaining =
+      metric === "boundary"
+        ? Math.max(0, dat.headerBoundary - dat.chainBoundary)
+        : Math.max(0, dat.headerBoundary - dat.chainTip);
+    return { v, etaMin: v > 0 ? remaining / v / 60 : null };
+  });
+
+  function etaText(min: number | null): string {
+    if (min == null || !Number.isFinite(min)) return "—";
+    if (min < 1) return "<1m";
+    const h = Math.floor(min / 60);
+    const m = Math.round(min % 60);
+    return h <= 0 ? `${m}m` : `${h}h${m ? ` ${m}m` : ""}`;
+  }
+
+  // sparkline bars fed by the real stream (same count/shape as before)
+  const bars = $derived.by(() => {
+    if (hist.length < 2) return Array.from({ length: 26 }, (_, i) => (i % 5 === 0 ? 22 : i % 3 === 0 ? 14 : 8));
+    const key = metric === "boundary" ? ("boundary" as const) : ("tip" as const);
+    const rates: number[] = [];
+    for (let i = 1; i < hist.length; i++) {
+      const dt = (hist[i].t - hist[i - 1].t) / 1000;
+      if (dt > 0) rates.push(Math.max(0, (hist[i][key] - hist[i - 1][key]) / dt));
+    }
+    if (rates.length === 0) return [8];
+    const max = Math.max(...rates, 1);
+    return rates.slice(-26).map((r) => Math.max(2, Math.round((r / max) * 22)));
+  });
 </script>
 
 <section class="int">
@@ -56,17 +143,23 @@
     <div class="card">
       <div class="card-head">
         <span class="h-card">{t("int.window_position")}</span>
-        <span class="chip mono" translate="no">0 → 43,750,000</span>
+        <span class="chip mono" translate="no">0 → {fmt(total())}</span>
       </div>
       <div class="win-track" role="img" aria-label={t("int.window_position")}>
         <span class="b-chain" aria-hidden="true"></span>
-        <span class="b-boundary" style:left={`${pos(dat.chainBoundary)}%`} aria-hidden="true"></span>
-        <span class="b-window" style:left={`${pos(dat.chainBoundary)}%`} style:width={`${pos(dat.windowSize)}%`} aria-hidden="true"></span>
-        <span class="b-tip" style:left={`${pos(dat.chainTip)}%`} aria-hidden="true"></span>
-        <span class="b-hmark" style:left={`${pos(dat.headerTip)}%`} aria-hidden="true"></span>
+        <span class="b-window" style="left:0;width:100%" aria-hidden="true"></span>
+        <span class="b-boundary" style="left:0" aria-hidden="true"></span>
+        {#each winSlices as s}
+          <span class="lane-bar" style="position:absolute;top:16px;left:{s.l}%;width:{s.w}%;margin:0" title={`${s.peer} ${fmt(s.start)}→${fmt(s.end)} · ${s.pct.toFixed(0)}%`}>
+            <span class="lane-done" style:width={`${s.pct}%`}></span>
+            {#if s.inFlight > 0}<span class="lane-inflight" style:left={`${s.pct}%`} style:width="4px"></span>{/if}
+          </span>
+        {/each}
+        <span class="b-tip" style:left={`${winFrac(dat.chainTip)}%`} aria-hidden="true"></span>
+        <span class="b-hmark" style:left={`${winFrac(dat.headerTip)}%`} aria-hidden="true"></span>
       </div>
       <div class="win-labels">
-        <span class="mono">▲ chainBoundary</span>
+        <span class="mono">▲ chainBoundary {fmt(dat.chainBoundary)}</span>
         <span class="mono straw">{t("int.window_size", { n: fmt(dat.windowSize) })}</span>
         <span class="mono">▲ chainTip {fmt(dat.chainTip)}</span>
         <span class="mono mint">▲ headerTip {t("int.caught_up")}</span>
@@ -78,18 +171,18 @@
       <div class="card-head">
         <span class="h-card">{t("int.window_speed")}</span>
         <span class="corner">
-          <select aria-label={t("int.options")}>
-            <option>{t("int.height")}</option>
-            <option>{t("int.boundary")}</option>
+          <select aria-label={t("int.options")} bind:value={metric}>
+            <option value="height">{t("int.height")}</option>
+            <option value="boundary">{t("int.boundary")}</option>
           </select>
         </span>
       </div>
       <div class="speed-bars" aria-hidden="true">
-        {#each Array.from({ length: 26 }, (_, i) => (i % 5 === 0 ? 22 : i % 3 === 0 ? 14 : 8)) as h}
+        {#each bars as h}
           <span class="bar" style:height={`${h}px`}></span>
         {/each}
       </div>
-      <p class="speed-cap mono">▲ 265 bl/s · boundary +12/h · ETA 37h</p>
+      <p class="speed-cap mono">▲ {t("int.blocks_per_s", { n: fmt(Math.round(rate.v)) })} · {t("int.eta", { eta: etaText(rate.etaMin) })}</p>
     </div>
 
     <!-- tasks -->
@@ -123,7 +216,12 @@
       </div>
 
       <div class="card">
-        <div class="card-head"><span class="h-card">{t("int.tasks_headers")}</span></div>
+        <div class="card-head">
+          <span class="h-card">{t("int.tasks_headers")}</span>
+          {#if dat.headerTasks.sliceLen > 0}
+            <span class="chip mono" translate="no">{headerPieces()}×{fmt(dat.headerTasks.sliceLen)}</span>
+          {/if}
+        </div>
         <div class="seg-grid">
           {#each dat.headerTasks.ranges as r}
             <span class="seg" class:done={r.state === "done"} class:inflight={r.state === "inflight"} class:todo={r.state === "todo"} title={`${r.start}-${r.end}`}>
@@ -132,6 +230,15 @@
             </span>
           {/each}
         </div>
+        {#if dat.headerTasks.recent.length > 0}
+          <div class="seg-grid recent">
+            {#each [...dat.headerTasks.recent].reverse() as w}
+              <span class="seg done" title={`${fmt(w.start)}→${fmt(w.end)} · ${w.peer} · ${fmtAgo(w.assignedAt)}`}>
+                <span class="mono" translate="no">{fmt(w.start)}→{fmt(w.end)}</span>✓
+              </span>
+            {/each}
+          </div>
+        {/if}
         <dl class="kv">
           <div><dt>{t("int.requested_blocks")}</dt><dd class="mono" translate="no">{fmt(dat.headerTasks.requestedBlocks)}</dd></div>
           <div><dt>{t("int.last_reissue")}</dt><dd class="mono">{fmtAgo(dat.headerTasks.lastReissueAt)}</dd></div>
@@ -144,18 +251,17 @@
       <div class="card">
         <div class="card-head"><span class="h-card">{t("int.memory")}</span></div>
         <dl class="kv">
-          <div><dt>{t("int.heap")}</dt><dd class="mono" translate="no">{fmtBytes(dat.mem.heapAlloc)}</dd></div>
-          <div><dt>HeapObjects</dt><dd class="mono" translate="no">{fmt(dat.mem.heapObjects)}</dd></div>
-          <div><dt>NumGC</dt><dd class="mono" translate="no">{fmt(dat.mem.numGC)}</dd></div>
-          <div><dt>{t("int.resident")}</dt><dd class="mono">~{Math.round(dat.windowSize / 1000)}k</dd></div>
+          <div><dt>{t("int.prefetch")}</dt><dd class="mono" translate="no">{fmt(dat.mem.window)} bl</dd></div>
+          <div><dt>{t("int.to_go")}</dt><dd class="mono" translate="no">{fmt(dat.mem.gap)} bl</dd></div>
+          <div><dt>{t("int.inflight")}</dt><dd class="mono" translate="no">{fmt(dat.mem.inflight)} bl</dd></div>
         </dl>
-        <div class="mem-bar" aria-hidden="true"><span style:width="88%"></span></div>
+        <div class="mem-bar" aria-hidden="true"><span style:width={`${dat.mem.gap > 0 ? Math.min(100, (dat.mem.window / dat.mem.gap) * 100) : 100}%`}></span></div>
       </div>
 
       <div class="card">
         <div class="card-head">
           <span class="h-card">{t("int.debug_level")}</span>
-          <span class="chip mono" translate="no">info</span>
+          <span class="chip mono" translate="no">{dat.debugLevel}</span>
         </div>
         <div class="debug-row">
           <label class="field-label" for="dbg">{t("int.current")}: {debug}</label>

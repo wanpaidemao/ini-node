@@ -1,4 +1,4 @@
-﻿{
+{
   "lang.name": "Русский",
   "app.name": "SugarChain",
   "app.tag": "Десктопный узел SugarChain",
@@ -92,6 +92,17 @@
   "int.not_connected": "Не подключено",
   "int.window_size": "окно {n}",
   "int.caught_up": "догнано",
+  "int.legend_handed": "▒ роздано",
+  "int.retain": "Удержание окна",
+  "int.handed_out": "роздано",
+  "int.prefetch": "Окно предвыборки",
+  "int.active_slice": "активный фрагмент (тот, который подключённая цепь проверяет сейчас)",
+  "int.to_go": "осталось",
+  "int.ranges": "{n} диапазонов",
+  "int.inflight": "Блоки в пути",
+  "int.legend_verify": "▓ проверено",
+  "int.eta": "ETA {eta}",
+  "int.legend_inflight": "▏ в пути",
 
   "wal.title": "Кошелёк",
   "wal.total": "Общий баланс",

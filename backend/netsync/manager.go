@@ -239,6 +239,17 @@ type headerRange struct {
 	assignedAt time.Time
 }
 
+// HeaderRecentRange is a lightweight record of one completed parallel header
+// download window: the contiguous [start, end) range a single peer fetched.
+// Only a short history is kept, purely so operators can see how the header
+// chain was chunked across peers.
+type HeaderRecentRange struct {
+	Start      int32
+	End        int32
+	Peer       string
+	AssignedAt time.Time
+}
+
 // headerSyncState tracks a parallel (multi-peer) initial header download.  It
 // is only accessed from the blockHandler goroutine and is non-nil while header
 // headers are being fetched from several peers simultaneously.
@@ -264,6 +275,12 @@ type blockSlice struct {
 	end        int32
 	peer       *peerpkg.Peer
 	assignedAt time.Time
+	// received is the highest height in [start, end) for which a block has
+	// actually been delivered by the peer (i.e. its true download progress).
+	// It starts at start-1 and only advances inside handleBlockMsg, so the UI
+	// can show every slice advancing in parallel instead of only the one the
+	// connected chain tip currently happens to sit in.
+	received int32
 }
 
 // blockSyncState tracks the parallel (multi-peer) initial block download.  It
@@ -294,6 +311,7 @@ type PeerSyncStatus struct {
 	SliceStart       int32 `json:"slice_start"`
 	SliceEnd         int32 `json:"slice_end"`
 	SliceAssignedAt  int64 `json:"slice_assigned_at"`
+	SliceReceived    int32 `json:"slice_received"`
 	// Header range currently assigned during a parallel header download.
 	// Start == End means none is assigned.
 	HeaderRangeStart      int32 `json:"header_range_start"`
@@ -333,6 +351,12 @@ type SyncStatus struct {
 	// BlockWindow is the request horizon (maxBlockRequestWindow) ahead of the
 	// connected chain that the parallel block download may prefetch.
 	BlockWindow int32 `json:"block_window"`
+	// HeaderSliceLen is the per-peer header batch size of the most recent
+	// parallel header download (0 when none).
+	HeaderSliceLen int32 `json:"header_slice_len"`
+	// HeaderRecentRanges lists the most recent completed header download
+	// windows as [start, end) ranges with the peer that fetched each.
+	HeaderRecentRanges []HeaderRecentRange `json:"header_recent_ranges"`
 	// Peers lists every connected peer with its sync role and assigned work.
 	Peers []PeerSyncStatus `json:"peers"`
 }
@@ -385,6 +409,19 @@ type SyncManager struct {
 	// performed across several peers in parallel.  It is only touched from
 	// the blockHandler goroutine.
 	headerSync *headerSyncState
+
+	// headerRecent keeps the last few completed parallel header download
+	// windows (which peer fetched which [start, end) range) after the header
+	// download itself has finished, so an operator can still see how the
+	// header chain was chunked across peers.  Only touched from the
+	// blockHandler goroutine.
+	headerRecent []HeaderRecentRange
+
+	// headerSliceLen is the per-peer header batch size of the most recent
+	// parallel header download.  It survives headerSync being torn down so the
+	// UI can show how many windows the header chain was split into.  Only
+	// touched from the blockHandler goroutine.
+	headerSliceLen int32
 
 	// blockSync is the set of peers taking part in a parallel initial block
 	// download.  Each participating peer is handed a disjoint slice of the
@@ -1352,9 +1389,34 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 	delete(sm.requestedBlocks, *blockHash)
 
 	// Record the peer's delivery so a parallel block-download peer that has
-	// stopped producing data can be detected and freed by the stall handler.
+	// stopped producing data can be detected and freed by the stall handler,
+	// and advance the peer's slice download progress so the RPC layer can
+	// report how far each peer has actually fetched within its slice.
 	if bs := sm.blockSyncState; bs != nil {
 		bs.lastProgress[peer] = time.Now()
+
+		// The delivered block's height: since version-2 blocks serialize
+		// their height into the coinbase, extract it so progress is counted
+		// even when the block is waiting for its parent to connect (it is a
+		// genuine download, not a best-chain connection).
+		var height int32
+		hdr := bmsg.block.MsgBlock().Header
+		if blockchain.ShouldHaveSerializedBlockHeight(&hdr) {
+			if txs := bmsg.block.Transactions(); len(txs) > 0 {
+				if h, herr := blockchain.ExtractCoinbaseHeight(txs[0]); herr == nil {
+					height = int32(h)
+				}
+			}
+		}
+		if height <= 0 {
+			height = bmsg.block.Height()
+		}
+		if height > 0 {
+			if sl, ok := bs.peerSlice[peer]; ok && sl != nil &&
+				height >= sl.start && height < sl.end && height > sl.received {
+				sl.received = height
+			}
+		}
 	}
 
 	// Process the block to include validation, best chain selection, orphan
@@ -1618,6 +1680,7 @@ func (sm *SyncManager) assignBlockSlice(peer *peerpkg.Peer) bool {
 		end:        end,
 		peer:       peer,
 		assignedAt: time.Now(),
+		received:   start - 1,
 	}
 	bs.slices[start] = sl
 	bs.peerSlice[peer] = sl
@@ -1995,6 +2058,8 @@ func (sm *SyncManager) processReadyHeaderRanges() {
 			sm.progressLogger.SetLastLogTime(time.Now())
 		}
 
+		sm.recordHeaderWindow(front.start, front.start+int32(len(front.headers)), front.peer)
+
 		delete(hs.ranges, front.start)
 		delete(hs.peerRange, front.peer)
 		hs.nextHeight = front.start + int32(len(front.headers))
@@ -2019,6 +2084,24 @@ func (sm *SyncManager) processReadyHeaderRanges() {
 	}
 }
 
+// recordHeaderWindow logs one completed parallel header download window so the
+// most recent ones stay visible after the header download itself has finished.
+func (sm *SyncManager) recordHeaderWindow(start, end int32, peer *peerpkg.Peer) {
+	if peer == nil {
+		return
+	}
+	sm.headerRecent = append(sm.headerRecent, HeaderRecentRange{
+		Start:      start,
+		End:        end,
+		Peer:       peer.Addr(),
+		AssignedAt: time.Now(),
+	})
+	const maxRecentHeaderWindows = 8
+	if len(sm.headerRecent) > maxRecentHeaderWindows {
+		sm.headerRecent = sm.headerRecent[len(sm.headerRecent)-maxRecentHeaderWindows:]
+	}
+}
+
 // finishHeaderSync signals that the parallel header download has caught up to
 // the connected peers' tips and the initial block download can proceed with
 // fetching the blocks themselves.
@@ -2027,6 +2110,7 @@ func (sm *SyncManager) finishHeaderSync() {
 	if hs == nil {
 		return
 	}
+	sm.headerSliceLen = hs.sliceLen
 	sm.headerSync = nil
 
 	bestHash, bestHeight := sm.chain.BestHeader()
@@ -2990,7 +3074,11 @@ func (sm *SyncManager) syncStatusSnapshot() *SyncStatus {
 	if hs := sm.headerSync; hs != nil {
 		status.HeaderTarget = hs.target
 		status.HeaderNextAssign = hs.nextAssign
+		status.HeaderSliceLen = hs.sliceLen
+	} else {
+		status.HeaderSliceLen = sm.headerSliceLen
 	}
+	status.HeaderRecentRanges = append([]HeaderRecentRange(nil), sm.headerRecent...)
 	if bs := sm.blockSyncState; bs != nil {
 		status.BlockTarget = bs.target
 		status.BlockNextAssign = bs.nextAssign
@@ -3021,6 +3109,7 @@ func (sm *SyncManager) syncStatusSnapshot() *SyncStatus {
 				ps.SliceStart = sl.start
 				ps.SliceEnd = sl.end
 				ps.SliceAssignedAt = sl.assignedAt.Unix()
+				ps.SliceReceived = sl.received
 			}
 			if last, ok := bs.lastProgress[peer]; ok {
 				ps.LastBlockAt = last.Unix()

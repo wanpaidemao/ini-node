@@ -2643,7 +2643,17 @@ func handleGetBlockSyncStatus(s *rpcServer, cmd interface{}, closeChan <-chan st
 		BlockTarget:      st.BlockTarget,
 		BlockNextAssign:  st.BlockNextAssign,
 		BlockWindow:      st.BlockWindow,
+		HeaderSliceLen:   st.HeaderSliceLen,
+		HeaderRecentRanges: make([]btcjson.HeaderRecentRangeResult, 0, len(st.HeaderRecentRanges)),
 		Peers:            make([]btcjson.PeerSyncStatusResult, 0, len(st.Peers)),
+	}
+	for _, w := range st.HeaderRecentRanges {
+		result.HeaderRecentRanges = append(result.HeaderRecentRanges, btcjson.HeaderRecentRangeResult{
+			Start:      w.Start,
+			End:        w.End,
+			Peer:       w.Peer,
+			AssignedAt: w.AssignedAt.Unix(),
+		})
 	}
 	for _, p := range st.Peers {
 		result.Peers = append(result.Peers, btcjson.PeerSyncStatusResult{
@@ -2655,6 +2665,7 @@ func handleGetBlockSyncStatus(s *rpcServer, cmd interface{}, closeChan <-chan st
 			SliceStart:             p.SliceStart,
 			SliceEnd:               p.SliceEnd,
 			SliceAssignedAt:        p.SliceAssignedAt,
+			SliceReceived:          p.SliceReceived,
 			HeaderRangeStart:       p.HeaderRangeStart,
 			HeaderRangeEnd:         p.HeaderRangeEnd,
 			HeaderRangeReceived:    p.HeaderRangeReceived,
