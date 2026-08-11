@@ -69,10 +69,15 @@ export interface NodeInternals {
   };
   headerTasks: {
     ranges: { start: number; end: number; state: "done" | "inflight" | "todo" }[];
+    hdrPeers: { peer: string; start: number; end: number; pct: number; received: boolean; assignedAt: number }[];
+    hdrLanes: { peer: string; start: number; end: number; pct: number; received: boolean; assignedAt: number }[];
     recent: { start: number; end: number; peer: string; assignedAt: number }[];
     sliceLen: number;
     requestedBlocks: number;
     lastReissueAt: number;
+    windowStart: number;
+    windowEnd: number;
+    nextAssign: number;
   };
   mem: { gap: number; window: number; inflight: number };
   debugLevel: string;

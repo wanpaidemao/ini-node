@@ -24,6 +24,7 @@
     try {
       dat = await Services.getNodeInternals(detail && debug === "trace" ? "trace" : "normal");
       if (dat) {
+        updateHdrHistory(dat);
         const now = Date.now();
         hist.push({ t: now, tip: dat.chainTip, boundary: dat.chainBoundary });
         if (hist.length > 30) hist.shift();
@@ -86,6 +87,189 @@
   function headerPieces() {
     if (!dat || dat.headerTasks.sliceLen <= 0) return 0;
     return Math.max(1, Math.ceil(dat.headerTip / dat.headerTasks.sliceLen));
+  }
+
+  // Header track zooms into the active download window (around the assign
+  // frontier); each peer's live header range is drawn as a colored band.
+  const hdrLeft = () => dat?.headerTasks.windowStart ?? 0;
+  const hdrRight = () => {
+    const r = dat?.headerTasks.windowEnd ?? 0;
+    const l = hdrLeft();
+    if (r > l) return r;
+    return Math.max(1, dat?.headerTip ?? 1);
+  };
+  const hdrFrac = (h: number) => {
+    const l = hdrLeft();
+    const r = hdrRight();
+    return r > l ? Math.min(100, Math.max(0, ((h - l) / (r - l)) * 100)) : 0;
+  };
+  // Stable color per peer, derived from the sorted lane list so the track bands
+  // and the per-IP progress bars below always share the same color.
+  const peerColor = $derived.by(() => {
+    const m = new Map<string, number>();
+    if (!dat) return m;
+    const peers = [...new Set(dat.headerTasks.hdrLanes.map((l) => l.peer))].sort();
+    peers.forEach((p, i) => m.set(p, i % 6));
+    return m;
+  });
+  // Per-IP header slice history. The backend only reports each peer's *current*
+  // header range, and a slice can complete between two polls (so `received` is
+  // often never seen). We treat any change of a peer's assigned range as one
+  // completed slice, which drives the green "done" squares on the track and the
+  // fake per-IP fill animation below.
+  interface HdrDoneRec {
+    peer: string;
+    start: number;
+    end: number;
+    at: number;
+  }
+  let hdrPrevStart = new Map<string, number>();
+  let hdrDone: HdrDoneRec[] = [];
+  // peer -> { ts, start, end } of the slice that just completed (drives the
+  // dark "filling" square and the lane fill animation, linking top+bottom).
+  let hdrJustDone = new Map<string, { ts: number; start: number; end: number }>();
+  function updateHdrHistory(d: NodeInternals) {
+    const lanes = d.headerTasks.hdrLanes;
+    const sliceLen = d.headerTasks.sliceLen || 2000;
+    const seen = new Set(hdrDone.map((x) => `${x.peer}:${x.start}`));
+    const fresh = new Map<string, { ts: number; start: number; end: number }>();
+    for (const l of lanes) {
+      const before = hdrPrevStart.get(l.peer) ?? 0;
+      if (before > 0 && (l.received || l.start !== before)) {
+        const key = `${l.peer}:${before}`;
+        if (!seen.has(key)) {
+          hdrDone = [...hdrDone, { peer: l.peer, start: before, end: before + sliceLen, at: Date.now() }].slice(-10);
+          fresh.set(l.peer, { ts: Date.now(), start: before, end: before + sliceLen });
+        }
+      }
+      hdrPrevStart.set(l.peer, l.start);
+    }
+    for (const [peer, start] of hdrPrevStart) {
+      if (start > 0 && !lanes.some((l) => l.peer === peer)) {
+        const key = `${peer}:${start}`;
+        if (!seen.has(key)) {
+          hdrDone = [...hdrDone, { peer, start, end: start + sliceLen, at: Date.now() }].slice(-10);
+          fresh.set(peer, { ts: Date.now(), start, end: start + sliceLen });
+        }
+        hdrPrevStart.set(peer, 0);
+      }
+    }
+    if (fresh.size > 0) {
+      const now = Date.now();
+      for (const [p, v] of fresh) hdrJustDone.set(p, v);
+      for (const [p, v] of hdrJustDone) if (now - v.ts > 5000) hdrJustDone.delete(p);
+    }
+  }
+  function hdrJust(peer: string): number {
+    return hdrJustDone.get(peer)?.ts ?? 0;
+  }
+  function hdrJustFresh(peer: string): boolean {
+    const j = hdrJust(peer);
+    return j > 0 && Date.now() - j < 1500;
+  }
+
+  // Conveyor of fixed-size task squares inside the track window:
+  // green = recently completed slice, colored = in-flight, gray = next todo.
+  const hdrDoneBlocks = $derived.by(() => {
+    const l = hdrLeft();
+    const r = hdrRight();
+    const span = r - l;
+    if (span <= 0) return [];
+    return hdrDone
+      .slice(-6)
+      .map((d) => {
+        const ls = Math.max(d.start, l);
+        const rs = Math.min(d.end, r);
+        const lf = ((ls - l) / span) * 100;
+        const rf = ((rs - l) / span) * 100;
+        if (rf <= lf) return null;
+        return { peer: d.peer, l: lf, w: rf - lf, start: d.start };
+      })
+      .filter((s) => s !== null) as { peer: string; l: number; w: number; start: number }[];
+  });
+  const hdrTodoBlocks = $derived.by(() => {
+    if (!dat) return [];
+    const l = hdrLeft();
+    const r = hdrRight();
+    const span = r - l;
+    if (span <= 0) return [];
+    const sliceLen = dat.headerTasks.sliceLen || 2000;
+    const frontier = Math.max(
+      dat.headerTip,
+      dat.headerTasks.nextAssign,
+      ...dat.headerTasks.hdrPeers.map((p) => p.end),
+    );
+    const blocks: { l: number; w: number; start: number }[] = [];
+    for (let i = 0; i < 6; i++) {
+      const start = frontier + i * sliceLen;
+      if (start >= r) break;
+      const lf = ((Math.max(start, l) - l) / span) * 100;
+      const rf = ((Math.min(start + sliceLen, r) - l) / span) * 100;
+      if (rf <= lf) continue;
+      blocks.push({ start, l: lf, w: rf - lf });
+    }
+    return blocks;
+  });
+  // Dark "filling" overlay: for ~1.5s after a peer's bar fills, the just-finished
+  // slice renders dark at its position, then fades to the green done square
+  // underneath. This is the moment the top square reacts to the lane below.
+  const hdrJustBlocks = $derived.by(() => {
+    const l = hdrLeft();
+    const r = hdrRight();
+    const span = r - l;
+    if (span <= 0) return [];
+    const out: { peer: string; l: number; w: number }[] = [];
+    for (const [peer, v] of hdrJustDone) {
+      if (Date.now() - v.ts < 1500) {
+        const ls = Math.max(v.start, l);
+        const rs = Math.min(v.end, r);
+        const lf = ((ls - l) / span) * 100;
+        const rf = ((rs - l) / span) * 100;
+        if (rf > lf) out.push({ peer, l: lf, w: rf - lf });
+      }
+    }
+    return out;
+  });
+  // Two guide lines: left = edge of the done (green) pile, right = the active
+  // frontier. Both slide as slices complete.
+  const hdrLeftLine = $derived.by(() => {
+    if (!dat) return 0;
+    const minStart = dat.headerTasks.hdrPeers.length > 0 ? Math.min(...dat.headerTasks.hdrPeers.map((p) => p.start)) : dat.headerTip;
+    return hdrFrac(minStart);
+  });
+  const hdrRightLine = $derived.by(() => {
+    if (!dat) return 0;
+    const frontier = Math.max(
+      dat.headerTip,
+      dat.headerTasks.nextAssign,
+      ...dat.headerTasks.hdrPeers.map((p) => p.end),
+    );
+    const sliceLen = dat.headerTasks.sliceLen || 2000;
+    // Breathe: right after a slice completes, pull the frontier one notch left,
+    // then it slides back to the new frontier on the next poll.
+    const just = [...hdrJustDone.values()].some((v) => Date.now() - v.ts < 1500);
+    return hdrFrac(just ? Math.max(dat.headerTip, frontier - sliceLen) : frontier);
+  });
+  const hdrBands = $derived.by(() => {
+    if (!dat) return [];
+    const l = hdrLeft();
+    const r = hdrRight();
+    if (r <= l) return [];
+    return dat.headerTasks.hdrPeers
+      .map((p) => {
+        const ls = Math.max(p.start, l);
+        const rs = Math.min(p.end, r);
+        const lf = ((ls - l) / (r - l)) * 100;
+        const rf = ((rs - l) / (r - l)) * 100;
+        if (rf <= lf) return null;
+        return { ...p, l: lf, w: rf - lf };
+      })
+      .filter((s) => s !== null) as (typeof dat.headerTasks.hdrPeers[number] & { l: number; w: number })[];
+  });
+
+  function hdrTotalPct() {
+    if (!dat) return 0;
+    return dat.headerBoundary > 0 ? Math.min(100, (dat.headerTip / dat.headerBoundary) * 100) : 0;
   }
 
   // live speed / ETA derived from successive polls
@@ -226,27 +410,78 @@
             <span class="chip mono" translate="no">{t("int.task_segments", { n: fmt(headerPieces()), len: fmt(dat.headerTasks.sliceLen) })}</span>
           {/if}
         </div>
-        <div class="seg-grid">
-          {#each dat.headerTasks.ranges as r}
-            <span class="seg" class:done={r.state === "done"} class:inflight={r.state === "inflight"} class:todo={r.state === "todo"} title={`${r.start}-${r.end}`}>
-              <span class="mono" translate="no">{fmt(r.start)}-{fmt(r.end)}</span>
-              {r.state === "done" ? "✓" : r.state === "inflight" ? "●" : "·"}
+        <div class="task-total">
+          <span class="mono" translate="no">{fmt(dat.headerTip)} / {fmt(dat.headerBoundary)}</span>
+          <div class="total-bar" aria-hidden="true">
+            <span style:width={`${hdrTotalPct()}%`}></span>
+          </div>
+          <span class="mono">{hdrTotalPct().toFixed(1)}%</span>
+        </div>
+        <div class="win-track hdr" role="img" aria-label={t("int.tasks_headers")}>
+          {#each hdrTodoBlocks as b}
+            <span class="hdr-todo-block" style:left={`${b.l}%`} style:width={`${b.w}%`} title={`${t("int.todo")} ${fmt(b.start)}`} aria-hidden="true"></span>
+          {/each}
+          {#each hdrDoneBlocks as b}
+            <span class="hdr-done-block" style:left={`${b.l}%`} style:width={`${b.w}%`} title={`${b.peer} ${fmt(b.start)}→${fmt(b.start + (dat.headerTasks.sliceLen || 2000))} · ${t("int.done")}`} aria-hidden="true"></span>
+          {/each}
+          {#each hdrJustBlocks as j}
+            <span
+              class="hdr-just-block"
+              style:--pc={`var(--peer${((peerColor.get(j.peer) ?? 0) % 6) + 1})`}
+              style:left={`${j.l}%`}
+              style:width={`${j.w}%`}
+              title={`${j.peer} filling → ${t("int.done")}`}
+              aria-hidden="true"
+            ></span>
+          {/each}
+          {#each hdrBands as b}
+            <span
+              class="ws hdr-band"
+              class:accent={b.received}
+              style:--pc={`var(--peer${((peerColor.get(b.peer) ?? 0) % 6) + 1})`}
+              style:left={`${b.l}%`}
+              style:width={`${b.w}%`}
+              title={`${b.peer} ${fmt(b.start)}→${fmt(b.end)} · ${b.received ? t("int.done") : t("int.inflight")}${!b.received ? ` ${b.pct.toFixed(0)}%` : ""}${b.assignedAt ? ` · ${fmtAgo(b.assignedAt)}` : ""}`}
+            >
+              {#if b.received}
+                <span class="ws-done" style:width="100%"></span>
+              {:else}
+                <span class="ws-done" style:width={`${Math.max(0, Math.min(100, b.pct))}%`}></span>
+                <span class="ws-flight" aria-hidden="true"></span>
+              {/if}
             </span>
           {/each}
+          <span class="hdr-line hdr-right-line" style:left={`${hdrRightLine}%`} title={`${t("int.hdr_next_assign")} ${fmt(dat.headerTasks.nextAssign)}`} aria-hidden="true"></span>
+          <span class="hdr-line hdr-left-line" style:left={`${hdrLeftLine}%`} title={`${t("int.done")} edge`} aria-hidden="true"></span>
         </div>
-        {#if dat.headerTasks.recent.length > 0}
-          <div class="seg-grid recent">
-            {#each [...dat.headerTasks.recent].reverse() as w}
-              <span class="seg done" title={`${fmt(w.start)}→${fmt(w.end)} · ${w.peer} · ${fmtAgo(w.assignedAt)}`}>
-                <span class="mono" translate="no">{fmt(w.start)}→{fmt(w.end)}</span>✓
-              </span>
+        <div class="win-labels">
+          <span class="mono mint">▲ {t("int.hdr_tip")} {fmt(dat.headerTip)}</span>
+          <span class="mono straw">↦ {t("int.hdr_next_assign")} {fmt(dat.headerTasks.nextAssign)}</span>
+          <span class="mono">◆ target {fmt(dat.headerBoundary)}</span>
+        </div>
+        {#if dat.headerTasks.hdrLanes.length > 0}
+          <p class="legend mono" aria-hidden="true">▓ {t("int.done")} ░ {t("int.inflight")} · {t("int.todo")}</p>
+          <div class="hdr-lanes">
+            {#each dat.headerTasks.hdrLanes as l}
+              <div class="lane">
+                <span class="lane-name mono" translate="no">{l.peer}</span>
+                <div class="lane-bar" aria-hidden="true">
+                  {#key `${l.peer}:${l.start}:${hdrJust(l.peer)}`}
+                    <span
+                      class="lane-done hi hdr-lane-fill"
+                      class:done={l.received || hdrJustFresh(l.peer)}
+                      style:--pc={`var(--peer${((peerColor.get(l.peer) ?? 0) % 6) + 1})`}
+                      title={`${fmt(l.start)}→${fmt(l.end)} · ${l.received || hdrJustFresh(l.peer) ? t("int.done") : t("int.inflight")} ${l.pct.toFixed(0)}%`}
+                    ></span>
+                  {/key}
+                </div>
+                <span class="lane-vals mono" translate="no">{fmt(l.start)}→{fmt(l.end)} · {l.received ? "100%" : `${l.pct.toFixed(0)}%`}</span>
+              </div>
             {/each}
           </div>
         {/if}
         <dl class="kv">
-          <div><dt>{t("int.window_start")}</dt><dd class="mono" translate="no">{fmt(winLeft())}</dd></div>
-          <div><dt>{t("int.window_end")}</dt><dd class="mono" translate="no">{fmt(winRight())}</dd></div>
-          <div><dt>{t("int.window_size_label")}</dt><dd class="mono" translate="no">{fmt(dat.windowSize)}</dd></div>
+          <div><dt>{t("int.hdr_window_start")}</dt><dd class="mono" translate="no">{fmt(hdrLeft())} → {fmt(hdrRight())}</dd></div>
           <div><dt>{t("int.requested_blocks")}</dt><dd class="mono" translate="no">{fmt(dat.headerTasks.requestedBlocks)}</dd></div>
           <div><dt>{t("int.last_reissue")}</dt><dd class="mono">{fmtAgo(dat.headerTasks.lastReissueAt)}</dd></div>
         </dl>
@@ -398,6 +633,76 @@
     background: var(--ink-fg);
     opacity: 0.6;
   }
+
+  .hdr-line {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    transition: left 0.7s cubic-bezier(0.22, 1, 0.36, 1);
+    pointer-events: none;
+  }
+  .hdr-right-line {
+    background: var(--honey);
+    opacity: 0.95;
+  }
+  .hdr-left-line {
+    background: var(--mint);
+    opacity: 0.95;
+  }
+  .hdr-todo-block {
+    position: absolute;
+    top: 6px;
+    bottom: 6px;
+    background: repeating-linear-gradient(45deg, #e4e4e4, #e4e4e4 5px, #ededed 5px, #ededed 10px);
+    border: 1px dashed #c6c6c6;
+    border-radius: 5px;
+  }
+  .hdr-done-block {
+    position: absolute;
+    top: 6px;
+    bottom: 6px;
+    background: var(--mint);
+    border: 1px solid color-mix(in srgb, var(--mint) 60%, #0a6b3a);
+    border-radius: 5px;
+    opacity: 0.92;
+  }
+  .hdr-just-block {
+    position: absolute;
+    top: 6px;
+    bottom: 6px;
+    border-radius: 5px;
+    background: var(--pc);
+    border: 1px solid color-mix(in srgb, var(--pc) 65%, #000);
+    animation: hdr-fade 1.4s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+    pointer-events: none;
+  }
+  @keyframes hdr-fade {
+    from {
+      background: var(--pc);
+      opacity: 1;
+    }
+    to {
+      background: var(--mint);
+      opacity: 0.95;
+    }
+  }
+  .win-track.hdr .ws {
+    top: 6px;
+    bottom: 6px;
+    transition:
+      background 0.4s,
+      border-color 0.4s,
+      box-shadow 0.4s;
+  }
+  .hdr-band.accent {
+    box-shadow: 0 0 0 1px var(--pc);
+    background: var(--mint);
+    border-color: color-mix(in srgb, var(--mint) 65%, #0a6b3a);
+  }
+  .hdr-band.accent .ws-done {
+    background: var(--mint);
+  }
   .win-labels {
     display: flex;
     gap: 16px;
@@ -471,6 +776,10 @@
     padding: 6px 0;
     font-size: 12px;
   }
+  .hdr-lanes {
+    margin-top: 10px;
+    border-top: 1px solid var(--line);
+  }
   .lane-name {
     color: var(--ink-dim);
     overflow: hidden;
@@ -495,6 +804,27 @@
     border-radius: 8px;
     transition: width 0.6s ease;
   }
+  .lane-done.hi {
+    background: linear-gradient(180deg, var(--pc), color-mix(in srgb, var(--pc) 70%, #000));
+  }
+  .lane-done.hi.hdr-lane-fill:not(.done) {
+    width: 5%;
+    min-width: 3px;
+    opacity: 0.55;
+  }
+  .lane-done.hi.hdr-lane-fill.done {
+    background: linear-gradient(180deg, var(--mint), color-mix(in srgb, var(--mint) 55%, #0a6b3a));
+    animation: hdr-fill 1s cubic-bezier(0.22, 1, 0.36, 1) both;
+    box-shadow: 0 0 6px color-mix(in srgb, var(--mint) 55%, transparent);
+  }
+  @keyframes hdr-fill {
+    from {
+      width: 0%;
+    }
+    to {
+      width: 100%;
+    }
+  }
   .lane-inflight {
     position: absolute;
     top: 1px;
@@ -502,6 +832,10 @@
     min-width: 2px;
     background: var(--honey);
     border-radius: 2px;
+  }
+  .lane-bar .lane-inflight {
+    background: var(--pc);
+    opacity: 0.85;
   }
   .lane-vals {
     color: var(--ink-dim);
@@ -519,29 +853,6 @@
     color: var(--ink-dim);
   }
 
-  .seg-grid {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-  }
-  .seg {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    border-radius: 6px;
-    padding: 4px 8px;
-    font-size: 11px;
-    border: 1px solid var(--line);
-    color: var(--ink-dim);
-  }
-  .seg.done {
-    border-color: var(--mint);
-    color: var(--mint);
-  }
-  .seg.inflight {
-    border-color: var(--honey);
-    color: var(--honey);
-  }
   .kv {
     margin: 14px 0 0;
     display: grid;

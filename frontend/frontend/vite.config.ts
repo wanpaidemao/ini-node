@@ -31,19 +31,25 @@ function parseIni(path: string): IniOpts {
   return out;
 }
 
-function rpcProxyPlugin(): Plugin {
+function rpcTarget() {
   const opts = parseIni(INI_PATH);
   const user = opts.rpcuser ?? "ini";
   const pass = opts.rpcpass ?? "ini";
   const auth = "Basic " + Buffer.from(`${user}:${pass}`).toString("base64");
   const target = new URL(/^https?:\/\//.test(opts.rpclisten ?? "") ? opts.rpclisten! : `http://${opts.rpclisten ?? "127.0.0.1:8334"}`);
-  const hostname = target.hostname || "127.0.0.1";
-  const port = target.port || "8334";
+  return {
+    hostname: target.hostname || "127.0.0.1",
+    port: target.port || "8334",
+    auth,
+  };
+}
 
+function rpcProxyPlugin(): Plugin {
   return {
     name: "ini-node-rpc-proxy",
     configureServer(server) {
       server.middlewares.use("/rpc", (req, res) => {
+        const { hostname, port, auth } = rpcTarget();
         const chunks: Buffer[] = [];
         req.on("data", (c) => chunks.push(c as Buffer));
         req.on("end", () => {

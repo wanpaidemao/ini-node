@@ -278,7 +278,7 @@ export const Services = {
     // Header download state is exposed per peer: each peer carries the range it
     // is currently receiving. Received ranges are done, the ones still being
     // pulled are in-flight, and whatever has not been handed out yet is pending.
-    const hdrPeers = (sync.peers ?? []).filter((p) => p.header_range_end > p.header_range_start);
+    const hdrPeers = (sync.peers ?? []).filter((p) => p.header_range_start > 0);
     const headerRanges: { start: number; end: number; state: "done" | "inflight" | "todo" }[] = [];
     if (sync.header_target > chainTip) {
       if (hdrPeers.length > 0) {
@@ -306,6 +306,14 @@ export const Services = {
       headerRanges.push({ start: 0, end: headerTip, state: "done" });
     }
 
+    // Zoom window for the header track: frame the active download area around
+    // the assign frontier (next range handed out next) instead of the whole
+    // 40M+ span, mirroring the block window track.
+    const hdrSliceLen = sync.header_slice_len || 2000;
+    const hdrWinLen = Math.max(hdrSliceLen * 8, hdrSliceLen * 4);
+    const hdrWindowStart = Math.max(0, Math.min(sync.header_next_assign, sync.header_target) - hdrWinLen);
+    const hdrWindowEnd = Math.min(sync.header_target, hdrWindowStart + hdrWinLen * 2);
+
     // "lastReissue" = the most recent time any slice/header range was handed to
     // a peer (the node reports it per peer in unix seconds).
     const lastAssignAt = (sync.peers ?? []).reduce(
@@ -328,15 +336,47 @@ export const Services = {
       },
       headerTasks: {
         ranges: headerRanges,
+        hdrPeers: hdrPeers.map((p) => {
+          const sliceLen = sync.header_slice_len || 2000;
+          return {
+            peer: p.addr,
+            start: p.header_range_start,
+            end: Math.max(p.header_range_start + 1, p.header_range_start + sliceLen),
+            pct: p.header_range_received
+              ? 100
+              : Math.min(100, Math.max(0, ((p.header_range_end - p.header_range_start) / sliceLen) * 100)),
+            received: p.header_range_received,
+            assignedAt: p.header_range_assigned_at ? p.header_range_assigned_at * 1000 : 0,
+          };
+        }),
         recent: (sync.header_recent_ranges ?? []).map((r) => ({
           start: r.start,
           end: r.end,
           peer: r.peer,
           assignedAt: r.assigned_at * 1000,
         })),
+        hdrLanes: (sync.peers ?? [])
+          .filter((p) => p.header_range_start > 0 || p.header_range_received)
+          .map((p) => {
+            const sliceLen = sync.header_slice_len || 2000;
+            return {
+              peer: p.addr,
+              start: p.header_range_start,
+              end: Math.max(p.header_range_start + 1, p.header_range_start + sliceLen),
+              pct: p.header_range_received
+                ? 100
+                : Math.min(100, Math.max(0, ((p.header_range_end - p.header_range_start) / sliceLen) * 100)),
+              received: p.header_range_received,
+              assignedAt: p.header_range_assigned_at ? p.header_range_assigned_at * 1000 : 0,
+            };
+          })
+          .sort((a, b) => a.peer.localeCompare(b.peer)),
         sliceLen: sync.header_slice_len ?? 0,
         requestedBlocks: Math.max(0, sync.block_target - chainTip),
         lastReissueAt: lastAssignAt > 0 ? lastAssignAt * 1000 : Date.now(),
+        windowStart: hdrWindowStart,
+        windowEnd: hdrWindowEnd,
+        nextAssign: sync.header_next_assign ?? 0,
       },
       mem: {
         gap: Math.max(0, headerTip - chainTip),

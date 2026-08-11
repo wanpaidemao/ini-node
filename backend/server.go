@@ -227,6 +227,7 @@ type peerState struct {
 	persistentPeers map[int32]*serverPeer
 	banned          map[string]time.Time
 	outboundGroups  map[string]int
+	outboundIPs     map[string]int
 }
 
 // Count returns the count of all known peers.
@@ -253,6 +254,39 @@ func (ps *peerState) forAllPeers(closure func(sp *serverPeer)) {
 		closure(e)
 	}
 	ps.forAllOutboundPeers(closure)
+}
+
+// peerIP extracts the remote host (without port) from a server peer, or an
+// empty string when the peer has no usable network address yet.
+func peerIP(sp *serverPeer) string {
+	na := sp.NA()
+	if na == nil {
+		return ""
+	}
+	lna := na.ToLegacy()
+	if lna == nil || lna.IP == nil {
+		return ""
+	}
+	return lna.IP.String()
+}
+
+// trackOutbound records an outbound peer in both the network-group and the
+// per-IP accounting maps so automatic connections avoid duplicating a host.
+func trackOutbound(state *peerState, sp *serverPeer) {
+	state.outboundGroups[addrmgr.GroupKey(sp.NA())]++
+	if ip := peerIP(sp); ip != "" {
+		state.outboundIPs[ip]++
+	}
+}
+
+// untrackOutbound removes an outbound peer from both accounting maps.
+func untrackOutbound(state *peerState, sp *serverPeer) {
+	if !sp.Inbound() && sp.VersionKnown() {
+		state.outboundGroups[addrmgr.GroupKey(sp.NA())]--
+		if ip := peerIP(sp); ip != "" {
+			state.outboundIPs[ip]--
+		}
+	}
 }
 
 // cfHeaderKV is a tuple of a filter header and its associated block hash. The
@@ -1923,7 +1957,7 @@ func (s *server) handleAddPeerMsg(state *peerState, sp *serverPeer) bool {
 	if sp.Inbound() {
 		state.inboundPeers[sp.ID()] = sp
 	} else {
-		state.outboundGroups[addrmgr.GroupKey(sp.NA())]++
+		trackOutbound(state, sp)
 		if sp.persistent {
 			state.persistentPeers[sp.ID()] = sp
 		} else {
@@ -2009,9 +2043,7 @@ func (s *server) handleDonePeerMsg(state *peerState, sp *serverPeer) {
 	}
 
 	if _, ok := list[sp.ID()]; ok {
-		if !sp.Inbound() && sp.VersionKnown() {
-			state.outboundGroups[addrmgr.GroupKey(sp.NA())]--
-		}
+		untrackOutbound(state, sp)
 		delete(list, sp.ID())
 		srvrLog.Debugf("Removed peer %s", sp)
 	}
@@ -2148,6 +2180,11 @@ type getOutboundGroup struct {
 	reply chan int
 }
 
+type getOutboundIP struct {
+	ip    string
+	reply chan int
+}
+
 type getAddedNodesMsg struct {
 	reply chan []*serverPeer
 }
@@ -2225,7 +2262,7 @@ func (s *server) handleQuery(state *peerState, querymsg interface{}) {
 		found := disconnectPeer(state.persistentPeers, msg.cmp, func(sp *serverPeer) {
 			// Keep group counts ok since we remove from
 			// the list now.
-			state.outboundGroups[addrmgr.GroupKey(sp.NA())]--
+			untrackOutbound(state, sp)
 		})
 
 		if found {
@@ -2235,6 +2272,13 @@ func (s *server) handleQuery(state *peerState, querymsg interface{}) {
 		}
 	case getOutboundGroup:
 		count, ok := state.outboundGroups[msg.key]
+		if ok {
+			msg.reply <- count
+		} else {
+			msg.reply <- 0
+		}
+	case getOutboundIP:
+		count, ok := state.outboundIPs[msg.ip]
 		if ok {
 			msg.reply <- count
 		} else {
@@ -2261,7 +2305,7 @@ func (s *server) handleQuery(state *peerState, querymsg interface{}) {
 		found = disconnectPeer(state.outboundPeers, msg.cmp, func(sp *serverPeer) {
 			// Keep group counts ok since we remove from
 			// the list now.
-			state.outboundGroups[addrmgr.GroupKey(sp.NA())]--
+			untrackOutbound(state, sp)
 		})
 		if found {
 			// If there are multiple outbound connections to the same
@@ -2269,7 +2313,7 @@ func (s *server) handleQuery(state *peerState, querymsg interface{}) {
 			// peers are found.
 			for found {
 				found = disconnectPeer(state.outboundPeers, msg.cmp, func(sp *serverPeer) {
-					state.outboundGroups[addrmgr.GroupKey(sp.NA())]--
+					untrackOutbound(state, sp)
 				})
 			}
 			msg.reply <- nil
@@ -2498,6 +2542,7 @@ func (s *server) peerHandler() {
 		outboundPeers:   make(map[int32]*serverPeer),
 		banned:          make(map[string]time.Time),
 		outboundGroups:  make(map[string]int),
+		outboundIPs:     make(map[string]int),
 	}
 
 	if !cfg.DisableDNSSeed {
@@ -2613,6 +2658,15 @@ func (s *server) ConnectedCount() int32 {
 func (s *server) OutboundGroupCount(key string) int {
 	replyChan := make(chan int)
 	s.query <- getOutboundGroup{key: key, reply: replyChan}
+	return <-replyChan
+}
+
+// OutboundIPCount returns the number of currently connected outbound peers
+// with the given remote IP.  It is used to avoid dialing the same host more
+// than once so each of the (limited) outbound slots reaches a distinct node.
+func (s *server) OutboundIPCount(ip string) int {
+	replyChan := make(chan int)
+	s.query <- getOutboundIP{ip: ip, reply: replyChan}
 	return <-replyChan
 }
 
@@ -3249,9 +3303,15 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 				// Just check that we don't already have an address
 				// in the same group so that we are not connecting
 				// to the same network segment at the expense of
-				// others.
+				// others, and that the exact remote IP is not
+				// already connected so each outbound slot reaches
+				// a distinct node.
 				key := addrmgr.GroupKey(addr.NetAddress())
 				if s.OutboundGroupCount(key) != 0 {
+					continue
+				}
+				ip := addr.NetAddress().ToLegacy().IP.String()
+				if ip != "" && s.OutboundIPCount(ip) != 0 {
 					continue
 				}
 
