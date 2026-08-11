@@ -139,29 +139,33 @@
   </div>
 
   {#if dat}
-    <!-- window position -->
+    <!-- window status -->
     <div class="card">
       <div class="card-head">
-        <span class="h-card">{t("int.window_position")}</span>
-        <span class="chip mono" translate="no">0 → {fmt(total())}</span>
+        <span class="h-card">{t("int.window_status")}</span>
+        <span class="chip mono" translate="no">{fmt(winLeft())} → {fmt(winRight())} · {t("int.window_size", { n: fmt(dat.windowSize) })}</span>
       </div>
-      <div class="win-track" role="img" aria-label={t("int.window_position")}>
-        <span class="b-chain" aria-hidden="true"></span>
-        <span class="b-window" style="left:0;width:100%" aria-hidden="true"></span>
-        <span class="b-boundary" style="left:0" aria-hidden="true"></span>
-        {#each winSlices as s}
-          <span class="lane-bar" style="position:absolute;top:16px;left:{s.l}%;width:{s.w}%;margin:0" title={`${s.peer} ${fmt(s.start)}→${fmt(s.end)} · ${s.pct.toFixed(0)}%`}>
-            <span class="lane-done" style:width={`${s.pct}%`}></span>
-            {#if s.inFlight > 0}<span class="lane-inflight" style:left={`${s.pct}%`} style:width="4px"></span>{/if}
+      <div class="win-track" role="img" aria-label={t("int.window_status")}>
+        <span class="ws-tip" style:left={`${winFrac(dat.chainTip)}%`} aria-hidden="true"></span>
+        {#each winSlices as s, i}
+          <span
+            class="ws"
+            class:accent={s.syncNode}
+            style:--pc={`var(--peer${(i % 6) + 1})`}
+            style:left={`${s.l}%`}
+            style:width={`${s.w}%`}
+            title={`${s.peer} ${fmt(s.start)}→${fmt(s.end)} · ${s.pct.toFixed(0)}%${s.inFlight > 0 ? ` · ${s.inFlight} in-flight` : ""}`}
+          >
+            <span class="ws-done" style:width={`${Math.max(0, Math.min(100, s.pct))}%`}></span>
+            {#if s.inFlight > 0}<span class="ws-flight" aria-hidden="true"></span>{/if}
           </span>
         {/each}
-        <span class="b-tip" style:left={`${winFrac(dat.chainTip)}%`} aria-hidden="true"></span>
-        <span class="b-hmark" style:left={`${winFrac(dat.headerTip)}%`} aria-hidden="true"></span>
+        <span class="ws-boundary" style:left={`${winFrac(dat.chainBoundary)}%`} aria-hidden="true"></span>
       </div>
       <div class="win-labels">
-        <span class="mono">▲ chainBoundary {fmt(dat.chainBoundary)}</span>
+        <span class="mono">▲ {t("int.boundary")} {fmt(dat.chainBoundary)}</span>
+        <span class="mono">▲ tip {fmt(dat.chainTip)}</span>
         <span class="mono straw">{t("int.window_size", { n: fmt(dat.windowSize) })}</span>
-        <span class="mono">▲ chainTip {fmt(dat.chainTip)}</span>
         <span class="mono mint">▲ headerTip {t("int.caught_up")}</span>
       </div>
     </div>
@@ -219,7 +223,7 @@
         <div class="card-head">
           <span class="h-card">{t("int.tasks_headers")}</span>
           {#if dat.headerTasks.sliceLen > 0}
-            <span class="chip mono" translate="no">{headerPieces()}×{fmt(dat.headerTasks.sliceLen)}</span>
+            <span class="chip mono" translate="no">{t("int.task_segments", { n: fmt(headerPieces()), len: fmt(dat.headerTasks.sliceLen) })}</span>
           {/if}
         </div>
         <div class="seg-grid">
@@ -240,6 +244,9 @@
           </div>
         {/if}
         <dl class="kv">
+          <div><dt>{t("int.window_start")}</dt><dd class="mono" translate="no">{fmt(winLeft())}</dd></div>
+          <div><dt>{t("int.window_end")}</dt><dd class="mono" translate="no">{fmt(winRight())}</dd></div>
+          <div><dt>{t("int.window_size_label")}</dt><dd class="mono" translate="no">{fmt(dat.windowSize)}</dd></div>
           <div><dt>{t("int.requested_blocks")}</dt><dd class="mono" translate="no">{fmt(dat.headerTasks.requestedBlocks)}</dd></div>
           <div><dt>{t("int.last_reissue")}</dt><dd class="mono">{fmtAgo(dat.headerTasks.lastReissueAt)}</dd></div>
         </dl>
@@ -298,6 +305,14 @@
     max-width: 1080px;
     margin: 0 auto;
   }
+  .int {
+    --peer1: var(--straw);
+    --peer2: var(--honey);
+    --peer3: var(--mint);
+    --peer4: #9a7bd8;
+    --peer5: #4aa3c7;
+    --peer6: #d86a8a;
+  }
   .head {
     display: flex;
     align-items: flex-end;
@@ -333,50 +348,55 @@
 
   .win-track {
     position: relative;
-    height: 46px;
+    height: 44px;
     border-radius: var(--r-12);
     background: #f0f0f0;
     border: 1px solid var(--line);
     overflow: hidden;
     margin-bottom: 8px;
   }
-  .b-chain {
-    position: absolute;
-    inset: 0;
-    background: repeating-linear-gradient(90deg, var(--straw) 0, var(--straw) 2px, transparent 2px, transparent 12%);
-    opacity: 0.15;
-  }
-  .b-boundary {
-    position: absolute;
-    top: 6px;
-    bottom: 6px;
-    width: 2px;
-    background: var(--mist);
-    opacity: 0.7;
-  }
-  .b-window {
-    position: absolute;
-    top: 8px;
-    bottom: 8px;
-    min-width: 3px;
-    background: var(--straw);
-    opacity: 0.85;
-    border-radius: 4px;
-  }
-  .b-tip {
+  .ws {
     position: absolute;
     top: 4px;
     bottom: 4px;
+    min-width: 3px;
+    background: color-mix(in srgb, var(--pc) 16%, transparent);
+    border: 1px solid color-mix(in srgb, var(--pc) 45%, transparent);
+    border-radius: 5px;
+    overflow: hidden;
+  }
+  .ws.accent {
+    box-shadow: 0 0 0 1px var(--pc);
+  }
+  .ws-done {
+    position: absolute;
+    inset: 0 auto 0 0;
+    background: var(--pc);
+    border-radius: 4px;
+  }
+  .ws-flight {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: #fff;
+    box-shadow: 0 0 4px rgba(0, 0, 0, 0.35);
+  }
+  .ws-boundary {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: var(--mist);
+    opacity: 0.8;
+  }
+  .ws-tip {
+    position: absolute;
+    top: 0;
+    bottom: 0;
     width: 2px;
     background: var(--ink-fg);
     opacity: 0.6;
-  }
-  .b-hmark {
-    position: absolute;
-    top: 4px;
-    bottom: 4px;
-    width: 2px;
-    background: var(--mint);
   }
   .win-labels {
     display: flex;
@@ -462,24 +482,26 @@
   }
   .lane-bar {
     position: relative;
-    height: 14px;
-    border-radius: 4px;
-    background: #e0e0e0;
+    height: 16px;
+    border-radius: 8px;
+    background: linear-gradient(#0003, #0003), #f0f0f0;
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.08);
     overflow: hidden;
   }
   .lane-done {
     position: absolute;
     inset: 0 auto 0 0;
-    background: var(--straw);
-    border-radius: 4px;
+    background: linear-gradient(180deg, var(--straw), color-mix(in srgb, var(--straw) 75%, #c07f00));
+    border-radius: 8px;
+    transition: width 0.6s ease;
   }
   .lane-inflight {
     position: absolute;
-    top: 0;
-    bottom: 0;
+    top: 1px;
+    bottom: 1px;
     min-width: 2px;
     background: var(--honey);
-    border-radius: 0 4px 4px 0;
+    border-radius: 2px;
   }
   .lane-vals {
     color: var(--ink-dim);

@@ -1,4 +1,4 @@
-﻿{
+{
   "lang.name": "English",
   "app.name": "SugarChain",
   "app.tag": "SugarChain desktop node",
@@ -73,7 +73,7 @@
   "g.ms": "{n} ms",
 
   "int.title": "Internals",
-  "int.window_position": "Window position",
+  "int.window_status": "Window status",
   "int.window_speed": "Window forward speed",
   "int.blocks_per_s": "{n} bl/s",
   "int.options": "Options",
@@ -81,8 +81,12 @@
   "int.boundary": "Boundary",
   "int.tasks_blocks": "Block tasks",
   "int.tasks_headers": "Header tasks",
-  "int.requested_blocks": "requestedBlocks: {n}",
-  "int.last_reissue": "lastReissue: {ago}",
+  "int.requested_blocks": "Blocks to download: {n}",
+  "int.last_reissue": "Last issued: {ago}",
+  "int.window_start": "Window start",
+  "int.window_end": "Window end",
+  "int.window_size_label": "Window size",
+  "int.task_segments": "Task segments: {n}×{len}",
   "int.memory": "Memory",
   "int.heap": "Heap {size}",
   "int.heap_objects": "HeapObjects {n:,}",

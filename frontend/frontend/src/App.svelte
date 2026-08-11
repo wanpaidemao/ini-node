@@ -2,7 +2,7 @@
   import { onMount, onDestroy } from "svelte";
   import { app, navigate, setConnected } from "./lib/store.svelte";
   import { Services } from "./lib/services";
-  import { t, setLang, LANG_NAMES, LANGS } from "./lib/i18n";
+  import { t } from "./lib/i18n";
   import type { Route } from "./lib/types";
   import Dashboard from "./pages/Dashboard.svelte";
   import Internals from "./pages/Internals.svelte";
@@ -48,26 +48,9 @@
   };
 
   let collapsible = $state(false);
-  let langOpen = $state(false);
-  let lang = $state<keyof typeof LANG_NAMES>("en");
-  let debugLevel = $state("info");
 
   function go(r: Route) {
     navigate(r);
-    langOpen = false;
-  }
-
-  function setLangUI(l: keyof typeof LANG_NAMES) {
-    setLang(l);
-    lang = l;
-    langOpen = false;
-  }
-
-  function jumpDebug() {
-    if (app.route !== "internals") {
-      app.shortcut.focusDebug = true;
-      navigate("internals");
-    }
   }
 
   let healthTimer: ReturnType<typeof setInterval> | undefined;
@@ -75,8 +58,7 @@
   async function checkHealth() {
     if (!app.connected) app.connecting = true;
     try {
-      const [s, d] = await Promise.all([Services.getSyncStatus(), Services.getDebugLevel()]);
-      debugLevel = d;
+      const s = await Services.getSyncStatus();
       setConnected({ connected: true, syncing: s.blocks < s.headers });
     } catch {
       setConnected({ connected: false, syncing: false });
@@ -142,33 +124,6 @@
   <div class="main-col">
     <header class="topbar">
       <span class="topbar-title">{t(titles[app.route])}</span>
-      <div class="topbar-right">
-        <div class="lang-wrap">
-          <button class="chip lang-chip" aria-haspopup="true" aria-expanded={langOpen} onclick={() => (langOpen = !langOpen)}>
-            {LANG_NAMES[lang] || "English"}
-            <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9" /><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18" /></svg>
-          </button>
-          {#if langOpen}
-            <div class="lang-panel" role="listbox" aria-label="Language">
-              {#each LANGS as l}
-                <button
-                  class="lang-opt"
-                  class:active={lang === l}
-                  role="option"
-                  aria-selected={lang === l}
-                  onclick={() => setLangUI(l)}
-                >
-                  {LANG_NAMES[l]}
-                </button>
-              {/each}
-            </div>
-          {/if}
-        </div>
-
-        <button class="chip debug-chip" onclick={jumpDebug} title={t("shell.debug")}>
-          <span class="dot" aria-hidden="true"></span> debug · {debugLevel}
-        </button>
-      </div>
     </header>
 
     <main id="main" class="page">
@@ -189,10 +144,6 @@
       {/if}
     </main>
   </div>
-
-  {#if langOpen}
-    <div class="lang-overlay" onclick={() => (langOpen = false)} aria-hidden="true"></div>
-  {/if}
 </div>
 
 <style>
@@ -335,71 +286,6 @@
     font-family: var(--font-display);
     font-weight: 800;
     font-size: 15px;
-  }
-  .topbar-right {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-
-  .lang-wrap {
-    position: relative;
-  }
-  .lang-chip,
-  .debug-chip {
-    cursor: pointer;
-    transition: color 0.12s ease, border-color 0.12s ease;
-  }
-  .lang-chip:hover,
-  .debug-chip:hover {
-    color: var(--ink-fg);
-    border-color: rgba(0, 0, 0, 0.2);
-  }
-  .lang-chip:focus-visible,
-  .debug-chip:focus-visible {
-    outline: none;
-    box-shadow: var(--focus);
-  }
-
-  .lang-panel {
-    position: absolute;
-    top: calc(100% + 8px);
-    right: 0;
-    background: var(--ink);
-    border: 1px solid var(--line);
-    border-radius: var(--r-12);
-    box-shadow: var(--shadow);
-    padding: 6px;
-    min-width: 150px;
-    z-index: 30;
-  }
-  .lang-panel button {
-    display: block;
-    width: 100%;
-    text-align: left;
-    background: none;
-    border: none;
-    color: var(--ink-dim);
-    padding: 8px 10px;
-    border-radius: var(--r-8);
-    cursor: pointer;
-    font-size: 13px;
-  }
-  .lang-panel button:hover {
-    background: rgba(0, 0, 0, 0.07);
-    color: var(--ink-fg);
-  }
-  .lang-panel button.active {
-    color: var(--straw);
-  }
-  .lang-overlay {
-    position: fixed;
-    inset: 0;
-    z-index: 20;
-  }
-
-  .debug-chip .dot {
-    background: var(--honey);
   }
 
   .page {

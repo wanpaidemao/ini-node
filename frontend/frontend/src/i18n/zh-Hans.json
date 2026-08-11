@@ -1,4 +1,4 @@
-﻿{
+{
   "lang.name": "简体中文",
   "app.name": "SugarChain",
   "app.tag": "SugarChain 桌面节点",
@@ -73,7 +73,7 @@
   "g.ms": "{n} ms",
 
   "int.title": "内部观测",
-  "int.window_position": "窗口位置",
+  "int.window_status": "窗口状态",
   "int.window_speed": "窗口前进速度",
   "int.blocks_per_s": "{n} bl/s",
   "int.options": "选项",
@@ -81,8 +81,12 @@
   "int.boundary": "边界",
   "int.tasks_blocks": "任务分配 (blockTasks)",
   "int.tasks_headers": "任务分配 (headerTasks)",
-  "int.requested_blocks": "requestedBlocks: {n}",
-  "int.last_reissue": "lastReissue: {ago}",
+  "int.requested_blocks": "待下载区块: {n}",
+  "int.last_reissue": "最近派发: {ago}",
+  "int.window_start": "窗口起始",
+  "int.window_end": "窗口结束",
+  "int.window_size_label": "窗口大小",
+  "int.task_segments": "任务分块: {n}×{len}",
   "int.memory": "内存",
   "int.heap": "Heap {size}",
   "int.heap_objects": "HeapObjects {n}",
