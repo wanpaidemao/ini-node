@@ -1,1 +1,7 @@
 frontend.rar
+
+# runtime artifacts
+/btcd-data/
+/btcd-logs/
+/proc-mem.csv
+/header-mem.csv

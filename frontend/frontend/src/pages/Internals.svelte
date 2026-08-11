@@ -89,15 +89,33 @@
     return Math.max(1, Math.ceil(dat.headerTip / dat.headerTasks.sliceLen));
   }
 
-  // Header track zooms into the active download window (around the assign
-  // frontier); each peer's live header range is drawn as a colored band.
-  const hdrLeft = () => dat?.headerTasks.windowStart ?? 0;
-  const hdrRight = () => {
-    const r = dat?.headerTasks.windowEnd ?? 0;
-    const l = hdrLeft();
-    if (r > l) return r;
-    return Math.max(1, dat?.headerTip ?? 1);
-  };
+  // Header track zooms into the active download window.  The window is a
+  // stepwise conveyor: its right edge tracks the download frontier immediately,
+  // while its left edge only advances once the dark "filling" squares have
+  // settled into the pile (see hdrWindow).  A completed slice therefore pushes
+  // the right line right first; when the dark square reaches the left line the
+  // whole frame (both lines included) shifts left by the settled span.
+  // peer -> { ts, start, end } of the slice that just completed (drives the
+  // dark "filling" square and the lane fill animation, linking top+bottom).
+  let hdrJustDone = new Map<string, { ts: number; start: number; end: number }>();
+  const hdrWindow = $derived.by(() => {
+    if (!dat) return { l: 0, r: 1 };
+    const sliceLen = dat.headerTasks.sliceLen || 2000;
+    const frontier = Math.max(
+      dat.headerTip,
+      dat.headerTasks.nextAssign,
+      ...dat.headerTasks.hdrPeers.map((p) => p.end),
+    );
+    const now = Date.now();
+    let unsettled = 0;
+    for (const v of hdrJustDone.values()) if (now - v.ts < 4500) unsettled++;
+    const settledTip = Math.max(0, dat.headerTip - unsettled * sliceLen);
+    const l = Math.max(0, settledTip - sliceLen * 2);
+    const r = Math.min(dat.headerBoundary, frontier + sliceLen * 6);
+    return r > l ? { l, r } : { l, r: Math.max(1, dat.headerTip) };
+  });
+  const hdrLeft = () => hdrWindow.l;
+  const hdrRight = () => hdrWindow.r;
   const hdrFrac = (h: number) => {
     const l = hdrLeft();
     const r = hdrRight();
@@ -109,7 +127,7 @@
     const m = new Map<string, number>();
     if (!dat) return m;
     const peers = [...new Set(dat.headerTasks.hdrLanes.map((l) => l.peer))].sort();
-    peers.forEach((p, i) => m.set(p, i % 6));
+    peers.forEach((p, i) => m.set(p, i % 8));
     return m;
   });
   // Per-IP header slice history. The backend only reports each peer's *current*
@@ -127,7 +145,6 @@
   let hdrDone: HdrDoneRec[] = [];
   // peer -> { ts, start, end } of the slice that just completed (drives the
   // dark "filling" square and the lane fill animation, linking top+bottom).
-  let hdrJustDone = new Map<string, { ts: number; start: number; end: number }>();
   function updateHdrHistory(d: NodeInternals) {
     const lanes = d.headerTasks.hdrLanes;
     const sliceLen = d.headerTasks.sliceLen || 2000;
@@ -157,7 +174,7 @@
     if (fresh.size > 0) {
       const now = Date.now();
       for (const [p, v] of fresh) hdrJustDone.set(p, v);
-      for (const [p, v] of hdrJustDone) if (now - v.ts > 5000) hdrJustDone.delete(p);
+      for (const [p, v] of hdrJustDone) if (now - v.ts > 12000) hdrJustDone.delete(p);
     }
   }
   function hdrJust(peer: string): number {
@@ -165,7 +182,7 @@
   }
   function hdrJustFresh(peer: string): boolean {
     const j = hdrJust(peer);
-    return j > 0 && Date.now() - j < 1500;
+    return j > 0 && Date.now() - j < 6000;
   }
 
   // Conveyor of fixed-size task squares inside the track window:
@@ -210,25 +227,24 @@
     }
     return blocks;
   });
-  // Dark "filling" overlay: for ~1.5s after a peer's bar fills, the just-finished
-  // slice first turns dark at its position, then slides left into the green done
-  // pile. This is the moment the top square reacts to the lane below.
+  // Dark "filling" overlay: for ~6s after a peer's bar fills, the just-finished
+  // slice holds its light peer color, then turns dark, then fades to light green
+  // once the stepwise frame has shifted it into the pile.  Its position rides
+  // the frame (left transitions) so it visibly drifts toward the pile.
   const hdrJustBlocks = $derived.by(() => {
     if (!dat) return [];
     const l = hdrLeft();
     const r = hdrRight();
     const span = r - l;
     if (span <= 0) return [];
-    const minStart = dat.headerTasks.hdrPeers.length > 0 ? Math.min(...dat.headerTasks.hdrPeers.map((p) => p.start)) : dat.headerTip;
-    const targetL = hdrFrac(minStart);
-    const out: { peer: string; ts: number; l: number; w: number; gl: number }[] = [];
+    const out: { peer: string; ts: number; l: number; w: number }[] = [];
     for (const [peer, v] of hdrJustDone) {
-      if (Date.now() - v.ts < 1500) {
+      if (Date.now() - v.ts < 6000) {
         const ls = Math.max(v.start, l);
         const rs = Math.min(v.end, r);
         const lf = ((ls - l) / span) * 100;
         const rf = ((rs - l) / span) * 100;
-        if (rf > lf) out.push({ peer, ts: v.ts, l: lf, w: rf - lf, gl: Math.min(targetL, lf) });
+        if (rf > lf) out.push({ peer, ts: v.ts, l: lf, w: rf - lf });
       }
     }
     return out;
@@ -420,15 +436,14 @@
           {#each hdrTodoBlocks as b}
             <span class="hdr-todo-block" style:left={`${b.l}%`} style:width={`${b.w}%`} title={`${t("int.todo")} ${fmt(b.start)}`} aria-hidden="true"></span>
           {/each}
+          <span class="hdr-done-pile" style:left="0%" style:width={`${hdrLeftLine}%`} title={t("int.done")} aria-hidden="true"></span>
           {#each hdrDoneBlocks as b (b.start)}
             <span class="hdr-done-block" style:left={`${b.l}%`} style:width={`${b.w}%`} title={`${b.peer} ${fmt(b.start)}→${fmt(b.start + (dat.headerTasks.sliceLen || 2000))} · ${t("int.done")}`} aria-hidden="true"></span>
           {/each}
           {#each hdrJustBlocks as j (j.peer + ":" + j.ts)}
             <span
               class="hdr-just-block"
-              style:--pc={`var(--peer${((peerColor.get(j.peer) ?? 0) % 6) + 1})`}
-              style:--jl={`${j.l}%`}
-              style:--gl={`${j.gl}%`}
+              style:--pc={`var(--peer${((peerColor.get(j.peer) ?? 0) % 8) + 1})`}
               style:left={`${j.l}%`}
               style:width={`${j.w}%`}
               title={`${j.peer} filling → ${t("int.done")}`}
@@ -439,7 +454,7 @@
             <span
               class="ws hdr-band"
               class:accent={b.received}
-              style:--pc={`var(--peer${((peerColor.get(b.peer) ?? 0) % 6) + 1})`}
+              style:--pc={`var(--peer${((peerColor.get(b.peer) ?? 0) % 8) + 1})`}
               style:left={`${b.l}%`}
               style:width={`${b.w}%`}
               title={`${b.peer} ${fmt(b.start)}→${fmt(b.end)} · ${b.received ? t("int.done") : t("int.inflight")}${!b.received ? ` ${b.pct.toFixed(0)}%` : ""}${b.assignedAt ? ` · ${fmtAgo(b.assignedAt)}` : ""}`}
@@ -471,7 +486,7 @@
                     <span
                       class="lane-done hi hdr-lane-fill"
                       class:done={l.received || hdrJustFresh(l.peer)}
-                      style:--pc={`var(--peer${((peerColor.get(l.peer) ?? 0) % 6) + 1})`}
+                      style:--pc={`var(--peer${((peerColor.get(l.peer) ?? 0) % 8) + 1})`}
                       title={`${fmt(l.start)}→${fmt(l.end)} · ${l.received || hdrJustFresh(l.peer) ? t("int.done") : t("int.inflight")} ${l.pct.toFixed(0)}%`}
                     ></span>
                   {/key}
@@ -542,12 +557,15 @@
     margin: 0 auto;
   }
   .int {
-    --peer1: var(--straw);
-    --peer2: var(--honey);
-    --peer3: var(--mint);
-    --peer4: #9a7bd8;
-    --peer5: #4aa3c7;
-    --peer6: #d86a8a;
+    --peer1: #e34d42;
+    --peer2: #e8873b;
+    --peer3: #ecd034;
+    --peer4: #d4a017;
+    --peer5: #a2acb8;
+    --peer6: #35c3c8;
+    --peer7: #4f86e0;
+    --peer8: #9b6adf;
+    --hdr-pile: #019875;
   }
   .head {
     display: flex;
@@ -640,7 +658,7 @@
     top: 0;
     bottom: 0;
     width: 2px;
-    transition: left 1s cubic-bezier(0.22, 1, 0.36, 1);
+    transition: left 1.5s cubic-bezier(0.22, 1, 0.36, 1);
     pointer-events: none;
   }
   .hdr-right-line {
@@ -648,8 +666,18 @@
     opacity: 0.95;
   }
   .hdr-left-line {
-    background: var(--mint);
-    opacity: 0.95;
+    background: #006b54;
+    opacity: 1;
+  }
+  .hdr-done-pile {
+    position: absolute;
+    top: 6px;
+    bottom: 6px;
+    left: 0;
+    background: var(--hdr-pile);
+    border-radius: 5px;
+    opacity: 0.92;
+    transition: width 1.5s cubic-bezier(0.22, 1, 0.36, 1);
   }
   .hdr-todo-block {
     position: absolute;
@@ -658,15 +686,21 @@
     background: repeating-linear-gradient(45deg, #e4e4e4, #e4e4e4 5px, #ededed 5px, #ededed 10px);
     border: 1px dashed #c6c6c6;
     border-radius: 5px;
+    transition:
+      left 1.5s cubic-bezier(0.22, 1, 0.36, 1),
+      width 1.5s cubic-bezier(0.22, 1, 0.36, 1);
   }
   .hdr-done-block {
     position: absolute;
     top: 6px;
     bottom: 6px;
-    background: var(--mint);
-    border: 1px solid color-mix(in srgb, var(--mint) 60%, #0a6b3a);
+    background: var(--hdr-pile);
+    border: 1px solid color-mix(in srgb, var(--hdr-pile) 60%, #0a6b3a);
     border-radius: 5px;
     opacity: 0.92;
+    transition:
+      left 1.5s cubic-bezier(0.22, 1, 0.36, 1),
+      width 1.5s cubic-bezier(0.22, 1, 0.36, 1);
   }
   .hdr-just-block {
     position: absolute;
@@ -675,23 +709,29 @@
     border-radius: 5px;
     background: var(--pc);
     border: 1px solid color-mix(in srgb, var(--pc) 65%, #000);
-    animation: hdr-settle 1.5s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+    animation: hdr-settle 6s ease forwards;
+    transition: left 1.5s cubic-bezier(0.22, 1, 0.36, 1);
     pointer-events: none;
   }
   @keyframes hdr-settle {
     0% {
-      left: var(--jl, 0%);
-      background: color-mix(in srgb, var(--pc) 72%, #000);
+      background: var(--pc);
       opacity: 1;
     }
-    45% {
-      left: var(--jl, 0%);
-      background: color-mix(in srgb, var(--pc) 72%, #000);
+    30% {
+      background: var(--pc);
+      opacity: 1;
+    }
+    55% {
+      background: color-mix(in srgb, var(--pc) 55%, #000);
+      opacity: 1;
+    }
+    85% {
+      background: color-mix(in srgb, var(--pc) 55%, #000);
       opacity: 1;
     }
     100% {
-      left: var(--gl, var(--jl, 0%));
-      background: var(--mint);
+      background: var(--hdr-pile);
       opacity: 0.95;
     }
   }
@@ -699,17 +739,19 @@
     top: 6px;
     bottom: 6px;
     transition:
+      left 1.5s cubic-bezier(0.22, 1, 0.36, 1),
+      width 1.5s cubic-bezier(0.22, 1, 0.36, 1),
       background 0.4s,
       border-color 0.4s,
       box-shadow 0.4s;
   }
   .hdr-band.accent {
     box-shadow: 0 0 0 1px var(--pc);
-    background: var(--mint);
-    border-color: color-mix(in srgb, var(--mint) 65%, #0a6b3a);
+    background: color-mix(in srgb, var(--pc) 55%, #000);
+    border-color: color-mix(in srgb, var(--pc) 65%, #000);
   }
   .hdr-band.accent .ws-done {
-    background: var(--mint);
+    background: color-mix(in srgb, var(--pc) 55%, #000);
   }
   .win-labels {
     display: flex;
@@ -821,9 +863,9 @@
     opacity: 0.55;
   }
   .lane-done.hi.hdr-lane-fill.done {
-    background: linear-gradient(180deg, var(--mint), color-mix(in srgb, var(--mint) 55%, #0a6b3a));
-    animation: hdr-fill 1s cubic-bezier(0.22, 1, 0.36, 1) both;
-    box-shadow: 0 0 6px color-mix(in srgb, var(--mint) 55%, transparent);
+    background: linear-gradient(180deg, var(--pc), color-mix(in srgb, var(--pc) 55%, #000));
+    animation: hdr-fill 2s cubic-bezier(0.22, 1, 0.36, 1) both;
+    box-shadow: 0 0 6px color-mix(in srgb, var(--pc) 55%, transparent);
   }
   @keyframes hdr-fill {
     from {
@@ -940,6 +982,30 @@
     }
     .lane-time {
       grid-column: 2;
+    }
+  }
+
+  /* The header-track conveyor is a load-bearing status animation; restore its
+     durations even under the global prefers-reduced-motion override. */
+  @media (prefers-reduced-motion: reduce) {
+    .hdr-line,
+    .hdr-done-pile,
+    .hdr-todo-block,
+    .hdr-done-block,
+    .hdr-just-block {
+      transition-duration: 1.5s !important;
+    }
+    .hdr-just-block {
+      animation-duration: 6s !important;
+    }
+    .win-track.hdr .ws {
+      transition-duration: 1.5s, 1.5s, 0.4s, 0.4s, 0.4s !important;
+    }
+    .lane-done {
+      transition-duration: 0.6s !important;
+    }
+    .lane-done.hi.hdr-lane-fill.done {
+      animation-duration: 2s !important;
     }
   }
 </style>
