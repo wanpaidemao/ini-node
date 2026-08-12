@@ -12,6 +12,7 @@
 
 | 日期 | 提交 hash | 内容 |
 |---|---|---|
+| 2026-08-12 | `44154b99` | ffldb(metadata leveldb): **block cache 8MB→320MB + open-files cache 500→4096**,消掉 IBD block 阶段随机点的重复表读;验证物理盘读由高频降至 **~1.5-2MB/s**(逻辑读 1.4GB/s 全部由 cache/页缓存命中,不落盘) |
 | 2026-08-09 | `453924c4` | yespower: **`sync.Pool` 缓冲池复用~8MB scratch**(V/X/S/B 跨调用复用),单次哈希分配由 ~8.3MB 降至 ~104KB/op,消除 block/header 校验的 GC churn;`Hash()` 签名不变,KAT(`TestTestnetGenesisPoW`)通过;live profile 重验待重启机房节点 |
 | 2026-08-08 | `e5d1d9ff` | netsync:落后于链时每 60s 打一条 INFO 同步进度(追上即静默) |
 | 2026-08-08 | `2fa55034` | netsync: **IBD 期间周期 flush UTXO 缓存**(5min/次),防重建缺口 |
@@ -43,7 +44,7 @@
 
 ## 3. 已排查确认的关键结论(勿重复调查)
 
-- **磁盘 I/O 不是瓶颈**:实测写 ~40KB/s;读峰值来自 leveldb 压实(初始化期拉平时时的峰值,属暂态)。
+- **磁盘 I/O 不是瓶颈**:实测写 ~40KB/s;读峰值来自 leveldb 压实(初始化期拉平时的峰值,属暂态)。**2026-08-12 后**:已把 metadata leveldb block cache 提到 320MB + open-files 4096(`44154b99`),物理盘读进一步降到 ~1.5-2MB/s,逻辑读靠缓存命中。(压平时长平稳后此条目可复核)
 - **内存稳定** ~1.05GB(IBD 中),无泄露;22GB 机器跑全链可行。
 - **metadata 10.6GB 组成**:43.75M header 全量索引(`blockheaderidx` 117B/条 + hashidx + heightidx)≈8.3GB 行成本 + leveldb 摊销 → 已是常量,**block 阶段几乎不涨**。
 - **块体 ~0.41KB/块**:全链预估 18–45GB。
