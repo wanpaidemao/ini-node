@@ -1709,7 +1709,7 @@ func TestParallelBlockDownloadAllPeersServed(t *testing.T) {
 	for i, p := range peers {
 		state := sm.peerStates[p]
 		state.requestedBlocks = make(map[chainhash.Hash]struct{})
-		for h := int32(1+i*10); h <= int32(10+i*10); h++ {
+		for h := int32(1 + i*10); h <= int32(10+i*10); h++ {
 			state.requestedBlocks[hashAt(h)] = struct{}{}
 		}
 	}
@@ -2263,3 +2263,190 @@ func TestFullSyncAllBlocks(t *testing.T) {
 	}
 }
 
+// TestParallelHeaderBlockOverlap verifies that once the applied header tip
+// leads the connected best chain by blockSyncStartLead, the parallel block
+// download starts while the header download keeps running, the header peers
+// receive disjoint block slices, and the block download survives (is not
+// rebuilt) when the header download later finishes.
+func TestParallelHeaderBlockOverlap(t *testing.T) {
+	params := chaincfg.RegressionNetParams
+	params.Checkpoints = nil
+
+	const numHeaders = 30
+	const sliceLen = 5
+	const startLead = 10
+	headers := makeTestHeaderChain(t, &params, numHeaders)
+
+	sm, tearDown := makeMockSyncManager(t, &params)
+	defer tearDown()
+	sm.blockSyncStartLead = startLead
+
+	peers := newHeaderSyncPeers(t, sm, 3, numHeaders)
+	sm.syncPeer = peers[0]
+	startParallelHeaderSync(t, sm, peers, numHeaders, sliceLen)
+
+	hs := sm.headerSync
+	require.NotNil(t, hs)
+	require.Nil(t, sm.blockSyncState,
+		"block download must not start before the lead threshold is met")
+
+	// Deliver the front header range [1,6).  The lead (5) is still below the
+	// threshold, so the block download must not start.
+	sm.handleHeadersMsg(headerMsgFor(hs.ranges[1].peer, headers[0:5]))
+	require.Nil(t, sm.blockSyncState,
+		"lead of 5 below the threshold of 10 must not start block sync")
+	require.NotNil(t, sm.headerSync)
+
+	// Deliver the next front range [6,11).  The lead is now 10, which meets
+	// the threshold; the block download starts while headers keep running.
+	hs = sm.headerSync
+	sm.handleHeadersMsg(headerMsgFor(hs.ranges[6].peer, headers[5:10]))
+	hs = sm.headerSync
+	require.NotNil(t, hs, "header download must keep running in overlap mode")
+	require.NotNil(t, sm.blockSyncState,
+		"block download should start once the header lead threshold is met")
+	_, bestHeaderHeight := sm.chain.BestHeader()
+	require.Equal(t, int32(10), bestHeaderHeight)
+	require.Equal(t, 3, len(sm.blockSync),
+		"block download must reuse the header peers")
+
+	bs := sm.blockSyncState
+
+	// Deliver the remaining header ranges to completion.  The block download
+	// must survive without being torn down or rebuilt.
+	for i := 0; i < numHeaders/sliceLen+4 && sm.headerSync != nil; i++ {
+		hs = sm.headerSync
+		rng := hs.ranges[hs.nextHeight]
+		if rng == nil {
+			break
+		}
+		start := rng.start
+		end := start + sliceLen
+		if end > numHeaders+1 {
+			end = numHeaders + 1
+		}
+		sm.handleHeadersMsg(headerMsgFor(rng.peer, headers[start-1:end-1]))
+	}
+
+	require.Nil(t, sm.headerSync, "header download should have completed")
+	require.NotNil(t, sm.blockSyncState,
+		"block download must keep running after headers finish")
+	require.Equal(t, bs, sm.blockSyncState,
+		"block download state must not be rebuilt when headers finish")
+	require.True(t, sm.ibdMode)
+}
+
+// TestConcurrentSyncPeerDrop verifies that a peer taking part in BOTH the
+// header download and the overlapping block download, when dropped from the
+// header side, also has its block slice freed and is removed from the block
+// participating set so its heights can be re-issued.
+func TestConcurrentSyncPeerDrop(t *testing.T) {
+	params := chaincfg.RegressionNetParams
+	params.Checkpoints = nil
+	sm, tearDown := makeMockSyncManager(t, &params)
+	defer tearDown()
+
+	peers := newHeaderSyncPeers(t, sm, 2, 20)
+	sm.syncPeer = peers[0]
+	startParallelHeaderSync(t, sm, peers, 20, 5)
+
+	// Manually set up an overlapping block download sharing the same peers.
+	bs := &blockSyncState{
+		nextAssign:   1,
+		target:       20,
+		slices:       make(map[int32]*blockSlice),
+		peerSlice:    make(map[*peer.Peer]*blockSlice),
+		sliceLen:     4,
+		lastProgress: make(map[*peer.Peer]time.Time),
+	}
+	sl0 := &blockSlice{start: 1, end: 5, peer: peers[0], assignedAt: time.Now()}
+	sl1 := &blockSlice{start: 5, end: 9, peer: peers[1], assignedAt: time.Now()}
+	bs.slices[1] = sl0
+	bs.slices[5] = sl1
+	bs.peerSlice[peers[0]] = sl0
+	bs.peerSlice[peers[1]] = sl1
+	sm.blockSync = []*peer.Peer{peers[0], peers[1]}
+	sm.blockSyncState = bs
+
+	hs := sm.headerSync
+	require.NotNil(t, hs.ranges[1])
+	require.NotNil(t, hs.ranges[6])
+
+	// Drop the peer that holds both the front header range and a block slice.
+	sm.dropHeaderPeer(peers[0])
+
+	// Header side: its range is freed and it leaves the header set.  The
+	// freed front range is immediately re-issued to a remaining peer so the
+	// download does not stall.
+	require.NotNil(t, hs.ranges[1])
+	require.NotEqual(t, peers[0], hs.ranges[1].peer,
+		"freed front range must be re-issued to a remaining peer")
+	require.Equal(t, []*peer.Peer{peers[1]}, hs.peers)
+
+	// Block side: its slice is released and it leaves the block set, while
+	// the other peer keeps its own slice untouched.
+	require.Nil(t, bs.peerSlice[peers[0]])
+	require.Nil(t, bs.slices[1])
+	require.Equal(t, []*peer.Peer{peers[1]}, sm.blockSync)
+	require.Equal(t, sl1, bs.peerSlice[peers[1]])
+	require.NotNil(t, bs.slices[5])
+}
+
+// TestBlockSliceCappedByHeaderLead verifies two safety properties of
+// assignBlockSlice during the overlapping sync: while the header download is
+// still running, new slices are not handed out once the header lead shrinks
+// below the request window (prioritizing header progress); and whenever a
+// slice is assigned it never extends past the current best header height.
+func TestBlockSliceCappedByHeaderLead(t *testing.T) {
+	params := chaincfg.RegressionNetParams
+	params.Checkpoints = nil
+	sm, tearDown := makeMockSyncManager(t, &params)
+	defer tearDown()
+
+	const headerHeight = 10
+	headers := makeTestHeaderChain(t, &params, headerHeight)
+	for _, h := range headers {
+		_, err := sm.chain.ProcessBlockHeader(h, blockchain.BFNoPoWCheck, false)
+		require.NoError(t, err)
+	}
+	_, bestHeaderHeight := sm.chain.BestHeader()
+	require.Equal(t, int32(headerHeight), bestHeaderHeight)
+
+	dp := newSyncCandidate(t, sm, headerHeight)
+	bs := &blockSyncState{
+		nextAssign:   1,
+		target:       bestHeaderHeight,
+		slices:       make(map[int32]*blockSlice),
+		peerSlice:    make(map[*peer.Peer]*blockSlice),
+		sliceLen:     100000,
+		lastProgress: make(map[*peer.Peer]time.Time),
+	}
+	sm.blockSyncState = bs
+	sm.blockSync = []*peer.Peer{dp}
+
+	// While a header download is still running and the lead (10) is below the
+	// request window (8192), no new slice may be handed out so the header
+	// download is not starved.
+	sm.headerSync = &headerSyncState{
+		peers:      []*peer.Peer{dp},
+		target:     headerHeight,
+		nextHeight: 1,
+		nextAssign: 1,
+		ranges:     make(map[int32]*headerRange),
+		peerRange:  make(map[*peer.Peer]*headerRange),
+	}
+	require.False(t, sm.assignBlockSlice(dp),
+		"no new slices while the header download needs headroom")
+
+	// Once the header download is done, the same state assigns a slice that
+	// covers the request window but never extends past the header tip.
+	sm.headerSync = nil
+	require.True(t, sm.assignBlockSlice(dp))
+	sl := bs.peerSlice[dp]
+	require.NotNil(t, sl)
+	require.Equal(t, int32(1), sl.start)
+	// end = min(start+sliceLen, windowEnd+1) with windowEnd =
+	// min(bestHeight+8192, bestHeaderHeight) = 10.
+	require.Equal(t, int32(11), sl.end)
+	require.LessOrEqual(t, sl.end-1, bestHeaderHeight)
+}

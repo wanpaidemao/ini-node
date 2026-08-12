@@ -287,13 +287,13 @@ type blockSlice struct {
 // is only accessed from the blockHandler goroutine and is non-nil while blocks
 // are being fetched from several peers simultaneously.
 type blockSyncState struct {
-	nextAssign  int32                         // next height to hand out to a peer
-	target      int32                         // highest header height to reach
-	slices      map[int32]*blockSlice         // assigned slices by start height
-	peerSlice   map[*peerpkg.Peer]*blockSlice // slice currently assigned to each peer
-	sliceLen    int32                         // max height span handed to a peer at once
-	lastReissue time.Time                     // last time a stale slice was reissued
-	lastProgress map[*peerpkg.Peer]time.Time  // last time each peer delivered a block
+	nextAssign   int32                         // next height to hand out to a peer
+	target       int32                         // highest header height to reach
+	slices       map[int32]*blockSlice         // assigned slices by start height
+	peerSlice    map[*peerpkg.Peer]*blockSlice // slice currently assigned to each peer
+	sliceLen     int32                         // max height span handed to a peer at once
+	lastReissue  time.Time                     // last time a stale slice was reissued
+	lastProgress map[*peerpkg.Peer]time.Time   // last time each peer delivered a block
 }
 
 // PeerSyncStatus describes one peer's role in an in-progress parallel initial
@@ -308,10 +308,10 @@ type PeerSyncStatus struct {
 	// Block slice currently assigned to the peer.  Start == End means no
 	// block slice is currently assigned (or no parallel block download is
 	// running).
-	SliceStart       int32 `json:"slice_start"`
-	SliceEnd         int32 `json:"slice_end"`
-	SliceAssignedAt  int64 `json:"slice_assigned_at"`
-	SliceReceived    int32 `json:"slice_received"`
+	SliceStart      int32 `json:"slice_start"`
+	SliceEnd        int32 `json:"slice_end"`
+	SliceAssignedAt int64 `json:"slice_assigned_at"`
+	SliceReceived   int32 `json:"slice_received"`
 	// Header range currently assigned during a parallel header download.
 	// Start == End means none is assigned.
 	HeaderRangeStart      int32 `json:"header_range_start"`
@@ -432,8 +432,17 @@ type SyncManager struct {
 	// blockSyncState tracks the per-peer disjoint height slices of an
 	// in-progress parallel initial block download.  It is nil while no
 	// parallel block download is running and only touched from the
-	// blockHandler goroutine.
+	// blockHandler goroutine.  It is created either by
+	// startParallelBlockDownload (once the applied header tip leads the
+	// connected best chain by blockSyncStartLead, or when the header download
+	// finishes) or by startSync when the node already has all headers.
 	blockSyncState *blockSyncState
+
+	// blockSyncStartLead is the height margin the applied header tip must
+	// lead the connected best chain by before the parallel block download is
+	// started while the header download is still running.  Zero disables the
+	// overlap.  Only touched from the blockHandler goroutine.
+	blockSyncStartLead int32
 
 	// The following fields are used for the initial block download mode.
 	ibdMode bool
@@ -1669,6 +1678,19 @@ func (sm *SyncManager) assignBlockSlice(peer *peerpkg.Peer) bool {
 		windowEnd = bestHeaderHeight
 	}
 
+	// While the header download is still running, keep a safety margin
+	// between the block request frontier and the applied header tip so a
+	// burst of heavy block processing cannot let blocks catch up to and
+	// starve the header download.  The frontier is already capped at the
+	// header tip below; this guard additionally refuses to hand out new
+	// slices once the margin shrinks below the request window, letting the
+	// (much cheaper) header processing catch up first.  Once headers finish
+	// (headerSync is torn down) the guard no longer applies and the final
+	// catch-up proceeds normally.
+	if sm.headerSync != nil && bestHeaderHeight-bestHeight < maxBlockRequestWindow {
+		return false
+	}
+
 	// Never hand out heights we have already connected.
 	if bs.nextAssign <= bestHeight {
 		bs.nextAssign = bestHeight + 1
@@ -2124,6 +2146,12 @@ func (sm *SyncManager) processReadyHeaderRanges() {
 	// Guard against a hole or stalled slice at the front of the download.
 	sm.reissueFrontRange()
 
+	// Start the block download early, while headers are still being
+	// downloaded, once the applied header tip has built up enough of a lead
+	// (see maybeStartBlockSync).  The block request frontier stays bounded by
+	// the header tip, so the two downloads proceed concurrently and safely.
+	sm.maybeStartBlockSync()
+
 	// Hand off to the block download once every header through the tallest
 	// participating peer has been applied.
 	if hs.nextHeight > hs.target {
@@ -2150,8 +2178,10 @@ func (sm *SyncManager) recordHeaderWindow(start, end int32, peer *peerpkg.Peer) 
 }
 
 // finishHeaderSync signals that the parallel header download has caught up to
-// the connected peers' tips and the initial block download can proceed with
-// fetching the blocks themselves.
+// the connected peers' tips.  If a parallel block download has not already been
+// started (see maybeStartBlockSync), it is started now from the peers that
+// served headers; otherwise the already-running block download is left in place
+// so its in-flight slices are not lost.
 func (sm *SyncManager) finishHeaderSync() {
 	hs := sm.headerSync
 	if hs == nil {
@@ -2164,14 +2194,32 @@ func (sm *SyncManager) finishHeaderSync() {
 	log.Infof("downloaded headers to %v(%v) in %d parallel "+
 		"slices -- now fetching blocks", bestHash, bestHeight, len(hs.peers))
 
+	// A block download may already be running if it was started while the
+	// header download was still in progress.  Keep it: tearing it down would
+	// lose every in-flight slice and the remaining peers' progress.
+	if sm.blockSyncState != nil {
+		log.Infof("Block download already running with %d peers; "+
+			"leaving it in place", len(sm.blockSync))
+		return
+	}
+
 	// Hand the block download off to all of the peers that served headers so
-	// the initial block download is also performed in parallel.  Each peer is
-	// handed a disjoint slice of the header chain (see assignBlockSlice) so
-	// multiple peers fetch different heights simultaneously instead of one
-	// peer claiming the entire request window ahead of the tip.  If we end up
+	// the initial block download is also performed in parallel.  If we end up
 	// with no peers the normal new-peer/stall handling will restart the sync.
+	sm.startParallelBlockDownload(hs.peers, bestHeight)
+}
+
+// startParallelBlockDownload sets up the parallel (multi-peer) initial block
+// download state and dispatches an initial request to every participating peer.
+// It is shared by finishHeaderSync (the header download is complete) and
+// maybeStartBlockSync (the header download is still running but has built up
+// enough of a lead).  The block request frontier is always capped by the
+// current best header height (see assignBlockSlice/buildBlockRequest), so the
+// block download can never request heights whose headers have not been applied
+// yet, no matter when it starts.
+func (sm *SyncManager) startParallelBlockDownload(peers []*peerpkg.Peer, bestHeaderHeight int32) {
 	sm.ibdMode = true
-	sm.blockSync = hs.peers
+	sm.blockSync = peers
 	if len(sm.blockSync) > maxHeaderSyncPeers {
 		sm.blockSync = sm.blockSync[:maxHeaderSyncPeers]
 	}
@@ -2203,8 +2251,7 @@ func (sm *SyncManager) finishHeaderSync() {
 	// header sync restarts it.  A fixed slice keeps the window sub-divided
 	// into maxHeaderSyncPeers pieces at all times, so peers that join midway
 	// always claim the slice left open ahead of the current frontier.
-	bestHeight = sm.chain.BestSnapshot().Height
-	_, bestHeaderHeight := sm.chain.BestHeader()
+	bestHeight := sm.chain.BestSnapshot().Height
 	sliceLen := int32(maxBlockRequestWindow) / maxHeaderSyncPeers
 	if sliceLen < 1 {
 		sliceLen = 1
@@ -2233,6 +2280,36 @@ func (sm *SyncManager) finishHeaderSync() {
 	// session before dispatching fresh requests, so the download resumes from
 	// where it left off instead of re-fetching or stalling on local data.
 	sm.reconnectStoredBlocks()
+}
+
+// maybeStartBlockSync starts the parallel block download while the header
+// download is still running, once the applied header tip leads the connected
+// best chain by blockSyncStartLead heights.  It is called as header batches are
+// applied (see processReadyHeaderRanges).  Because the block request frontier
+// is bounded by the current best header height, starting early cannot request
+// blocks whose headers are not applied yet; the header download keeps running
+// and simply stays ahead.  It is a no-op when the overlap is disabled
+// (blockSyncStartLead <= 0), when no header download is running, or when the
+// block download has already started.
+func (sm *SyncManager) maybeStartBlockSync() {
+	if sm.blockSyncStartLead <= 0 {
+		return
+	}
+	hs := sm.headerSync
+	if hs == nil || sm.blockSyncState != nil {
+		return
+	}
+
+	_, bestHeaderHeight := sm.chain.BestHeader()
+	bestHeight := sm.chain.BestSnapshot().Height
+	if bestHeaderHeight-bestHeight < sm.blockSyncStartLead {
+		return
+	}
+
+	log.Infof("Header tip leads connected chain by %d (>= %d) -- "+
+		"starting parallel block download while headers continue",
+		bestHeaderHeight-bestHeight, sm.blockSyncStartLead)
+	sm.startParallelBlockDownload(hs.peers, bestHeaderHeight)
 }
 
 // dropHeaderPeer removes a peer from an in-progress parallel header download,
@@ -2265,6 +2342,20 @@ func (sm *SyncManager) dropHeaderPeer(peer *peerpkg.Peer) {
 		}
 	}
 	hs.target = target
+
+	// If the peer was also taking part in a parallel block download (which
+	// can happen while the header and block downloads overlap), free its
+	// block slice and drop it from the participating set so its heights are
+	// re-issued to a remaining peer.
+	if sm.blockSync != nil {
+		sm.releaseBlockSlice(peer)
+		for i, p := range sm.blockSync {
+			if p == peer {
+				sm.blockSync = append(sm.blockSync[:i], sm.blockSync[i+1:]...)
+				break
+			}
+		}
+	}
 
 	// If nobody is left to serve headers, tear the download down and let the
 	// normal flow restart it (e.g. when a new peer connects).
@@ -3208,18 +3299,19 @@ func (sm *SyncManager) Pause() chan<- struct{} {
 // block, tx, and inv updates.
 func New(config *Config) (*SyncManager, error) {
 	sm := SyncManager{
-		peerNotifier:    config.PeerNotifier,
-		chain:           config.Chain,
-		txMemPool:       config.TxMemPool,
-		chainParams:     config.ChainParams,
-		rejectedTxns:    make(map[chainhash.Hash]struct{}),
-		requestedTxns:   make(map[chainhash.Hash]struct{}),
-		requestedBlocks: make(map[chainhash.Hash]struct{}),
-		peerStates:      make(map[*peerpkg.Peer]*peerSyncState),
-		progressLogger:  newBlockProgressLogger("Processed", log),
-		msgChan:         make(chan interface{}, config.MaxPeers*3),
-		quit:            make(chan struct{}),
-		feeEstimator:    config.FeeEstimator,
+		peerNotifier:       config.PeerNotifier,
+		chain:              config.Chain,
+		txMemPool:          config.TxMemPool,
+		chainParams:        config.ChainParams,
+		rejectedTxns:       make(map[chainhash.Hash]struct{}),
+		requestedTxns:      make(map[chainhash.Hash]struct{}),
+		requestedBlocks:    make(map[chainhash.Hash]struct{}),
+		peerStates:         make(map[*peerpkg.Peer]*peerSyncState),
+		progressLogger:     newBlockProgressLogger("Processed", log),
+		msgChan:            make(chan interface{}, config.MaxPeers*3),
+		quit:               make(chan struct{}),
+		feeEstimator:       config.FeeEstimator,
+		blockSyncStartLead: config.BlockSyncStartLead,
 	}
 
 	if config.DisableCheckpoints {

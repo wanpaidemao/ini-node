@@ -37,5 +37,11 @@ type Config struct {
 	DisableCheckpoints bool
 	MaxPeers           int
 
+	// BlockSyncStartLead starts downloading blocks while the initial header
+	// download is still running once the applied header tip leads the
+	// connected best chain by this many heights.  A value of 0 disables the
+	// overlap (header-then-block, historical behavior).
+	BlockSyncStartLead int32
+
 	FeeEstimator *mempool.FeeEstimator
 }

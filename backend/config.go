@@ -70,6 +70,7 @@ const (
 	defaultTxIndex               = false
 	defaultAddrIndex             = false
 	defaultSugarIndex            = false
+	defaultBlockSyncStartLead    = 20000
 	pruneMinSize                 = 1536
 )
 
@@ -188,6 +189,7 @@ type config struct {
 	TrickleInterval      time.Duration `long:"trickleinterval" description:"Minimum time between attempts to send new inventory to a connected peer"`
 	UtxoCacheMaxSizeMiB  uint          `long:"utxocachemaxsize" description:"The maximum size in MiB of the UTXO cache"`
 	HeaderWindow         int32         `long:"headerwindow" description:"Keep only this many recent headers (and blocks) in memory; older headers are read from disk on demand. A value of 0 keeps the full index in memory (default, historical btcd behavior)"`
+	BlockSyncStartLead   int32         `long:"blocksyncstartlead" description:"Start downloading blocks while headers are still being downloaded once the applied header tip leads the connected best chain by this many heights. A value of 0 disables the overlap and keeps the historical header-then-block download. A negative value starts block download immediately with the first header batch."`
 	SugarIndex           bool          `long:"sugarindex" description:"Maintain a SugarChain-compatible (umami byte-for-byte) address/spent/timestamp index in <datadir>/index and enable the getaddress* family of RPCs"`
 	TxIndex              bool          `long:"txindex" description:"Maintain a full hash-based transaction index which makes all transactions available via the getrawtransaction RPC"`
 	V2Transport          bool          `long:"v2transport" description:"Enable P2P v2 encrypted transport protocol (BIP324) (default: false)"`
@@ -457,6 +459,7 @@ func loadConfig() (*config, []string, error) {
 		TxIndex:              defaultTxIndex,
 		AddrIndex:            defaultAddrIndex,
 		SugarIndex:           defaultSugarIndex,
+		BlockSyncStartLead:   defaultBlockSyncStartLead,
 		V2Transport:          false,
 	}
 

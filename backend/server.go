@@ -3252,6 +3252,7 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 		ChainParams:        s.chainParams,
 		DisableCheckpoints: cfg.DisableCheckpoints,
 		MaxPeers:           cfg.MaxPeers,
+		BlockSyncStartLead: cfg.BlockSyncStartLead,
 		FeeEstimator:       s.feeEstimator,
 	})
 	if err != nil {
