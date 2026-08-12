@@ -12,6 +12,8 @@
 
 | 日期 | 提交 hash | 内容 |
 |---|---|---|
+| 2026-08-12 | `c37cbbf3` | netsync: **header 尖峰重启后把已在线 sync candidate 重新折叠进并行 block 下载**(不再只等新连接),修复并行度从 6→2 的坍缩 |
+| 2026-08-12 | `c779c9cb` | script: `04-sync-rate` 默认 RPC 凭据与 `btcd-runtime.ini` 对齐为 sugar/sugar |
 | 2026-08-12 | `44154b99` | ffldb(metadata leveldb): **block cache 8MB→320MB + open-files cache 500→4096**,消掉 IBD block 阶段随机点的重复表读;验证物理盘读由高频降至 **~1.5-2MB/s**(逻辑读 1.4GB/s 全部由 cache/页缓存命中,不落盘) |
 | 2026-08-09 | `453924c4` | yespower: **`sync.Pool` 缓冲池复用~8MB scratch**(V/X/S/B 跨调用复用),单次哈希分配由 ~8.3MB 降至 ~104KB/op,消除 block/header 校验的 GC churn;`Hash()` 签名不变,KAT(`TestTestnetGenesisPoW`)通过;live profile 重验待重启机房节点 |
 | 2026-08-08 | `e5d1d9ff` | netsync:落后于链时每 60s 打一条 INFO 同步进度(追上即静默) |
