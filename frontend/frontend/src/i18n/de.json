@@ -140,6 +140,7 @@
   "int.quick": "Schnell",
   "int.ranges": "{n} Bereiche",
   "int.requested_blocks": "Zu ladende Blöcke",
+  "int.requested_headers": "Zu ladende Header",
   "int.resident": "Fensterbelegung ~{n}k×Zeilen",
   "int.retain": "Fenster-Erhalt",
   "int.task_segments": "Aufgaben-Segmente: {n}×{len}",

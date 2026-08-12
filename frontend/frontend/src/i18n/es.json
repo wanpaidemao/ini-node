@@ -140,6 +140,7 @@
   "int.quick": "Rápido",
   "int.ranges": "{n} rangos",
   "int.requested_blocks": "Bloques por descargar",
+  "int.requested_headers": "Encabezados por descargar",
   "int.resident": "Retención de la ventana ~{n}k×filas",
   "int.retain": "Retención de ventana",
   "int.task_segments": "Segmentos: {n}×{len}",

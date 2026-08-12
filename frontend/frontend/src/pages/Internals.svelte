@@ -4,12 +4,10 @@
   import { Services } from "../lib/services";
   import type { NodeInternals } from "../lib/types";
 
-  let dat = $state<NodeInternals | null>(null);
-  let trace = $state(false);
-  let detail = $state(false);
-  let debug = $state("info");
-  let metric = $state("height");
-  let timer: ReturnType<typeof setInterval> | undefined;
+let dat = $state<NodeInternals | null>(null);
+let detail = $state(false);
+let metric = $state("height");
+let timer: ReturnType<typeof setInterval> | undefined;
 
   // Client-side sampling of the poll stream so the speed/ETA numbers are real,
   // computed from the live chain tip / boundary instead of placeholders.
@@ -22,8 +20,9 @@
 
   async function poll() {
     try {
-      dat = await Services.getNodeInternals(detail && debug === "trace" ? "trace" : "normal");
+      dat = await Services.getNodeInternals(detail ? "trace" : "normal");
       if (dat) {
+        settleDoneBlocks(dat);
         updateHdrHistory(dat);
         const now = Date.now();
         hist.push({ t: now, tip: dat.chainTip, boundary: dat.chainBoundary });
@@ -38,15 +37,9 @@
     poll();
     timer = setInterval(poll, 2000);
   });
-  onDestroy(() => clearInterval(timer));
+onDestroy(() => clearInterval(timer));
 
-  function applyDebug(ev: Event) {
-    const v = (ev.target as HTMLSelectElement).value;
-    debug = v;
-    Services.setDebugLevel(v);
-  }
-
-  // Text keeps the whole-chain totals; the track zooms into the active window.
+// Text keeps the whole-chain totals; the track zooms into the active window.
   const total = () => dat?.headerBoundary ?? dat?.headerTip ?? 43_750_000;
   const winLeft = () => dat?.chainBoundary ?? 0;
   const winRight = () => {
@@ -58,6 +51,37 @@
     const r = winRight();
     return r > l ? Math.min(100, Math.max(0, ((h - l) / (r - l)) * 100)) : 0;
   };
+  // Completed block-ranges tracked client-side: the backend only reports each
+  // peer's *current* range, so once a peer is re-assigned its old band would
+  // vanish. We keep finished ranges as dark "settled" nodes on the track that
+  // only disappear once the window edge slides past them.
+  interface DoneRange {
+    start: number;
+    end: number;
+    peer: string;
+  }
+  let doneBlocks = $state<DoneRange[]>([]);
+  let prevRanges = $state<Map<string, { start: number; end: number }>>(new Map());
+  function settleDoneBlocks(d: NodeInternals) {
+    const curRanges = new Map<string, { start: number; end: number }>();
+    for (const s of d.blockTasks.slices) curRanges.set(s.peer, { start: s.start, end: s.end });
+    const completed: DoneRange[] = [];
+    for (const [peer, prev] of prevRanges) {
+      const cur = curRanges.get(peer);
+      if (!cur || cur.start !== prev.start || cur.end !== prev.end) {
+        completed.push({ ...prev, peer });
+      }
+    }
+    let list = [...doneBlocks, ...completed].filter((x) => {
+      const active = curRanges.get(x.peer);
+      if (active && active.start === x.start && active.end === x.end) return false;
+      return x.end > winLeft();
+    });
+    if (list.length > 4000) list = list.slice(-4000);
+    doneBlocks = list;
+    prevRanges = curRanges;
+  }
+
   // Each task slice is drawn as a band spanning its [start, end) inside the
   // window; s.fill is how much of that band its owner has actually downloaded.
   const winSlices = $derived.by(() => {
@@ -65,8 +89,22 @@
     const l = winLeft();
     const r = winRight();
     if (r <= l) return [];
-    const slices = dat.blockTasks.slices;
-    return slices
+    const active = dat.blockTasks.slices;
+    const src: typeof active = [
+      ...active,
+      ...doneBlocks.map((x) => ({
+        peer: x.peer,
+        start: x.start,
+        end: x.end,
+        pct: 100,
+        complete: true,
+        inFlight: 0,
+        syncNode: false,
+        lastActiveAt: 0,
+        assignedAt: 0,
+      })),
+    ].sort((a, b) => a.start - b.start);
+    return src
       .map((s) => {
         const ls = Math.max(s.start, l);
         const rs = Math.min(s.end, r);
@@ -75,7 +113,7 @@
         if (rf <= lf) return null;
         return { ...s, l: lf, w: rf - lf };
       })
-      .filter((s) => s !== null) as (typeof slices[number] & { l: number; w: number })[];
+      .filter((s) => s !== null) as (typeof src[number] & { l: number; w: number })[];
   });
 
   // overall sync progress across the whole chain
@@ -87,6 +125,12 @@
   function headerPieces() {
     if (!dat || dat.headerTasks.sliceLen <= 0) return 0;
     return Math.max(1, Math.ceil(dat.headerTip / dat.headerTasks.sliceLen));
+  }
+
+  // Most recent block-slice assignment (mirrors headerTasks.lastReissueAt).
+  function lastBlockAssign() {
+    if (!dat) return 0;
+    return dat.blockTasks.slices.reduce((m, s) => Math.max(m, s.assignedAt), 0);
   }
 
   // Header track zooms into the active download window.  The window is a
@@ -127,6 +171,19 @@
     const m = new Map<string, number>();
     if (!dat) return m;
     const peers = [...new Set(dat.headerTasks.hdrLanes.map((l) => l.peer))].sort();
+    peers.forEach((p, i) => m.set(p, i % 8));
+    return m;
+  });
+  // Same stable-per-peer color scheme for the block-task slices, shared by the
+  // window track bands and the per-IP progress bars so they always match.
+  const blockPeerColor = $derived.by(() => {
+    const m = new Map<string, number>();
+    if (!dat) return m;
+    // Include completed ranges too, otherwise an idle peer that just finished
+    // would fall back to peer1 and every relaxed band would share its color.
+    const peers = [
+      ...new Set([...dat.blockTasks.slices.map((s) => s.peer), ...doneBlocks.map((x) => x.peer)]),
+    ].sort();
     peers.forEach((p, i) => m.set(p, i % 8));
     return m;
   });
@@ -338,62 +395,12 @@
   </div>
 
   {#if dat}
-    <!-- window status -->
-    <div class="card">
-      <div class="card-head">
-        <span class="h-card">{t("int.window_status")}</span>
-        <span class="chip mono" translate="no">{fmt(winLeft())} → {fmt(winRight())} · {t("int.window_size", { n: fmt(dat.windowSize) })}</span>
-      </div>
-      <div class="win-track" role="img" aria-label={t("int.window_status")}>
-        <span class="ws-tip" style:left={`${winFrac(dat.chainTip)}%`} aria-hidden="true"></span>
-        {#each winSlices as s, i}
-          <span
-            class="ws"
-            class:accent={s.syncNode}
-            style:--pc={`var(--peer${(i % 6) + 1})`}
-            style:left={`${s.l}%`}
-            style:width={`${s.w}%`}
-            title={`${s.peer} ${fmt(s.start)}→${fmt(s.end)} · ${s.pct.toFixed(0)}%${s.inFlight > 0 ? ` · ${s.inFlight} in-flight` : ""}`}
-          >
-            <span class="ws-done" style:width={`${Math.max(0, Math.min(100, s.pct))}%`}></span>
-            {#if s.inFlight > 0}<span class="ws-flight" aria-hidden="true"></span>{/if}
-          </span>
-        {/each}
-        <span class="ws-boundary" style:left={`${winFrac(dat.chainBoundary)}%`} aria-hidden="true"></span>
-      </div>
-      <div class="win-labels">
-        <span class="mono">▲ {t("int.boundary")} {fmt(dat.chainBoundary)}</span>
-        <span class="mono">▲ tip {fmt(dat.chainTip)}</span>
-        <span class="mono straw">{t("int.window_size", { n: fmt(dat.windowSize) })}</span>
-        <span class="mono mint">▲ headerTip {t("int.caught_up")}</span>
-      </div>
-    </div>
-
-    <!-- speed -->
-    <div class="card">
-      <div class="card-head">
-        <span class="h-card">{t("int.window_speed")}</span>
-        <span class="corner">
-          <select aria-label={t("int.options")} bind:value={metric}>
-            <option value="height">{t("int.height")}</option>
-            <option value="boundary">{t("int.boundary")}</option>
-          </select>
-        </span>
-      </div>
-      <div class="speed-bars" aria-hidden="true">
-        {#each bars as h}
-          <span class="bar" style:height={`${h}px`}></span>
-        {/each}
-      </div>
-      <p class="speed-cap mono">▲ {t("int.blocks_per_s", { n: fmt(Math.round(rate.v)) })} · {t("int.eta", { eta: etaText(rate.etaMin) })}</p>
-    </div>
-
     <!-- tasks -->
     <div class="two">
       <div class="card">
         <div class="card-head">
           <span class="h-card">{t("int.tasks_blocks")}</span>
-          <span class="chip mono" translate="no">{fmt(dat.blockTasks.total)} blocks to go</span>
+          <span class="chip mono" translate="no">{fmt(winLeft())} → {fmt(winRight())} · {t("int.window_size", { n: fmt(dat.windowSize) })}</span>
         </div>
         <div class="task-total">
           <span class="mono" translate="no">{fmt(dat.blockTasks.synced)} / {fmt(dat.headerTip)}</span>
@@ -402,20 +409,61 @@
           </div>
           <span class="mono">{taskPct().toFixed(1)}%</span>
         </div>
-        {#each dat.blockTasks.slices as s}
-          <div class="lane">
-            <span class="lane-name mono">{s.peer}{#if s.syncNode}<span class="lane-star" title="sync node"> ★</span>{/if}</span>
-            <div class="lane-bar" aria-hidden="true">
-              <span class="lane-done" style:width={`${s.pct}%`}></span>
-              {#if s.inFlight > 0}<span class="lane-inflight" style:width={`${Math.min(100 - s.pct, 12)}%`} style:left={`${s.pct}%`}></span>{/if}
+        <div class="win-track" role="img" aria-label={t("int.window_status")}>
+          <span class="ws-tip" style:left={`${winFrac(dat.chainTip)}%`} aria-hidden="true"></span>
+          {#each winSlices as s (s.peer + ":" + s.start)}
+            <span
+              class="ws"
+              class:accent={s.syncNode}
+              style:--pc={`var(--peer${((blockPeerColor.get(s.peer) ?? 0) % 8) + 1})`}
+              style:left={`${s.l}%`}
+              style:width={`${s.w}%`}
+              title={`${s.peer} ${fmt(s.start)}→${fmt(s.end)} · ${s.pct.toFixed(0)}%${s.inFlight > 0 ? ` · ${s.inFlight} in-flight` : ""}`}
+            >
+              <span class="ws-done" style:width={`${Math.max(0, Math.min(100, s.pct))}%`}></span>
+              {#if s.inFlight > 0}<span class="ws-flight" aria-hidden="true"></span>{/if}
+            </span>
+          {/each}
+          <span class="ws-boundary" style:left={`${winFrac(dat.chainBoundary)}%`} aria-hidden="true"></span>
+        </div>
+        <div class="win-labels">
+          <span class="mono">▲ {t("int.boundary")} {fmt(dat.chainBoundary)}</span>
+          <span class="mono">▲ tip {fmt(dat.chainTip)}</span>
+          <span class="mono straw">{t("int.window_size", { n: fmt(dat.windowSize) })}</span>
+          <span class="mono mint">▲ headerTip {t("int.caught_up")}</span>
+        </div>
+        <div class="legend-row">
+          <p class="legend mono" aria-hidden="true">▓ downloaded  ░ in-flight</p>
+          <button
+            class="btn btn-ghost se"
+            class:on={detail}
+            title={t("int.trace_hint")}
+            onclick={() => {
+              detail = !detail;
+              poll();
+            }}
+          >{t("int.details")}</button>
+        </div>
+        <div class="block-lanes">
+          {#each dat.blockTasks.slices as s}
+            <div class="lane" style:--pc={`var(--peer${((blockPeerColor.get(s.peer) ?? 0) % 8) + 1})`}>
+              <span class="lane-name mono">{s.peer}{#if s.syncNode}<span class="lane-star" title="sync node"> ★</span>{/if}</span>
+              <div class="lane-bar" aria-hidden="true">
+                <span class="lane-done hi" style:width={`${s.pct}%`}></span>
+                {#if s.inFlight > 0}<span class="lane-inflight" style:width={`${Math.min(100 - s.pct, 12)}%`} style:left={`${s.pct}%`}></span>{/if}
+              </div>
+              <span class="lane-vals mono" translate="no">{fmt(s.start)}→{fmt(s.end)} · {s.pct.toFixed(0)}%</span>
+              {#if detail}
+                <span class="lane-time mono" title="in-flight / last block at">{s.inFlight}↕ · {s.lastActiveAt ? fmtAgo(s.lastActiveAt) : "—"}</span>
+              {/if}
             </div>
-            <span class="lane-vals mono" translate="no">{fmt(s.start)}→{fmt(s.end)} · {s.pct.toFixed(0)}%</span>
-            {#if detail}
-              <span class="lane-time mono" title="in-flight / last block at">{s.inFlight}↕ · {s.lastActiveAt ? fmtAgo(s.lastActiveAt) : "—"}</span>
-            {/if}
-          </div>
-        {/each}
-        <p class="legend mono" aria-hidden="true">▓ downloaded  ░ in-flight</p>
+          {/each}
+        </div>
+        <dl class="kv">
+          <div><dt>{t("int.hdr_window_start")}</dt><dd class="mono" translate="no">{fmt(winLeft())} → {fmt(winRight())}</dd></div>
+          <div><dt>{t("int.requested_blocks")}</dt><dd class="mono" translate="no">{fmt(dat.blockTasks.total)}</dd></div>
+          <div><dt>{t("int.last_reissue")}</dt><dd class="mono">{lastBlockAssign() > 0 ? fmtAgo(lastBlockAssign()) : "—"}</dd></div>
+        </dl>
       </div>
 
       <div class="card">
@@ -491,21 +539,39 @@
                     ></span>
                   {/key}
                 </div>
-                <span class="lane-vals mono" translate="no">{fmt(l.start)}→{fmt(l.end)} · {l.received ? "100%" : `${l.pct.toFixed(0)}%`}</span>
+                <span class="lane-vals mono" translate="no">{fmt(l.start)}→{fmt(l.end)}</span>
               </div>
             {/each}
           </div>
         {/if}
         <dl class="kv">
           <div><dt>{t("int.hdr_window_start")}</dt><dd class="mono" translate="no">{fmt(hdrLeft())} → {fmt(hdrRight())}</dd></div>
-          <div><dt>{t("int.requested_blocks")}</dt><dd class="mono" translate="no">{fmt(dat.headerTasks.requestedBlocks)}</dd></div>
+          <div><dt>{t("int.requested_headers")}</dt><dd class="mono" translate="no">{fmt(Math.max(0, dat.headerBoundary - dat.headerTip))}</dd></div>
           <div><dt>{t("int.last_reissue")}</dt><dd class="mono">{fmtAgo(dat.headerTasks.lastReissueAt)}</dd></div>
         </dl>
       </div>
     </div>
 
-    <!-- mem + debug -->
-    <div class="two">
+    <!-- speed + mem -->
+    <div class="mem-zone">
+      <div class="card">
+        <div class="card-head">
+          <span class="h-card">{t("int.window_speed")}</span>
+          <span class="corner">
+            <select aria-label={t("int.options")} bind:value={metric}>
+              <option value="height">{t("int.height")}</option>
+              <option value="boundary">{t("int.boundary")}</option>
+            </select>
+          </span>
+        </div>
+        <div class="speed-bars" aria-hidden="true">
+          {#each bars as h}
+            <span class="bar" style:height={`${h}px`}></span>
+          {/each}
+        </div>
+        <p class="speed-cap mono">▲ {t("int.blocks_per_s", { n: fmt(Math.round(rate.v)) })} · {t("int.eta", { eta: etaText(rate.etaMin) })}</p>
+      </div>
+
       <div class="card">
         <div class="card-head"><span class="h-card">{t("int.memory")}</span></div>
         <dl class="kv">
@@ -514,33 +580,6 @@
           <div><dt>{t("int.inflight")}</dt><dd class="mono" translate="no">{fmt(dat.mem.inflight)} bl</dd></div>
         </dl>
         <div class="mem-bar" aria-hidden="true"><span style:width={`${dat.mem.gap > 0 ? Math.min(100, (dat.mem.window / dat.mem.gap) * 100) : 100}%`}></span></div>
-      </div>
-
-      <div class="card">
-        <div class="card-head">
-          <span class="h-card">{t("int.debug_level")}</span>
-          <span class="chip mono" translate="no">{dat.debugLevel}</span>
-        </div>
-        <div class="debug-row">
-          <label class="field-label" for="dbg">{t("int.current")}: {debug}</label>
-          <select id="dbg" value={debug} onchange={applyDebug}>
-            <option>info</option>
-            <option>debug</option>
-            <option>trace</option>
-            <option>warn</option>
-            <option>off</option>
-          </select>
-          <label class="field-label" for="dbgapply">{t("g.apply")}</label>
-        </div>
-        <div class="quick-row">
-          {#each ["debug", "trace", "info", "warn", "off"] as q}
-            <button class="btn btn-ghost se" onclick={() => { debug = q; Services.setDebugLevel(q); }}>{q}</button>
-          {/each}
-        </div>
-        <label class="check">
-          <input type="checkbox" bind:checked={detail} onchange={() => poll()} />
-          <span>{t("int.details")} — <span class="dim">{t("int.trace_hint")}</span></span>
-        </label>
       </div>
     </div>
   {:else}
@@ -618,6 +657,11 @@
     border: 1px solid color-mix(in srgb, var(--pc) 45%, transparent);
     border-radius: 5px;
     overflow: hidden;
+    transition:
+      left 1.5s cubic-bezier(0.22, 1, 0.36, 1),
+      width 1.5s cubic-bezier(0.22, 1, 0.36, 1),
+      background 0.4s,
+      border-color 0.4s;
   }
   .ws.accent {
     box-shadow: 0 0 0 1px var(--pc);
@@ -830,6 +874,14 @@
     margin-top: 10px;
     border-top: 1px solid var(--line);
   }
+  .block-lanes {
+    margin-top: 10px;
+    border-top: 1px solid var(--line);
+    padding-top: 6px;
+  }
+  .block-lanes .lane {
+    padding: 9px 0;
+  }
   .lane-name {
     color: var(--ink-dim);
     overflow: hidden;
@@ -898,9 +950,27 @@
     text-align: right;
   }
   .legend {
-    margin: 8px 0 0;
+    margin: 0;
     font-size: 11px;
     color: var(--ink-dim);
+  }
+  .legend-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  .btn.se {
+    padding: 4px 10px;
+    min-height: 28px;
+    font-size: 12px;
+    font-weight: 500;
+  }
+  .btn.se.on {
+    border-color: var(--mint);
+    color: var(--mint);
+    background: rgba(3, 152, 118, 0.08);
   }
 
   .kv {
@@ -921,6 +991,11 @@
     font-size: 13px;
   }
 
+  .mem-zone {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+  }
   .mem-bar {
     height: 8px;
     border-radius: 4px;
@@ -933,41 +1008,7 @@
     height: 100%;
     background: var(--straw);
     border-radius: 4px;
-  }
-
-  .debug-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
-  .debug-row .field-label {
-    margin: 0;
-  }
-  .quick-row {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    margin: 10px 0;
-  }
-  .btn.se {
-    padding: 4px 10px;
-    min-height: 28px;
-    font-size: 12px;
-  }
-  .check {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 13px;
-    cursor: pointer;
-  }
-  .check input {
-    accent-color: var(--straw);
-  }
-  .dim {
-    color: var(--ink-dim);
-  }
+    }
 
   @media (max-width: 760px) {
     .two {

@@ -140,6 +140,7 @@
   "int.quick": "Rapida",
   "int.ranges": "{n} intervalli",
   "int.requested_blocks": "Blocchi da scaricare",
+  "int.requested_headers": "Intestazioni da scaricare",
   "int.resident": "Conservazione finestra ~{n}k×righe",
   "int.retain": "Ritenzione della finestra",
   "int.task_segments": "Segmenti attività: {n}×{len}",

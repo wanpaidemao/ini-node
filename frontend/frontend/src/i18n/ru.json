@@ -140,6 +140,7 @@
   "int.quick": "Быстро",
   "int.ranges": "{n} диапазонов",
   "int.requested_blocks": "Блоки для загрузки",
+  "int.requested_headers": "Заголовки для загрузки",
   "int.resident": "Удержание окна ~{n}k×строк",
   "int.retain": "Удержание окна",
   "int.task_segments": "Сегменты задач: {n}×{len}",

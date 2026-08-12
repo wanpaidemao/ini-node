@@ -140,6 +140,7 @@
   "int.quick": "快捷",
   "int.ranges": "{n} 段",
   "int.requested_blocks": "待下载区块",
+  "int.requested_headers": "待下载区块头",
   "int.resident": "窗口驻留 ~{n}k×行",
   "int.retain": "窗口驻留",
   "int.task_segments": "任务分块: {n}×{len}",

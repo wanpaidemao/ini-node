@@ -140,6 +140,7 @@
   "int.quick": "Quick",
   "int.ranges": "{n} ranges",
   "int.requested_blocks": "Blocks to download",
+  "int.requested_headers": "Headers to download",
   "int.resident": "Window retention ~{n}k×rows",
   "int.retain": "Window retention",
   "int.task_segments": "Task segments: {n}×{len}",

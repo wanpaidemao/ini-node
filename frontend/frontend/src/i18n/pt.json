@@ -140,6 +140,7 @@
   "int.quick": "Rápido",
   "int.ranges": "{n} faixas",
   "int.requested_blocks": "Blocos a baixar",
+  "int.requested_headers": "Cabeçalhos a baixar",
   "int.resident": "Retenção da janela ~{n}k×linhas",
   "int.retain": "Retenção da janela",
   "int.task_segments": "Segmentos de tarefa: {n}×{len}",
