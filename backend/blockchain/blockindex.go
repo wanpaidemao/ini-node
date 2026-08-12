@@ -19,6 +19,18 @@ import (
 // blockStatus is a bit field representing the validation state of the block.
 type blockStatus byte
 
+// blockWorkPool recycles the big.Int work sums stored on block nodes.  A node's
+// work sum never aliases another node's value: initBlockNode computes it into
+// its own big.Int from the parent's value, so recycling the values is free of
+// side effects.
+var blockWorkPool sync.Pool
+
+// blockNodePool recycles block node structs that have been evicted from the
+// in-memory block index and both chain views.  Reuse avoids per-header
+// allocation and GC churn during the initial sync.  See evictWindow for the
+// invariants that make returning a node to the pool safe.
+var blockNodePool sync.Pool
+
 const (
 	// statusDataStored indicates that the block's payload is stored on disk.
 	statusDataStored blockStatus = 1 << iota
@@ -126,10 +138,18 @@ type blockNode struct {
 // This function is NOT safe for concurrent access.  It must only be called when
 // initially creating a node.
 func initBlockNode(node *blockNode, blockHeader *wire.BlockHeader, parent *blockNode) {
+	// Recycle a work sum big.Int from the pool instead of allocating one per
+	// node.  CalcWorkInto writes into the pooled value, so the only remaining
+	// allocations are the transient values used to compute the work.
+	ws, _ := blockWorkPool.Get().(*big.Int)
+	if ws == nil {
+		ws = new(big.Int)
+	}
+
 	*node = blockNode{
 		hash:       blockHeader.BlockHash(),
 		parentHash: blockHeader.PrevBlock,
-		workSum:    CalcWork(blockHeader.Bits),
+		workSum:    CalcWorkInto(blockHeader.Bits, ws),
 		version:    blockHeader.Version,
 		bits:       blockHeader.Bits,
 		nonce:      blockHeader.Nonce,
@@ -146,11 +166,23 @@ func initBlockNode(node *blockNode, blockHeader *wire.BlockHeader, parent *block
 
 // newBlockNode returns a new block node for the given block header and parent
 // node, calculating the height and workSum from the respective fields on the
-// parent. This function is NOT safe for concurrent access.
+// parent.  The node struct and its work sum are recycled from the pool when
+// available. This function is NOT safe for concurrent access.
 func newBlockNode(blockHeader *wire.BlockHeader, parent *blockNode) *blockNode {
-	var node blockNode
-	initBlockNode(&node, blockHeader, parent)
-	return &node
+	node, _ := blockNodePool.Get().(*blockNode)
+	if node == nil {
+		node = new(blockNode)
+	}
+
+	// A recycled node retains the work sum from its previous incarnation.
+	// Return it to the work pool before initBlockNode overwrites the struct,
+	// which would otherwise drop the last reference to the pooled value.
+	if node.workSum != nil {
+		blockWorkPool.Put(node.workSum)
+	}
+
+	initBlockNode(node, blockHeader, parent)
+	return node
 }
 
 // Equals compares all the fields of the block node except for the parent and
@@ -382,6 +414,13 @@ type blockIndex struct {
 	// resume a header sync from the last accepted header.
 	bestHeaderNode func() *blockNode
 
+	// onEvicted, when set, is invoked with every block node removed from the
+	// in-memory index by an eviction, after the nodes have been dropped from
+	// both chain views but before their structs are recycled through the
+	// node pool.  The BlockChain wires this to clear the cold-read cache,
+	// whose entries may alias an evicted node through their parent pointer.
+	onEvicted func(evicted []*blockNode)
+
 	sync.RWMutex
 
 	// windowSize, when greater than zero, bounds the in-memory block index
@@ -605,6 +644,16 @@ func (bi *blockIndex) evictWindow() {
 	// are therefore retained alongside the header window; this keeps the
 	// download hot without blowing up the memory bound, since the frontier
 	// window slides with the tip as blocks connect.
+	//
+	// Evicted nodes are collected so they can be recycled through the node
+	// pool after the chain views have been pruned below their boundaries.
+	// At that point the invariants required for safe reuse all hold: the
+	// node has been removed from the index map, it is no longer referenced
+	// by either chain view (bestHeader only spans its own window and any
+	// best-chain node was retained via the contains check), the dirty set
+	// was cleared by finishFlushLocked before eviction, and any in-window
+	// node whose parent/ancestor pointed at it was severed below.
+	var evicted []*blockNode
 	if bi.bestChainView != nil {
 		for hash, node := range bi.index {
 			if node.height < headerBoundary && !bi.bestChainView.contains(node) {
@@ -612,6 +661,7 @@ func (bi *blockIndex) evictWindow() {
 					continue
 				}
 				delete(bi.index, hash)
+				evicted = append(evicted, node)
 			}
 		}
 	} else {
@@ -621,6 +671,7 @@ func (bi *blockIndex) evictWindow() {
 					continue
 				}
 				delete(bi.index, hash)
+				evicted = append(evicted, node)
 			}
 		}
 	}
@@ -660,6 +711,26 @@ func (bi *blockIndex) evictWindow() {
 	}
 	if bi.bestHeaderView != nil {
 		bi.bestHeaderView.pruneBelow(headerBoundary)
+	}
+
+	// Recycle the evicted nodes.  The cold-read cache is cleared first (it
+	// may hold entries whose parent aliases an evicted in-memory node) so no
+	// cached node can observe a recycled struct through its parent pointer.
+	// The work sums are returned to their pool before the structs so a reuse
+	// never resurrects a pooled value as its own.  The workSum pointer is
+	// then nulled out on the struct: the value now belongs to the pool, and
+	// leaving the reference in place would cause the same big.Int to be
+	// returned to the pool twice (here and again when the struct is reused),
+	// so two live nodes could end up aliasing a single work sum.
+	if len(evicted) > 0 && bi.onEvicted != nil {
+		bi.onEvicted(evicted)
+	}
+	for _, node := range evicted {
+		if node.workSum != nil {
+			blockWorkPool.Put(node.workSum)
+			node.workSum = nil
+		}
+		blockNodePool.Put(node)
 	}
 
 	if bi.bestHeaderView != nil {

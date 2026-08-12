@@ -151,3 +151,21 @@ func CalcWork(bits uint32) *big.Int {
 	denominator := new(big.Int).Add(difficultyNum, bigOne)
 	return new(big.Int).Div(oneLsh256, denominator)
 }
+
+// CalcWorkInto calculates the work value for the given difficulty bits and
+// stores it in the provided big.Int, returning it.  Unlike CalcWork it does
+// not allocate a new big.Int for the result, which makes it suitable for
+// recycling work values through a pool.
+func CalcWorkInto(bits uint32, result *big.Int) *big.Int {
+	// Return a work value of zero if the passed difficulty bits represent
+	// a negative number. Note this should not happen in practice with valid
+	// blocks, but an invalid block could trigger it.
+	difficultyNum := CompactToBig(bits)
+	if difficultyNum.Sign() <= 0 {
+		return result.SetInt64(0)
+	}
+
+	// (1 << 256) / (difficultyNum + 1)
+	denominator := new(big.Int).Add(difficultyNum, bigOne)
+	return result.Div(oneLsh256, denominator)
+}

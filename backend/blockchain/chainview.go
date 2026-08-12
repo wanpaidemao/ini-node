@@ -43,9 +43,17 @@ func fastLog2Floor(n uint32) uint8 {
 // The chain view for the branch ending in 6a consists of:
 //
 //	genesis -> 1 -> 2 -> 3 -> 4a -> 5a -> 6a
+//
+// When the in-memory header window is active the view only materializes the
+// most recent part of the chain.  base is the absolute height of the node
+// stored at index zero of the nodes slice, so the slice covers the absolute
+// heights [base, base+len(nodes)).  Pruning the view (see pruneBelow) drops the
+// prefix below the window and advances base, which keeps the backing array
+// sized to the window rather than to the full chain height.
 type chainView struct {
 	mtx   sync.Mutex
 	nodes []*blockNode
+	base  int32
 }
 
 // newChainView returns a new chain view for the given tip block node.  Passing
@@ -58,9 +66,13 @@ func newChainView(tip *blockNode) *chainView {
 	return &c
 }
 
-// genesis returns the genesis block for the chain view.  This only differs from
-// the exported version in that it is up to the caller to ensure the lock is
-// held.
+// genesis returns the oldest block retained by the chain view.  This only
+// differs from the exported version in that it is up to the caller to ensure
+// the lock is held.
+//
+// When the view is not windowed this is the true genesis block; when the
+// in-memory header window is active it is the window boundary anchor instead,
+// which is the lowest height the view can resolve.
 //
 // This function MUST be called with the view mutex locked (for reads).
 func (c *chainView) genesis() *blockNode {
@@ -107,28 +119,38 @@ func (c *chainView) Tip() *blockNode {
 
 // setTip sets the chain view to use the provided block node as the current tip
 // and ensures the view is consistent by populating it with the nodes obtained
-// by walking backwards all the way to genesis block as necessary.  Further
-// calls will only perform the minimum work needed, so switching between chain
-// tips is efficient.  This only differs from the exported version in that it is
-// up to the caller to ensure the lock is held.
+// by walking backwards through the retained window as necessary.  Further calls
+// will only perform the minimum work needed, so switching between chain tips is
+// efficient.  This only differs from the exported version in that it is up to
+// the caller to ensure the lock is held.
 //
 // This function MUST be called with the view mutex locked (for writes).
 func (c *chainView) setTip(node *blockNode) {
 	if node == nil {
 		// Keep the backing array around for potential future use.
 		c.nodes = c.nodes[:0]
+		c.base = 0
 		return
 	}
 
-	// Create or resize the slice that will hold the block nodes to the
-	// provided tip height.  When creating the slice, it is created with
-	// some additional capacity for the underlying array as append would do
-	// in order to reduce overhead when extending the chain later.  As long
-	// as the underlying array already has enough capacity, simply expand or
-	// contract the slice accordingly.  The additional capacity is chosen
-	// such that the array should only have to be extended about once a
-	// week.
-	needed := node.height + 1
+	// A tip below the materialized window base cannot be represented by the
+	// view.  This should never happen for the views maintained by the chain
+	// (tips are always extensions of, or reorganizations near, the current
+	// tip), but guard against it so a walk can never index a negative
+	// offset.
+	if node.height < c.base {
+		return
+	}
+
+	// Create or resize the slice that will hold the block nodes for the
+	// window from the view base through the provided tip height.  When
+	// creating the slice, it is created with some additional capacity for
+	// the underlying array as append would do in order to reduce overhead
+	// when extending the chain later.  As long as the underlying array
+	// already has enough capacity, simply expand or contract the slice
+	// accordingly.  The additional capacity is chosen such that the array
+	// should only have to be extended about once a week.
+	needed := node.height - c.base + 1
 	if int32(cap(c.nodes)) < needed {
 		nodes := make([]*blockNode, needed, needed+approxNodesPerWeek)
 		copy(nodes, c.nodes)
@@ -141,8 +163,8 @@ func (c *chainView) setTip(node *blockNode) {
 		}
 	}
 
-	for node != nil && c.nodes[node.height] != node {
-		c.nodes[node.height] = node
+	for node != nil && node.height >= c.base && c.nodes[node.height-c.base] != node {
+		c.nodes[node.height-c.base] = node
 		node = node.parent
 	}
 }
@@ -167,33 +189,46 @@ func (c *chainView) SetTip(node *blockNode) {
 // unreachable from the view and can be garbage collected once they are also
 // removed from the block index.
 //
+// The retained window is compacted to the front of the backing array and the
+// view base is advanced, so the array only needs to cover the in-memory window
+// rather than the full chain height.
+//
 // This only differs from the exported version in that it is up to the caller
 // to ensure the lock is held.
 //
 // This function MUST be called with the view mutex locked (for writes).
 func (c *chainView) pruneBelow(height int32) {
-	if height < 0 {
+	// The requested boundary sits at or below the current window base, so
+	// every height below it has already been dropped.
+	if height <= c.base {
 		return
 	}
-	if height > int32(len(c.nodes)) {
-		height = int32(len(c.nodes))
-	}
 
-	// Nil out the slots below the boundary so the view no longer references
-	// the evicted nodes.
-	for i := int32(0); i < height; i++ {
-		c.nodes[i] = nil
+	// Drop every height strictly below the provided height.  When the
+	// boundary reaches or passes the tip, the view is left empty.
+	drop := height - c.base
+	if drop >= int32(len(c.nodes)) {
+		c.nodes = c.nodes[:0]
+		c.base = height
+		return
 	}
 
 	// Sever the parent and ancestor of the node that now sits at the window
 	// boundary so upward walks terminate there and so the evicted prefix of
 	// the chain is not kept alive through those back-references.
-	if height < int32(len(c.nodes)) {
-		if node := c.nodes[height]; node != nil {
-			node.parent = nil
-			node.ancestor = nil
-		}
+	if node := c.nodes[drop]; node != nil {
+		node.parent = nil
+		node.ancestor = nil
 	}
+
+	// Compact the retained window to the front of the backing array and
+	// advance the view base.  Reallocating the array to the retained size
+	// also releases the memory that previously covered the evicted prefix.
+	retained := int32(len(c.nodes)) - drop
+	nodes := make([]*blockNode, retained, retained+approxNodesPerWeek)
+	copy(nodes, c.nodes[drop:])
+	c.nodes = nodes
+	c.base = height
 }
 
 // PruneBelow drops every node strictly below the provided height from the
@@ -214,7 +249,11 @@ func (c *chainView) PruneBelow(height int32) {
 //
 // This function MUST be called with the view mutex locked (for reads).
 func (c *chainView) height() int32 {
-	return int32(len(c.nodes) - 1)
+	if len(c.nodes) == 0 {
+		return -1
+	}
+
+	return c.base + int32(len(c.nodes)) - 1
 }
 
 // Height returns the height of the tip of the chain view.  It will return -1 if
@@ -235,11 +274,11 @@ func (c *chainView) Height() int32 {
 //
 // This function MUST be called with the view mutex locked (for reads).
 func (c *chainView) nodeByHeight(height int32) *blockNode {
-	if height < 0 || height >= int32(len(c.nodes)) {
+	if height < c.base || height >= c.base+int32(len(c.nodes)) {
 		return nil
 	}
 
-	return c.nodes[height]
+	return c.nodes[height-c.base]
 }
 
 // NodeByHeight returns the block node at the specified height.  Nil will be
@@ -443,9 +482,16 @@ func (c *chainView) blockLocator(node *blockNode) BlockLocator {
 		// When the node is in the current chain view, all of its
 		// ancestors must be too, so use a much faster O(1) lookup in
 		// that case.  Otherwise, fall back to walking backwards through
-		// the nodes of the other chain to the correct ancestor.
+		// the nodes of the other chain to the correct ancestor.  An
+		// ancestor that falls below the retained window terminates the
+		// locator, mirroring the historical behavior of stopping at the
+		// oldest materialized node.
 		if c.contains(node) {
-			node = c.nodes[height]
+			if height >= c.base {
+				node = c.nodes[height-c.base]
+			} else {
+				node = nil
+			}
 		} else {
 			node = node.Ancestor(height)
 		}

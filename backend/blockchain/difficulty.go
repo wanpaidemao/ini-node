@@ -101,6 +101,13 @@ func CalcWork(bits uint32) *big.Int {
 	return workmath.CalcWork(bits)
 }
 
+// CalcWorkInto calculates the work value for the given difficulty bits and
+// stores it in the provided big.Int, returning it.  This avoids the allocation
+// performed by CalcWork when the caller wants to recycle the work value.
+func CalcWorkInto(bits uint32, result *big.Int) *big.Int {
+	return workmath.CalcWorkInto(bits, result)
+}
+
 // calcEasiestDifficulty calculates the easiest possible difficulty that a block
 // can have given starting difficulty bits and a duration.  It is mainly used to
 // verify that claimed proof of work by a block is sane as compared to a

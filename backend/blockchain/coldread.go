@@ -67,6 +67,17 @@ func (c *coldNodeCache) put(node *blockNode) {
 	}
 }
 
+// reset drops every cached cold node.  The BlockChain invokes it after each
+// window eviction because a cached node may alias an evicted in-memory node
+// through its parent pointer, and once that parent is recycled through the
+// block node pool it would reference a node representing a different block.
+func (c *coldNodeCache) reset() {
+	c.Lock()
+	c.order = c.order[:0]
+	c.nodes = make(map[chainhash.Hash]*blockNode)
+	c.Unlock()
+}
+
 // materializeColdNode builds a temporary block node for the provided hash by
 // reading the two-hop block index, without touching the block file.  It returns
 // nil when the hash is not indexed.
@@ -157,11 +168,19 @@ func (b *BlockChain) materializeColdNodeWithTx(hash *chainhash.Hash,
 
 	// Resolve a parent when it is still present in the in-memory index so the
 	// node behaves like a regular server node as far as possible.
-	if parent := b.index.LookupNode(&node.parentHash); parent != nil {
+	//
+	// The parent lookup and the cache insertion are performed under the index
+	// read lock so a concurrent window eviction (which holds the index write
+	// lock through both the index sweep and the node recycling) can never
+	// recycle the parent between the lookup and the insertion.  Without this
+	// the cached node could alias a recycled struct through its parent
+	// pointer.
+	b.index.RLock()
+	if parent := b.index.index[node.parentHash]; parent != nil {
 		node.parent = parent
 	}
-
 	b.coldCache.put(node)
+	b.index.RUnlock()
 	return node
 }
 

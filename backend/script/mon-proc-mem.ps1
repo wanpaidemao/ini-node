@@ -28,7 +28,7 @@ function Invoke-Rpc([string]$method) {
     $body = "{`"jsonrpc`":`"1.0`",`"id`":`"x`",`"method`":`"$method`"}"
     $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$RpcUser`:$RpcPass"))
     try {
-        $req = [System.Net.HttpWebRequest]::Create("https://127.0.0.1:$RpcPort/")
+        $req = [System.Net.HttpWebRequest]::Create("http://127.0.0.1:$RpcPort/")
         $req.Method = 'POST'
         $req.ContentType = 'application/json'
         $req.Accept = 'application/json'

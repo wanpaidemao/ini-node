@@ -1710,11 +1710,13 @@ func (b *BlockChain) initChainState() error {
 			if parent == nil && i > 0 {
 				// Seed the boundary anchor with the cumulative work of the
 				// entire chain up to and including this row, and fix its
-				// height since its parent is not materialized.
+				// height since its parent is not materialized.  The work
+				// sum value already allocated by initBlockNode is reused
+				// rather than replaced so it stays recycled through the
+				// block work pool.
 				node.height = i
 				if runningWorkSum != nil {
-					node.workSum = new(big.Int).Add(runningWorkSum,
-						CalcWork(header.Bits))
+					node.workSum = node.workSum.Add(runningWorkSum, node.workSum)
 				}
 			}
 			node.status = status
@@ -1744,6 +1746,17 @@ func (b *BlockChain) initChainState() error {
 			}
 		}
 		b.bestHeader.SetTip(headerTip)
+
+		// Compact both views down to the in-memory header window.  The tip
+		// installation above sizes each backing array to the full chain
+		// height (the views are only populated with the materialized
+		// window, but the array capacity covers everything below it), so
+		// prune immediately to release the memory that would otherwise be
+		// retained for the entire process lifetime.
+		if b.headerWindow > 0 {
+			b.bestChain.PruneBelow(b.index.windowBoundary(int32(state.height)))
+			b.bestHeader.PruneBelow(b.index.windowBoundary(headerTip.height))
+		}
 
 		// Determine whether the persisted height-to-hash index already covers
 		// the best header chain.  Databases created before the height index

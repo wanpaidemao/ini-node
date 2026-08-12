@@ -1048,3 +1048,69 @@ func solveYespower(header *wire.BlockHeader) {
 		}
 	}
 }
+
+// TestBlockNodePoolReuse verifies that a block node recycled through the pool
+// is fully re-initialized: no stale parent, height, status, hash or work sum
+// from its previous incarnation leaks into the new node.
+func TestBlockNodePoolReuse(t *testing.T) {
+	// Build a two-node chain so the child carries a non-trivial cumulative
+	// work sum and a parent pointer.
+	parentHeader := &wire.BlockHeader{Bits: 0x1f00ffff}
+	parent := newBlockNode(parentHeader, nil)
+	childHeader := &wire.BlockHeader{
+		PrevBlock: parent.hash,
+		Bits:      0x1f00ffff,
+	}
+	child := newBlockNode(childHeader, parent)
+	if child.parent != parent || child.height != 1 {
+		t.Fatalf("unexpected child node: parent=%v height=%d", child.parent,
+			child.height)
+	}
+	parentWork := new(big.Int).Set(parent.workSum)
+	childWork := new(big.Int).Set(child.workSum)
+	if childWork.Cmp(parentWork) <= 0 {
+		t.Fatalf("expected child cumulative work to exceed parent's")
+	}
+
+	// Recycle the child node and its work sum through the pools, exactly as
+	// evictWindow does for evicted nodes.  Save the child's identity first:
+	// the recycled struct is the same memory that a pooled node will later
+	// reuse, so the comparison must be against these saved values.
+	childHash := child.hash
+	blockWorkPool.Put(child.workSum)
+	blockNodePool.Put(child)
+
+	// Allocate a fresh header-only node.  Whether or not the pool happens to
+	// hand back the recycled struct, the resulting node must be fully
+	// initialized from the new header.
+	freshHeader := &wire.BlockHeader{Version: 3}
+	fresh := newBlockNode(freshHeader, nil)
+	if fresh.height != 0 {
+		t.Fatalf("unexpected height %d, want 0", fresh.height)
+	}
+	if fresh.parent != nil {
+		t.Fatalf("expected nil parent on the fresh node")
+	}
+	if fresh.status != statusNone {
+		t.Fatalf("expected reset status, got %v", fresh.status)
+	}
+	if fresh.hash == childHash {
+		t.Fatalf("expected a distinct hash for the fresh node")
+	}
+	if fresh.workSum.Sign() != 0 {
+		t.Fatalf("expected zero work sum for the fresh node, got %v",
+			fresh.workSum)
+	}
+
+	// A fresh child of a fresh parent must reproduce the exact work sum a
+	// non-recycled node would compute.
+	freshParent := newBlockNode(parentHeader, nil)
+	freshChild := newBlockNode(&wire.BlockHeader{
+		PrevBlock: freshParent.hash,
+		Bits:      0x1f00ffff,
+	}, freshParent)
+	if freshChild.workSum.Cmp(childWork) != 0 {
+		t.Fatalf("expected work sum %v, got %v", childWork,
+			freshChild.workSum)
+	}
+}

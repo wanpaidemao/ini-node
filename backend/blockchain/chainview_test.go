@@ -413,6 +413,95 @@ testLoop:
 	}
 }
 
+// TestChainViewWindow ensures pruneBelow compacts the backing array down to the
+// retained window rather than keeping it sized to the full chain height, and
+// that the view stays consistent across compaction, no-op prunes, and
+// extension of the tip afterwards.
+func TestChainViewWindow(t *testing.T) {
+	// Build a synthetic chain of 1000 nodes.
+	nodes := chainedNodes(nil, 1000)
+	tip := nodes[len(nodes)-1]
+
+	view := newChainView(tip)
+	if view.Height() != 999 {
+		t.Fatalf("unexpected height %d, want 999", view.Height())
+	}
+
+	// Prune everything below height 900.  The tip is preserved and the
+	// backing array is compacted to the 100 retained slots.
+	view.pruneBelow(900)
+	if view.Height() != 999 {
+		t.Fatalf("unexpected height after prune %d, want 999", view.Height())
+	}
+	if view.base != 900 {
+		t.Fatalf("unexpected view base %d, want 900", view.base)
+	}
+	if len(view.nodes) != 100 {
+		t.Fatalf("unexpected window length %d, want 100", len(view.nodes))
+	}
+
+	// Heights below the window are unresolvable, heights inside are
+	// retained, and pruned nodes are no longer contained.
+	if view.nodeByHeight(899) != nil {
+		t.Fatalf("expected height 899 to be pruned")
+	}
+	if got := view.nodeByHeight(900); got != nodes[900] {
+		t.Fatalf("expected height 900 to map to nodes[900]")
+	}
+	if got := view.nodeByHeight(999); got != tip {
+		t.Fatalf("expected height 999 to map to the tip")
+	}
+	if !view.Contains(nodes[950]) || !view.Contains(tip) {
+		t.Fatalf("expected in-window nodes to be contained")
+	}
+	if view.Contains(nodes[899]) || view.Contains(nodes[0]) {
+		t.Fatalf("expected pruned nodes to not be contained")
+	}
+
+	// The boundary node has a severed parent so upward walks terminate.
+	if n := view.nodeByHeight(900); n == nil || n.parent != nil {
+		t.Fatalf("expected boundary node with severed parent")
+	}
+
+	// A prune at or below the current base is a no-op.
+	view.pruneBelow(500)
+	if view.base != 900 || len(view.nodes) != 100 {
+		t.Fatalf("expected no-op prune to leave the view unchanged")
+	}
+	view.pruneBelow(900)
+	if view.base != 900 || len(view.nodes) != 100 {
+		t.Fatalf("expected no-op prune to leave the view unchanged")
+	}
+
+	// Extending the tip after compaction grows the view from the base and
+	// keeps every retained height resolvable.
+	ext := chainedNodes(tip, 10)
+	newTip := ext[9]
+	view.setTip(newTip)
+	if view.Height() != 1009 {
+		t.Fatalf("unexpected height after extension %d, want 1009",
+			view.Height())
+	}
+	if len(view.nodes) != 110 {
+		t.Fatalf("unexpected window length after extension %d, want 110",
+			len(view.nodes))
+	}
+	if view.nodeByHeight(900) != nodes[900] {
+		t.Fatalf("expected height 900 to stay resolvable after extension")
+	}
+	if got := view.nodeByHeight(1009); got != newTip {
+		t.Fatalf("expected height 1009 to map to the new tip")
+	}
+
+	// Setting the tip to nil resets the view base so a fresh instance can
+	// cover a full chain again from height 0.
+	view.setTip(nil)
+	if view.base != 0 || len(view.nodes) != 0 || view.Height() != -1 {
+		t.Fatalf("unexpected view after nil tip: base=%d len=%d height=%d",
+			view.base, len(view.nodes), view.Height())
+	}
+}
+
 // TestChainViewNil ensures that creating and accessing a nil chain view behaves
 // as expected.
 func TestChainViewNil(t *testing.T) {

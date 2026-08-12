@@ -155,6 +155,10 @@ type BlockChain struct {
 	// Protected by chainLock.
 	headerFlushCount int32
 
+	// lastFreeOSMemory is the time of the last debug.FreeOSMemory call used
+	// to coalesce forced GCs during the initial sync.  Protected by chainLock.
+	lastFreeOSMemory time.Time
+
 	// headerWindow is the number of recent headers/blocks kept in memory at
 	// the tips of the best chain and best header chain.  When zero, the full
 	// block index is retained in memory (historical behavior).  Protected by
@@ -1473,7 +1477,10 @@ func (b *BlockChain) FlushBlockIndex() error {
 	b.chainLock.Lock()
 	defer b.chainLock.Unlock()
 
-	return b.index.flushToDB(false)
+	// forceEvict so an explicit flush always trims the in-memory index back
+	// to the header window instead of deferring eviction to the throttled
+	// counter, which may be far from its trigger point.
+	return b.index.flushToDB(true)
 }
 
 // BestChainHeaderForkHeight returns the height of the fork point between the
@@ -2502,6 +2509,14 @@ func New(config *Config) (*BlockChain, error) {
 	// state alongside the block index writes.
 	b.index.bestHeaderNode = func() *blockNode {
 		return b.bestHeader.Tip()
+	}
+
+	// Clear the cold-read cache whenever window eviction recycles block nodes
+	// so no cached cold node can alias a recycled struct through its parent
+	// pointer.  The evicted nodes are the only source of recycled structs, so
+	// the entries referencing them are exactly the ones that must be dropped.
+	b.index.onEvicted = func(evicted []*blockNode) {
+		b.coldCache.reset()
 	}
 
 	// Adopt the header window and wire the window management hooks so the

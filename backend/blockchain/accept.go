@@ -6,6 +6,8 @@ package blockchain
 
 import (
 	"fmt"
+	"runtime/debug"
+	"time"
 
 	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
@@ -17,12 +19,36 @@ import (
 // before the block index is flushed to the database during header sync.
 // Batching bounds the amount of work re-downloaded after a restart to at most
 // this many headers.
-const headerFlushBatchSize = 10000
+const headerFlushBatchSize = 20000
 
 // blockFlushBatchSize is the number of blocks to connect before flushing the
 // block index to the database during block sync.  Batching bounds the amount
 // of work re-processed after a restart to at most this many blocks.
 const blockFlushBatchSize = 1000
+
+// freeOSMemoryMinInterval is the minimum time that must elapse between
+// debug.FreeOSMemory calls.  During header sync a batch flush can complete in
+// well under this interval, so without coalescing the forced GC would run far
+// more often than necessary.
+const freeOSMemoryMinInterval = 15 * time.Second
+
+// freeOSMemory runs a garbage collection and returns the reclaimed heap arena
+// memory to the operating system.  It is invoked after each batched header
+// flush during the initial sync, when the windowed block index allocates and
+// releases the bulk of its block nodes; without it the Go heap arena retains
+// the high-water mark and RSS stays far above the live heap.  The call runs
+// asynchronously so the batch flush does not block on the STW, and the result
+// is coalesced to once per freeOSMemoryMinInterval.
+//
+// This function MUST be called with the chain lock held (for writes).
+func (b *BlockChain) freeOSMemory() {
+	now := time.Now()
+	if now.Sub(b.lastFreeOSMemory) < freeOSMemoryMinInterval {
+		return
+	}
+	b.lastFreeOSMemory = now
+	go debug.FreeOSMemory()
+}
 
 // maybeAcceptBlock potentially accepts a block into the block chain and, if
 // accepted, returns whether or not it is on the main chain.  It performs
@@ -311,6 +337,9 @@ func (b *BlockChain) maybeAcceptBlockHeader(header *wire.BlockHeader,
 		if err != nil {
 			return false, err
 		}
+		// Return the Go heap arena memory back to the OS now that the bulk
+		// of the windowed block index has been released.  See freeOSMemory.
+		b.freeOSMemory()
 	}
 
 	return isMainChain, nil
