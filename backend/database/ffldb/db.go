@@ -2165,6 +2165,23 @@ const defaultCompactionTotalSize = 128 * 1024 * 1024 // 128 MB
 // so each new random key is rewritten only a handful of times on its way down.
 const defaultCompactionTotalSizeMultiplier = 10.0
 
+// defaultBlockCacheCapacity is the capacity of the leveldb sorted-table block
+// cache.  goleveldb's default is only 8 MiB, which is far smaller than the
+// working set of the metadata database during a block sync, so every random
+// point read (UTXO, spend journal, CF inputs, index navigation) re-reads the
+// same table index, bloom, and data blocks over and over.  This raised value
+// holds all tables' index+filter blocks plus the hot data blocks in memory,
+// collapsing that repeat-read volume while leaving enough headroom on the
+// machine's RAM for the header window.
+const defaultBlockCacheCapacity = 320 * 1024 * 1024 // 320 MB
+
+// defaultOpenFilesCacheCapacity is the capacity of the leveldb open-files (SST
+// reader) cache.  goleveldb's default of 500 is smaller than the number of
+// sorted tables the metadata database accumulates, so files are repeatedly
+// reopened as the read working set shifts.  This value keeps every table's
+// reader open, removing the open/close churn.
+const defaultOpenFilesCacheCapacity = 4096
+
 // openDB opens the database at the provided path.  database.ErrDbDoesNotExist
 // is returned if the database doesn't exist and the create flag is not set.
 func openDB(dbPath string, network wire.BitcoinNet, create bool) (database.DB, error) {
@@ -2193,6 +2210,8 @@ func openDB(dbPath string, network wire.BitcoinNet, create bool) (database.DB, e
 		WriteBuffer:            defaultWriteBuffer,
 		CompactionTableSize:    defaultCompactionTableSize,
 		CompactionTotalSize:    defaultCompactionTotalSize,
+		BlockCacheCapacity:     defaultBlockCacheCapacity,
+		OpenFilesCacheCapacity: defaultOpenFilesCacheCapacity,
 		CompactionTotalSizeMultiplier: defaultCompactionTotalSizeMultiplier,
 		CompactionL0Trigger:    defaultL0CompactionTrigger,
 		WriteL0SlowdownTrigger: defaultWriteL0SlowdownTrigger,
