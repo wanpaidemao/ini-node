@@ -986,6 +986,53 @@ func (sm *SyncManager) blockSyncAddPeer(peer *peerpkg.Peer) {
 		peer.Addr(), len(sm.blockSync))
 }
 
+// foldExistingSyncPeers extends the parallel block download set with any peers
+// that are already connected and are sync candidates but did not take part in
+// the most recent header round.  finishHeaderSync rebuilds the participating
+// set from the header-round peers alone, which can be as small as one peer when
+// a small header catch-up restarts the download on top of a running sync.  The
+// set normally only grows when a brand new peer connects (handleNewPeerMsg),
+// so without re-folding those already-connected peers would stay idle and the
+// download would run on a fraction of the available parallelism.
+func (sm *SyncManager) foldExistingSyncPeers() {
+	if sm.blockSync == nil {
+		return
+	}
+	for peer, state := range sm.peerStates {
+		if len(sm.blockSync) >= maxHeaderSyncPeers {
+			return
+		}
+		if peer == nil || state == nil || !state.syncCandidate {
+			continue
+		}
+		if !peer.Connected() {
+			continue
+		}
+
+		// Dedup by pointer and host, mirroring blockSyncAddPeer so multiple
+		// connections to the same host count once.
+		host := peerHost(peer)
+		dup := false
+		for _, p := range sm.blockSync {
+			if p == peer {
+				dup = true
+				break
+			}
+			if host != "" && peerHost(p) == host {
+				dup = true
+				break
+			}
+		}
+		if dup {
+			continue
+		}
+
+		sm.blockSync = append(sm.blockSync, peer)
+		log.Infof("Added peer %v to the parallel block download (%d peers active)",
+			peer.Addr(), len(sm.blockSync))
+	}
+}
+
 // blkDownload tops up every participating block-download peer that has drained
 // below the minimum in-flight threshold.  Each peer owns a disjoint height slice
 // (see assignBlockSlice), so different peers request different parts of the
@@ -2132,6 +2179,14 @@ func (sm *SyncManager) finishHeaderSync() {
 		log.Infof("No peers remaining for parallel block download")
 		return
 	}
+
+	// Fold in any already-connected sync candidates that did not serve the
+	// final header round.  A header catch-up on top of a running download can
+	// restart this function with only one or two header peers; without this the
+	// remaining connected peers would never rejoin the block download (the set
+	// only grows from newPeer) and parallelism would collapse to that couple of
+	// peers until fresh connections arrived.
+	sm.foldExistingSyncPeers()
 
 	// Carve the download into disjoint per-peer slices.  The whole download
 	// is capped at maxBlockRequestWindow heights ahead of the tip (the same
