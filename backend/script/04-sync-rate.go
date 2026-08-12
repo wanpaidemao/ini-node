@@ -32,8 +32,8 @@ import (
 
 const (
 	defaultRPCPort = 8334
-	defaultRPCUser = "qYjMSzVGbXdgPJiuwxfMAp5EM3M="
-	defaultRPCPass = "dSQjlIXRW7ETYcroIhjlTqduT0A="
+	defaultRPCUser = "sugar"
+	defaultRPCPass = "sugar"
 )
 
 type options struct {
