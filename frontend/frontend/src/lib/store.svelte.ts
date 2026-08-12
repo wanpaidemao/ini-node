@@ -2,8 +2,11 @@
 // Svelte 5 runes module — reactive from anywhere, import { app } directly.
 import type { Route } from "./types";
 
+export type NavMode = "top" | "side";
+
 export const app = $state({
   route: "dashboard" as Route,
+  navMode: "top" as NavMode,
   connected: false,
   connecting: false,
   syncing: true,
@@ -27,6 +30,18 @@ export function navigate(route: Route): void {
   }
 }
 
+const NAV_KEY = "ini-node.nav";
+
+/** persist the nav layout the user picked in Settings → Appearance. */
+export function setNavMode(mode: NavMode): void {
+  app.navMode = mode;
+  try {
+    localStorage.setItem(NAV_KEY, mode);
+  } catch {
+    /* ignore */
+  }
+}
+
 // init route from location.hash (deep-linking, also enables headless screenshots)
 function initRoute(): void {
   const h = (location.hash || "").replace("#", "") as Route;
@@ -34,3 +49,14 @@ function initRoute(): void {
   if (valid.includes(h)) app.route = h;
 }
 if (typeof window !== "undefined") initRoute();
+
+// restore nav layout; top bar is the default (keeps the content column wide, and
+// leaves room for a frameless wails3 titlebar drag region later).
+if (typeof window !== "undefined") {
+  try {
+    const saved = localStorage.getItem(NAV_KEY) as NavMode | null;
+    if (saved === "top" || saved === "side") app.navMode = saved;
+  } catch {
+    /* keep default */
+  }
+}

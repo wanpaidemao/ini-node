@@ -2,7 +2,7 @@
   import { onMount, onDestroy } from "svelte";
   import { app, navigate, setConnected } from "./lib/store.svelte";
   import { Services } from "./lib/services";
-  import { t } from "./lib/i18n";
+  import { t, fmt } from "./lib/i18n";
   import type { Route } from "./lib/types";
   import Dashboard from "./pages/Dashboard.svelte";
   import Internals from "./pages/Internals.svelte";
@@ -47,19 +47,39 @@
     console: "nav.console",
   };
 
+  const menus = sections.map((s) => ({
+    title: s.title,
+    main: s.items[0],
+    items: s.items.slice(1),
+  }));
+
+  function isOnMenu(m: { main: { route: Route }; items: { route: Route }[] }): boolean {
+    return app.route === m.main.route || m.items.some((i) => i.route === app.route);
+  }
+
+  let openMenu: Route | null = $state(null);
   let collapsible = $state(false);
 
   function go(r: Route) {
     navigate(r);
   }
 
+  function connBadge() {
+    if (app.connecting) return { cls: "busy", key: "shell.connecting" };
+    if (!app.connected) return { cls: "off", key: "shell.offline" };
+    if (app.syncing) return { cls: "sync", key: "shell.syncing" };
+    return { cls: "on", key: "shell.connected" };
+  }
+
   let healthTimer: ReturnType<typeof setInterval> | undefined;
+  let navSync = $state<{ blocks: number; headers: number; rate: number } | null>(null);
 
   async function checkHealth() {
     if (!app.connected) app.connecting = true;
     try {
       const s = await Services.getSyncStatus();
       setConnected({ connected: true, syncing: s.blocks < s.headers });
+      navSync = { blocks: s.blocks, headers: s.headers, rate: s.rateBlPerSec };
     } catch {
       setConnected({ connected: false, syncing: false });
     } finally {
@@ -78,48 +98,135 @@
   <title>{t(titles[app.route])}</title>
 </svelte:head>
 
-<div class="shell" class:collapsed={collapsible}>
+<div class="shell" class:nav-top={app.navMode === "top"} class:nav-side={app.navMode !== "top"} class:collapsed={collapsible}>
   <a class="skip-link" href="#main">Skip to content</a>
 
-  <aside class="rail" class:collapsed={collapsible}>
-    <div class="rail-top">
-      <button
-        class="collapse-btn"
-        aria-label={collapsible ? "Expand navigation" : "Collapse navigation"}
-        title={collapsible ? "Expand navigation" : "Collapse navigation"}
-        onclick={() => (collapsible = !collapsible)}
+  <!-- top navigation (default): main menus with hover submenus · live node sync rail -->
+  {#if app.navMode === "top"}
+    <header class="topnav" aria-label="Main navigation">
+      <nav class="topnav-menus">
+        {#each menus as m}
+          <div
+            class="menu-wrap"
+            role="group"
+            onmouseenter={() => (openMenu = m.main.route)}
+            onmouseleave={() => (openMenu = null)}
+            onfocusin={() => (openMenu = m.main.route)}
+            onfocusout={(e) => {
+              if (!e.currentTarget.contains(e.relatedTarget as Node)) openMenu = null;
+            }}
+          >
+            <button
+              class="menu-btn"
+              class:active={isOnMenu(m)}
+              aria-current={isOnMenu(m) ? "page" : undefined}
+              aria-haspopup={m.items.length ? "menu" : undefined}
+              aria-expanded={m.items.length ? openMenu === m.main.route : undefined}
+              onclick={() => go(m.main.route)}
+              title={t(m.main.label)}
+            >
+              {t(m.main.label)}
+              {#if m.items.length}
+                <svg class="chev" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true">
+                  <polyline points="6 9 12 15 18 9" />
+                </svg>
+              {/if}
+            </button>
+            {#if m.items.length}
+              <div class="menu-drop" class:open={openMenu === m.main.route} role="menu">
+                {#each m.items as item}
+                  <button
+                    class="menu-drop-item"
+                    class:active={app.route === item.route}
+                    role="menuitem"
+                    onclick={() => go(item.route)}
+                    title={t(item.label)}
+                  >
+                    {t(item.label)}
+                  </button>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        {/each}
+      </nav>
+
+      <div
+        class="nav-sync"
+        class:on={connBadge().cls === "on"}
+        class:sync={connBadge().cls === "sync"}
+        class:off={connBadge().cls === "off"}
+        class:busy={connBadge().cls === "busy"}
+        role="status"
+        title={t(connBadge().key)}
       >
-        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
-          {#if collapsible}
-            <polyline points="9 6 15 12 9 18" />
+        <span class="nav-sync-dot" aria-hidden="true"></span>
+        <span class="nav-sync-state">{t(connBadge().key)}</span>
+        <span class="nav-sync-num mono" translate="no">
+          {#if navSync}
+            {navSync.headers > 0 ? Math.min(100, (navSync.blocks / navSync.headers) * 100).toFixed(1) : "—"}%
           {:else}
-            <polyline points="15 6 9 12 15 18" />
+            —%
           {/if}
-        </svg>
-      </button>
-    </div>
-    <nav>
-      {#each sections as section}
-        <p class="section-head">{t(section.title)}</p>
-        <ul>
-          {#each section.items as item}
-            <li>
-              <button
-                class="nav-item"
-                class:active={app.route === item.route}
-                aria-current={app.route === item.route ? "page" : undefined}
-                onclick={() => go(item.route)}
-                title={t(item.label)}
-              >
-                <span class="nav-dot" aria-hidden="true"></span>
-                <span class="nav-text">{t(item.label)}</span>
-              </button>
-            </li>
-          {/each}
-        </ul>
-      {/each}
-    </nav>
-  </aside>
+        </span>
+        <span class="nav-sync-blocks mono" translate="no" title={navSync ? `#${fmt(navSync.blocks)} / #${fmt(navSync.headers)}` : undefined}>
+          {navSync ? fmt(navSync.blocks) : "…"}
+        </span>
+        <span class="nav-sync-rate mono" translate="no">{navSync ? `${navSync.rate.toFixed(0)} bl/s` : "—"}</span>
+      </div>
+
+      <!-- signature: the chain fill — the nav is a live instrument, not a menu -->
+      <div class="chain-fill" aria-hidden="true">
+        <span
+          class="chain-fill-bar"
+          style:width={`${navSync && navSync.headers > 0 ? Math.min(100, (navSync.blocks / navSync.headers) * 100) : 0}%`}
+        ></span>
+      </div>
+    </header>
+  {/if}
+
+  <!-- side rail (optional): the classic collapsed sidebar -->
+  {#if app.navMode !== "top"}
+    <aside class="rail" class:collapsed={collapsible}>
+      <div class="rail-top">
+        <button
+          class="collapse-btn"
+          aria-label={collapsible ? "Expand navigation" : "Collapse navigation"}
+          title={collapsible ? "Expand navigation" : "Collapse navigation"}
+          onclick={() => (collapsible = !collapsible)}
+        >
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+            {#if collapsible}
+              <polyline points="9 6 15 12 9 18" />
+            {:else}
+              <polyline points="15 6 9 12 15 18" />
+            {/if}
+          </svg>
+        </button>
+      </div>
+      <nav>
+        {#each sections as section}
+          <p class="section-head">{t(section.title)}</p>
+          <ul>
+            {#each section.items as item}
+              <li>
+                <button
+                  class="nav-item"
+                  class:active={app.route === item.route}
+                  aria-current={app.route === item.route ? "page" : undefined}
+                  onclick={() => go(item.route)}
+                  title={t(item.label)}
+                >
+                  <span class="nav-dot" aria-hidden="true"></span>
+                  <span class="nav-text">{t(item.label)}</span>
+                </button>
+              </li>
+            {/each}
+          </ul>
+        {/each}
+      </nav>
+    </aside>
+  {/if}
 
   <div class="main-col">
     <header class="topbar">
@@ -157,10 +264,205 @@
     color: var(--ink-fg);
     transition: grid-template-columns 0.15s ease;
   }
+  .shell.nav-top {
+    grid-template-columns: 1fr;
+    grid-template-rows: var(--nav-h) minmax(0, 1fr);
+  }
+  .shell.nav-top.collapsed {
+    grid-template-columns: 1fr;
+  }
   .shell.collapsed {
     grid-template-columns: 48px 1fr;
   }
 
+  /* ── top navigation bar ────────────────────────── */
+  .topnav {
+    grid-row: 1;
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 0 12px 0 16px;
+    background: var(--violet);
+    border-bottom: 1px solid var(--line);
+    min-width: 0;
+  }
+  .topnav-menus {
+    display: flex;
+    align-items: stretch;
+    gap: 4px;
+    min-width: 0;
+    flex: 1;
+  }
+  .menu-wrap {
+    position: relative;
+    display: flex;
+    align-items: center;
+  }
+  .menu-btn {
+    appearance: none;
+    border: none;
+    background: none;
+    color: var(--ink-dim);
+    font-family: var(--font-body);
+    font-size: 13px;
+    font-weight: 600;
+    padding: 7px 11px;
+    border-radius: var(--r-8);
+    cursor: pointer;
+    white-space: nowrap;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    transition: background 0.12s ease, color 0.12s ease;
+    touch-action: manipulation;
+  }
+  .menu-btn .chev {
+    transition: transform 0.12s ease;
+  }
+  .menu-btn:hover {
+    background: rgba(0, 0, 0, 0.06);
+    color: var(--ink-fg);
+  }
+  .menu-btn:focus-visible {
+    outline: none;
+    box-shadow: var(--focus);
+  }
+  .menu-btn.active {
+    background: var(--violet-2);
+    color: var(--ink-fg);
+    box-shadow: inset 0 -2px 0 var(--straw);
+  }
+  .menu-btn.active .chev {
+    transform: rotate(180deg);
+  }
+
+  .menu-drop {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    min-width: 172px;
+    display: none;
+    flex-direction: column;
+    gap: 2px;
+    padding: 6px;
+    background: var(--ink);
+    border: 1px solid var(--line);
+    border-radius: var(--r-8);
+    box-shadow: var(--shadow);
+    z-index: 60;
+  }
+  .menu-drop.open {
+    display: flex;
+  }
+  .menu-drop-item {
+    appearance: none;
+    border: none;
+    background: none;
+    color: var(--ink-fg);
+    font-family: var(--font-body);
+    font-size: 13px;
+    font-weight: 500;
+    text-align: left;
+    padding: 8px 10px;
+    border-radius: var(--r-8);
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.12s ease, color 0.12s ease;
+  }
+  .menu-drop-item:hover {
+    background: var(--violet-2);
+  }
+  .menu-drop-item:focus-visible {
+    outline: none;
+    box-shadow: var(--focus);
+  }
+  .menu-drop-item.active {
+    color: var(--straw);
+  }
+
+  /* live sync readout */
+  .nav-sync {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    flex: none;
+    padding: 5px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--ink-dim);
+    border: 1px solid var(--line);
+    background: var(--ink);
+  }
+  .nav-sync-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--mist);
+    flex: none;
+  }
+  .nav-sync-num {
+    font-variant-numeric: tabular-nums;
+  }
+  .nav-sync-blocks {
+    border-left: 1px solid var(--line);
+    padding-left: 7px;
+    font-variant-numeric: tabular-nums;
+  }
+  .nav-sync-rate {
+    font-variant-numeric: tabular-nums;
+  }
+  .nav-sync.on {
+    color: var(--mint);
+    border-color: var(--mint);
+  }
+  .nav-sync.on .nav-sync-dot {
+    background: var(--mint);
+  }
+  .nav-sync.sync {
+    color: var(--honey);
+    border-color: var(--honey);
+  }
+  .nav-sync.sync .nav-sync-dot {
+    background: var(--honey);
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  .nav-sync.off .nav-sync-dot {
+    background: var(--mist);
+  }
+  .nav-sync.busy .nav-sync-dot {
+    background: var(--straw);
+  }
+
+  @keyframes pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.35;
+    }
+  }
+
+  /* sync progress strip along the bottom edge */
+  .chain-fill {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: -1px;
+    height: 3px;
+    background: rgba(0, 0, 0, 0.1);
+    pointer-events: none;
+  }
+  .chain-fill-bar {
+    display: block;
+    height: 100%;
+    background: var(--straw);
+    transition: width 0.6s ease;
+  }
+
+  /* ── side rail ────────────────────────────────── */
   .rail {
     grid-row: 1;
     background: var(--violet);
@@ -221,6 +523,7 @@
     text-transform: uppercase;
     color: var(--mist);
     margin: 16px 8px 6px;
+    font-family: var(--font-display);
   }
   ul {
     list-style: none;
@@ -269,8 +572,12 @@
   .main-col {
     grid-row: 1;
     display: grid;
-    grid-template-rows: var(--top-h) 1fr;
+    grid-template-rows: var(--top-h) minmax(0, 1fr);
     min-width: 0;
+    min-height: 0;
+  }
+  .shell.nav-top .main-col {
+    grid-row: 2;
   }
 
   .topbar {
@@ -315,6 +622,9 @@
     .shell.collapsed {
       grid-template-columns: 1fr;
     }
+    .shell.nav-top {
+      grid-template-rows: auto minmax(0, 1fr);
+    }
     .rail-top,
     .collapse-btn {
       display: none;
@@ -348,6 +658,16 @@
     }
     .main-col {
       grid-row: 2;
+    }
+    .topnav {
+      flex-wrap: wrap;
+      gap: 6px;
+      padding: 8px 10px;
+    }
+    .topnav-menus {
+      order: 3;
+      flex-basis: 100%;
+      padding-bottom: 4px;
     }
   }
 </style>

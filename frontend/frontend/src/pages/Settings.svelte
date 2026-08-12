@@ -2,8 +2,20 @@
   import { onMount } from "svelte";
   import { fmt, fmtBytes, LANG_NAMES, LANGS, setLang, t } from "../lib/i18n";
   import { Services } from "../lib/services";
-  import { app } from "../lib/store.svelte";
+  import { app, setNavMode, type NavMode } from "../lib/store.svelte";
   import type { AppConfig } from "../lib/types";
+
+  type Category = "connection" | "node" | "wallet" | "data" | "appearance";
+
+  const categories: { id: Category; label: string }[] = [
+    { id: "connection", label: t("set.connection") },
+    { id: "node", label: t("set.sync") },
+    { id: "wallet", label: t("set.wallet_display") },
+    { id: "data", label: t("set.data_logs") },
+    { id: "appearance", label: t("set.appearance") },
+  ];
+
+  let cat = $state<Category>("connection");
 
   let cfg = $state<AppConfig | null>(null);
   let test = $state<{ ok: boolean; ms: number } | null>(null);
@@ -22,6 +34,14 @@
       /* keep "—" */
     }
   });
+
+  function pickCat(c: Category) {
+    cat = c;
+  }
+
+  function pickNav(mode: NavMode) {
+    setNavMode(mode);
+  }
 
   function connBadge() {
     if (app.connecting) return { cls: "busy", key: "shell.connecting" };
@@ -97,7 +117,23 @@
     </div>
   </div>
 
+  <div class="cat-nav" role="tablist" aria-label={t("set.sections")}>
+    {#each categories as c}
+      <button
+        role="tab"
+        class="cat-btn"
+        class:active={cat === c.id}
+        aria-selected={cat === c.id}
+        onclick={() => pickCat(c.id)}
+      >
+        {c.label}
+      </button>
+    {/each}
+  </div>
+
   {#if cfg}
+    <!-- ── Connection / node ─────────────────────────── -->
+    {#if cat === "connection"}
     <div class="card">
       <div class="conn-head">
         <h2 class="h-card">{t("set.connection")}</h2>
@@ -155,7 +191,10 @@
         </button>
       </div>
     </div>
+    {/if}
 
+    <!-- ── Node / sync ──────────────────────────────── -->
+    {#if cat === "node"}
     <div class="card">
       <h2 class="h-card">{t("set.sync")}</h2>
       <div class="field-row sync-row">
@@ -195,9 +234,19 @@
           <input type="checkbox" checked={cfg.proxy != null} />
           <span>{t("set.proxy")} {cfg.proxy ? `:${cfg.proxy}` : ""}</span>
         </label>
+        <label class="check">
+          <input type="checkbox" bind:checked={cfg.runNodeOnStart} />
+          <span>
+            {t("set.run_at_start")}
+            <span class="dim mono"> sugarchain-node</span>
+          </span>
+        </label>
       </div>
     </div>
+    {/if}
 
+    <!-- ── Wallet / display ────────────────────────── -->
+    {#if cat === "wallet"}
     <div class="card">
       <h2 class="h-card">{t("set.wallet_display")}</h2>
       <div class="field">
@@ -220,14 +269,6 @@
 
       <div class="field-row sync-row">
         <div class="field">
-          <label class="field-label" for="langsel">{t("set.language")}</label>
-          <select id="langsel" onchange={(e) => pickLang((e.target as HTMLSelectElement).value)}>
-            {#each LANGS as l}
-              <option value={l} selected={currentLang() === l}>{LANG_NAMES[l]}</option>
-            {/each}
-          </select>
-        </div>
-        <div class="field">
           <span class="field-label">{t("set.unit")}</span>
           <p class="unit-val mono">S <span class="dim">{t("set.unit_fixed")}</span></p>
         </div>
@@ -237,13 +278,16 @@
         </div>
       </div>
     </div>
+    {/if}
 
+    <!-- ── Data / logs ─────────────────────────────── -->
+    {#if cat === "data"}
     <div class="card">
       <h2 class="h-card">{t("set.data_logs")}</h2>
       <div class="field">
-        <label class="field-label" for="datadir">{t("set.data_dir")}</label>
+        <label class="field-label" for="datadir2">{t("set.data_dir")}</label>
         <div class="field-row">
-          <input id="datadir" class="mono" bind:value={cfg.dataDir} autocomplete="off" spellcheck="false" />
+          <input id="datadir2" class="mono" bind:value={cfg.dataDir} autocomplete="off" spellcheck="false" />
           <button class="btn" onclick={chooseDir}>{t("set.choose")}</button>
           <button class="btn btn-ghost">{t("set.open_dir")}</button>
         </div>
@@ -259,17 +303,49 @@
           {/if}
         </div>
       </div>
+    </div>
+    {/if}
 
-      <div class="field-row flags">
-        <label class="check">
-          <input type="checkbox" bind:checked={cfg.runNodeOnStart} />
-          <span>
-            {t("set.run_at_start")}
-            <span class="dim mono"> sugarchain-node</span>
-          </span>
-        </label>
+    <!-- ── Appearance / theme ──────────────────────── -->
+    {#if cat === "appearance"}
+    <div class="card">
+      <h2 class="h-card">{t("set.appearance")}</h2>
+
+      <div class="field">
+        <span class="field-label">{t("set.language")}</span>
+        <select id="langsel" onchange={(e) => pickLang((e.target as HTMLSelectElement).value)}>
+          {#each LANGS as l}
+            <option value={l} selected={currentLang() === l}>{LANG_NAMES[l]}</option>
+          {/each}
+        </select>
+      </div>
+
+      <div class="field">
+        <span class="field-label" id="nav-layout-label">{t("set.nav_layout")}</span>
+        <div class="nav-layout" role="radiogroup" aria-labelledby="nav-layout-label">
+          <label class="layout-card {app.navMode === 'top' ? 'active' : ''}">
+            <input type="radio" name="navlayout" checked={app.navMode === "top"} onchange={() => pickNav("top")} />
+            <span class="layout-preview" aria-hidden="true">
+              <span class="lp-bar"><i></i><i></i><i></i></span>
+              <span class="lp-body"></span>
+            </span>
+            <span class="layout-name">{t("set.nav_top")}</span>
+            <span class="layout-hint">{t("set.nav_top_hint")}</span>
+          </label>
+
+          <label class="layout-card {app.navMode === 'side' ? 'active' : ''}">
+            <input type="radio" name="navlayout" checked={app.navMode === "side"} onchange={() => pickNav("side")} />
+            <span class="layout-preview" aria-hidden="true">
+              <span class="lp-rail"></span>
+              <span class="lp-body"></span>
+            </span>
+            <span class="layout-name">{t("set.nav_side")}</span>
+            <span class="layout-hint">{t("set.nav_side_hint")}</span>
+          </label>
+        </div>
       </div>
     </div>
+    {/if}
   {:else}
     <div class="card"><p>…</p></div>
   {/if}
@@ -297,6 +373,132 @@
     margin: 0 0 16px;
     font-size: 14px;
   }
+
+  /* ── category tabs ─────────────────────────────── */
+  .cat-nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 6px;
+  }
+  .cat-btn {
+    appearance: none;
+    border: none;
+    background: none;
+    color: var(--ink-dim);
+    font-family: var(--font-display);
+    font-size: 13px;
+    font-weight: 600;
+    padding: 7px 12px;
+    border-radius: var(--r-8);
+    cursor: pointer;
+    transition: background 0.12s ease, color 0.12s ease;
+    touch-action: manipulation;
+  }
+  .cat-btn:hover {
+    background: var(--violet);
+    color: var(--ink-fg);
+  }
+  .cat-btn:focus-visible {
+    outline: none;
+    box-shadow: var(--focus);
+  }
+  .cat-btn.active {
+    background: var(--violet-2);
+    color: var(--ink-fg);
+    box-shadow: inset 0 -2px 0 var(--straw);
+  }
+
+  /* ── appearance: nav-layout picker ─────────────── */
+  .nav-layout {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 12px;
+  }
+  .layout-card {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-12);
+    padding: 12px;
+    cursor: pointer;
+    transition: border-color 0.12s ease, background 0.12s ease;
+    position: relative;
+  }
+  .layout-card:hover {
+    border-color: var(--mist);
+  }
+  .layout-card.active {
+    border-color: var(--straw);
+    background: var(--straw-soft);
+  }
+  .layout-card input {
+    position: absolute;
+    opacity: 0;
+    pointer-events: none;
+  }
+  .layout-card:has(input:focus-visible) {
+    box-shadow: var(--focus);
+  }
+  .layout-preview {
+    display: block;
+    width: 100%;
+    height: 60px;
+    border-radius: var(--r-8);
+    background: var(--ink);
+    border: 1px solid var(--line);
+    overflow: hidden;
+    position: relative;
+  }
+  .lp-bar {
+    display: flex;
+    gap: 3px;
+    align-items: center;
+    height: 16px;
+    padding: 0 8px;
+    background: var(--violet);
+    border-bottom: 1px solid var(--line);
+  }
+  .lp-bar i {
+    width: 14px;
+    height: 5px;
+    border-radius: 2px;
+    background: var(--violet-2);
+  }
+  .lp-body {
+    position: absolute;
+    inset: 22px 8px 8px;
+    border-radius: 3px;
+    background: var(--violet);
+  }
+  .lp-rail {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    bottom: 8px;
+    width: 12px;
+    border-radius: 3px;
+    background: var(--violet-2);
+    border: 1px solid var(--line);
+  }
+  .layout-card.active .lp-bar i:first-child {
+    background: var(--straw);
+  }
+  .layout-card.active .lp-rail {
+    background: var(--straw);
+  }
+  .layout-name {
+    font-family: var(--font-display);
+    font-weight: 800;
+    font-size: 13px;
+  }
+  .layout-hint {
+    font-size: 11px;
+    color: var(--ink-dim);
+  }
+
   .conn-head {
     display: flex;
     align-items: center;
