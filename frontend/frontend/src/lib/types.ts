@@ -75,8 +75,6 @@ export interface NodeInternals {
     sliceLen: number;
     requestedBlocks: number;
     lastReissueAt: number;
-    windowStart: number;
-    windowEnd: number;
     nextAssign: number;
   };
   mem: { gap: number; window: number; inflight: number };

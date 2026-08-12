@@ -306,14 +306,6 @@ export const Services = {
       headerRanges.push({ start: 0, end: headerTip, state: "done" });
     }
 
-    // Zoom window for the header track: frame the active download area around
-    // the assign frontier (next range handed out next) instead of the whole
-    // 40M+ span, mirroring the block window track.
-    const hdrSliceLen = sync.header_slice_len || 2000;
-    const hdrWinLen = Math.max(hdrSliceLen * 8, hdrSliceLen * 4);
-    const hdrWindowStart = Math.max(0, Math.min(sync.header_next_assign, sync.header_target) - hdrWinLen);
-    const hdrWindowEnd = Math.min(sync.header_target, hdrWindowStart + hdrWinLen * 2);
-
     // "lastReissue" = the most recent time any slice/header range was handed to
     // a peer (the node reports it per peer in unix seconds).
     const lastAssignAt = (sync.peers ?? []).reduce(
@@ -374,8 +366,6 @@ export const Services = {
         sliceLen: sync.header_slice_len ?? 0,
         requestedBlocks: Math.max(0, sync.block_target - chainTip),
         lastReissueAt: lastAssignAt > 0 ? lastAssignAt * 1000 : Date.now(),
-        windowStart: hdrWindowStart,
-        windowEnd: hdrWindowEnd,
         nextAssign: sync.header_next_assign ?? 0,
       },
       mem: {
