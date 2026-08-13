@@ -288,6 +288,16 @@ func (b *BlockChain) thresholdState(prevNode *blockNode,
 	checker thresholdConditionChecker,
 	cache *thresholdStateCache) (ThresholdState, error) {
 
+	// The BIP9 state calculation walks back a full miner confirmation window
+	// (MinerConfirmationWindow) through parent pointers while counting votes,
+	// and the windowed ancestor walk below can reach even further back.  The
+	// in-memory header window may have severed some of those links (see
+	// evictWindow), which would make the walk dereference a nil parent and
+	// crash the node during block connection.  Re-link any severed ancestors
+	// from the cold index first so the walk always sees the true chain; the
+	// repair is a no-op when the chain is already intact.
+	b.repairAncestorChain(prevNode, 2*int32(checker.MinerConfirmationWindow()))
+
 	// If the deployment has a nonzero AlwaysActiveHeight and the next
 	// block’s height is at or above that threshold, then force the state
 	// to Active.

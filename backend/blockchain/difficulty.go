@@ -189,6 +189,21 @@ func calcNextRequiredDifficulty(lastNode HeaderCtx, newBlockTime time.Time,
 		return c.ChainParams().PowLimitBits, nil
 	}
 
+	// Repair any parent links severed by the in-memory header window before
+	// walking the ancestor chain below.  evictWindow cuts parent pointers at
+	// the window boundary, so without this repair a valid block whose
+	// ancestors fell out of the window would stop the walk early and be
+	// falsely rejected with the PowLimit as the expected difficulty.  The
+	// repair re-links severed ancestors from the authoritative cold index and
+	// also keeps the median-time comparisons (CalcPastMedianTime below)
+	// correct.  Only the real BlockChain owns the cold-read layer; other
+	// ChainCtx implementations are left unchanged.
+	if bc, ok := c.(*BlockChain); ok {
+		if bn, ok := lastNode.(*blockNode); ok {
+			bc.repairDifficultyChain(bn)
+		}
+	}
+
 	// SugarShield-N510: Recalculate difficulty at every block
 	// Collect the last 510 blocks' nBits
 	var bnTot big.Int

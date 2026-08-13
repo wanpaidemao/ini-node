@@ -124,6 +124,21 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
 	newNode := b.index.LookupNode(block.Hash())
 	if newNode != nil {
 		b.index.SetStatusFlags(newNode, statusDataStored)
+
+		// A header-only node may have had its parent pointer severed by a
+		// window eviction that ran while the block body was still in flight
+		// (evictWindow cuts parent/ancestor pointers below the boundary).
+		// The parent is guaranteed to be in memory now -- prevNode was
+		// resolved at the top of this function -- so re-link the chain before
+		// connecting.  Otherwise any difficulty walk that starts at this node
+		// (for example when its own child is validated) stops at the severed
+		// link and reports the PowLimit as the expected difficulty, falsely
+		// rejecting a valid block.  This mirrors the parent wiring that
+		// newBlockNode performs for a freshly created node.
+		if newNode.parent == nil && prevNode != nil {
+			newNode.parent = prevNode
+			newNode.buildAncestor()
+		}
 	} else {
 		blockHeader := &block.MsgBlock().Header
 		newNode = newBlockNode(blockHeader, prevNode)

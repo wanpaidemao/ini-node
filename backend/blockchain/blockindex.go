@@ -578,6 +578,19 @@ func (bi *blockIndex) tipHeight(view *chainView) int32 {
 	return -1
 }
 
+// difficultyProtectDepth is the number of ancestor levels below a window
+// boundary that must stay materialized and intact so the SugarShield difficulty
+// calculation can always complete.  The algorithm walks back
+// SugarPowAveragingWindow blocks from the parent of the block being validated,
+// then medianTimeBlocks more for the median-time calculation, entirely through
+// parent pointers.  If a node retained at or above the boundary had its
+// ancestor chain severed at the raw boundary, a valid block body arriving
+// later would have its expected difficulty computed as the PowLimit and be
+// falsely rejected, stalling the sync.  Lowering the eviction and severing
+// boundaries by this depth keeps the whole difficulty window walkable for a
+// bounded extra cost of a few hundred nodes.
+const difficultyProtectDepth = int32(SugarPowAveragingWindow + medianTimeBlocks)
+
 // evictWindow prunes the block index and both chain views down to the current
 // in-memory header windows.  Each view keeps its own trailing window: the best
 // chain view retains the most recent windowSize connected blocks (the chain
@@ -612,6 +625,25 @@ func (bi *blockIndex) evictWindow() {
 	headerBoundary := bi.windowBoundary(bi.tipHeight(bi.bestHeaderView))
 	if headerBoundary <= 0 {
 		return
+	}
+
+	// Protect the difficulty window.  SugarShield-N510 recalculates the
+	// difficulty at every block by walking SugarPowAveragingWindow (+
+	// medianTimeBlocks for the median-time comparison) ancestors of the
+	// parent of the block being validated, purely through parent pointers.
+	// Lowering the eviction and severing boundaries by that depth keeps the
+	// ancestor chains of any node at or above the boundary intact, so a
+	// valid block body that arrives later (well after the header that
+	// introduced its parent node) is not falsely rejected with the PowLimit
+	// as the expected difficulty.  The extra cost is a bounded few hundred
+	// retained nodes.
+	chainBoundary -= difficultyProtectDepth
+	headerBoundary -= difficultyProtectDepth
+	if chainBoundary < 0 {
+		chainBoundary = 0
+	}
+	if headerBoundary < 0 {
+		headerBoundary = 0
 	}
 
 	// Compute the block-connection frontier window before acquiring the chain

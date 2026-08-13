@@ -303,3 +303,71 @@ func (b *BlockChain) isMainChainHash(hash *chainhash.Hash) bool {
 
 	return *dbHash == *hash
 }
+
+// repairDifficultyChain re-links, from the cold index, any parent pointers in
+// the ancestor chain of the provided node that a window eviction severed, so
+// consensus walks (the SugarShield difficulty calculation and its median-time
+// comparisons) can always traverse the full chain.  Without this, a valid
+// block whose ancestors fell out of the in-memory header window would have its
+// expected difficulty computed as the PowLimit and be falsely rejected.
+//
+// This function MUST be called with the chain lock held (for writes): it
+// mutates parent pointers of in-memory index nodes, and window eviction (the
+// only other parent-pointer writer) also runs under the chain lock via
+// flushToDB, so the two can never race.
+func (b *BlockChain) repairDifficultyChain(node *blockNode) *blockNode {
+	return b.repairAncestorChain(node, difficultyProtectDepth)
+}
+
+// repairAncestorChain re-links, from the cold index, any parent pointers in
+// the ancestor chain of the provided node that a window eviction severed, up
+// to depth levels.  It is the general form of repairDifficultyChain, used by
+// every consensus walk that traverses parent pointers further back than the
+// difficulty window -- most notably the BIP9 threshold-state calculation,
+// which walks back a full miner confirmation window (MinerConfirmationWindow)
+// while counting votes.  Without this repair that walk would hit a severed
+// parent pointer and dereference a nil node, crashing the node during block
+// connection.
+//
+// The walk stops once it reaches a live in-memory link, so intact chains are
+// untouched and a repair is a no-op.  Every severed node carries its parent
+// hash (parentHash is immutable, populated at construction), so the true
+// parent is always resolvable from the hash-keyed block index on disk.  A
+// materialized parent may itself have a severed parent, so the walk continues
+// from the materialized node, chaining cold nodes until the required depth or
+// a live link is reached.
+//
+// This function MUST be called with the chain lock held (for writes): it
+// mutates parent pointers of in-memory index nodes, and window eviction (the
+// only other parent-pointer writer) also runs under the chain lock via
+// flushToDB, so the two can never race.
+func (b *BlockChain) repairAncestorChain(node *blockNode, depth int32) *blockNode {
+	if node == nil {
+		return nil
+	}
+
+	cur := node
+	for i := int32(0); i < depth && cur != nil; i++ {
+		if cur.parent != nil {
+			cur = cur.parent
+			continue
+		}
+
+		// Severed link: resolve the true parent by its hash.  The genesis
+		// block has a zero parent hash and terminates the walk naturally.
+		if cur.parentHash == (chainhash.Hash{}) {
+			return node
+		}
+		parent := b.materializeColdNode(&cur.parentHash)
+		if parent == nil {
+			// Not indexed (cannot happen for an accepted header); leave the
+			// link severed and let the caller fall back to its previous
+			// behavior.
+			return node
+		}
+		cur.parent = parent
+		cur = parent
+	}
+
+	return node
+}
