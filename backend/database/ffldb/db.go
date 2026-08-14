@@ -2120,7 +2120,7 @@ func initDB(ldb *leveldb.DB) error {
 // it substantially reduces the file count and the compaction churn (and
 // therefore the write amplification) at the cost of somewhat larger compaction
 // buffers and longer individual compaction pauses.
-const defaultCompactionTableSize = 32 * 1024 * 1024 // 32 MB
+const defaultCompactionTableSize = 64 * 1024 * 1024 // 64 MB
 
 // defaultWriteBuffer is the maximum size of a leveldb memtable before it is
 // flushed to a level-0 table.  It is raised alongside the compaction table
@@ -2129,7 +2129,7 @@ const defaultCompactionTableSize = 32 * 1024 * 1024 // 32 MB
 // number of level-0 files produced by each cache flush, which drastically
 // reduces the cascading L0->L1->L2 compactions and the resulting write
 // amplification on the metadata database.
-const defaultWriteBuffer = 32 * 1024 * 1024 // 32 MB
+const defaultWriteBuffer = 64 * 1024 * 1024 // 64 MB
 
 // defaultL0CompactionTrigger is the number of level-0 sorted tables that must
 // accumulate before compaction starts.  It is raised so a whole batch of
@@ -2157,7 +2157,7 @@ const defaultWriteL0PauseTrigger = 48
 // default 12.8x and captures most of the write-amplification win at a much
 // smaller space cost.  Tune upward from here only after measuring the actual
 // write-amplification improvement on a live block-sync run.
-const defaultCompactionTotalSize = 128 * 1024 * 1024 // 128 MB
+const defaultCompactionTotalSize = 256 * 1024 * 1024 // 256 MB
 
 // defaultCompactionTotalSizeMultiplier is the per-level growth factor applied
 // to the level-1 budget to derive the budgets of the deeper levels.  Keeping it
