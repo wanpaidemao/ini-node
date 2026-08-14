@@ -2,6 +2,7 @@ package sugarindex
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/btcsuite/btcd/blockchain"
 	"github.com/btcsuite/btcd/btcutil/v2"
@@ -67,13 +68,23 @@ func (m *Manager) Init(chain *blockchain.BlockChain,
 		return err
 	}
 
-	if tipHash != nil && !chain.MainChainHasBlock(tipHash) {
-		log.Warnf("Sugar index tip %v is orphaned; rebuilding from scratch",
-			tipHash)
-		if err := m.wipeIndex(); err != nil {
-			return err
+	// MainChainHasBlock only consults the in-memory index, which evicts the
+	// tip after a restart (the tip sits far below the header window).  Use
+	// the database-backed height lookup instead so a valid tip is not
+	// falsely declared orphaned, which would wipe and rebuild the whole
+	// index from scratch (~30h on 43.8M blocks).
+	// MainChainHasBlock 只查内存索引,重启后 tip 远低于窗口会被驱逐;改用
+	// 走数据库的高度查询,避免把合法 tip 误判为孤儿而整库重来。
+	if tipHash != nil {
+		mainHeight, herr := chain.BlockHeightByHash(tipHash)
+		if herr != nil || mainHeight != tipHeight {
+			log.Warnf("Sugar index tip %v is orphaned; rebuilding from scratch",
+				tipHash)
+			if err := m.wipeIndex(); err != nil {
+				return err
+			}
+			tipHeight = -1
 		}
-		tipHeight = -1
 	}
 
 	bestHeight := chain.BestSnapshot().Height
@@ -81,27 +92,149 @@ func (m *Manager) Init(chain *blockchain.BlockChain,
 		return nil
 	}
 
+	// Rebuild batching: accumulate up to rebuildBatchBlocks blocks into one
+	// leveldb batch before writing, cutting the number of write transactions
+	// (and fsyncs) ~100x during the initial catch-up.  The tip is stored with
+	// each flush so an interrupted rebuild resumes from the last flushed
+	// height instead of redoing the whole chain.
+	// 批量重建:每 rebuildBatchBlocks 块合并为一次 leveldb 写入,将初始追赶
+	// 期间的写事务(及 fsync)次数降低约 100 倍;每次落盘同时记录尖点,中断后
+	// 从上次落盘高度继续,无需整链重来。
+	const rebuildBatchBlocks = 100
+
 	log.Infof("Sugar index catching up from height %d to %d",
 		tipHeight+1, bestHeight)
-	for height := tipHeight + 1; height <= bestHeight; height++ {
-		if interruptRequested(interrupt) {
-			return errInterruptRequested
-		}
 
-		block, err := chain.BlockByHeight(height)
-		if err != nil {
-			return err
+	// Parallel read-ahead.  BlockByHeight + FetchSpendJournal are the rebuild
+	// bottleneck (random reads from the main DB), so run several workers to
+	// fetch blocks/spent-journals ahead of the writer, then merge results in
+	// height order so the write side stays strictly sequential.
+	// 并行预读:主库随机读(BlockByHeight+FetchSpendJournal)是重建瓶颈,用多个
+	// worker 提前读取,再按高度顺序合并,写入保持串行。
+	const rebuildReadWorkers = 4
+
+	type fetchResult struct {
+		height int32
+		block  *btcutil.Block
+		stxos  []blockchain.SpentTxOut
+		err    error
+	}
+
+	heights := make(chan int32, rebuildReadWorkers*2)
+	results := make(chan fetchResult, rebuildReadWorkers*2)
+	var wg sync.WaitGroup
+	for i := 0; i < rebuildReadWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			// Batch spend-journal reads: fetch up to fetchBatchBlocks blocks
+			// per database view so the per-block read-transaction overhead is
+			// amortized (BlockByHeight stays per-block, but the journal reads
+			// dominate).  Results are emitted per block; the consumer merges
+			// them in height order, so out-of-order emission is fine.
+			// 批量读 spend journal:每 fetchBatchBlocks 块一次数据库视图读取,
+			// 摊薄每块读事务开销;结果仍按块发出,由消费端按高度顺序合并。
+			const fetchBatchBlocks = 32
+			var blocks []*btcutil.Block
+			var blockHeights []int32
+
+			flush := func() error {
+				if len(blocks) == 0 {
+					return nil
+				}
+				journals, err := chain.FetchSpendJournals(blocks)
+				if err != nil {
+					for _, h := range blockHeights {
+						results <- fetchResult{height: h, err: err}
+					}
+				} else {
+					for i, h := range blockHeights {
+						results <- fetchResult{
+							height: h, block: blocks[i], stxos: journals[i],
+						}
+					}
+				}
+				blocks = blocks[:0]
+				blockHeights = blockHeights[:0]
+				return nil
+			}
+
+			for height := range heights {
+				if interruptRequested(interrupt) {
+					return
+				}
+				block, err := chain.BlockByHeight(height)
+				if err != nil {
+					results <- fetchResult{height: height, err: err}
+					continue
+				}
+				blocks = append(blocks, block)
+				blockHeights = append(blockHeights, height)
+				if len(blocks) >= fetchBatchBlocks {
+					if err := flush(); err != nil {
+						return
+					}
+				}
+			}
+			_ = flush()
+		}()
+	}
+
+	// Producer: feed the height range to the workers, stopping on interrupt.
+	go func() {
+		defer close(heights)
+		for height := tipHeight + 1; height <= bestHeight; height++ {
+			select {
+			case heights <- height:
+			case <-interrupt:
+				return
+			}
 		}
-		spentTxos, err := chain.FetchSpendJournal(block)
-		if err != nil {
-			return err
+	}()
+	// Close the results channel once every reader has finished.
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	batch := new(leveldb.Batch)
+	batched := 0
+	next := tipHeight + 1
+	pending := make(map[int32]fetchResult)
+	for r := range results {
+		if r.err != nil {
+			return r.err
 		}
-		if err := m.connectBlock(block, spentTxos); err != nil {
-			return err
+		pending[r.height] = r
+
+		// Consume strictly in height order.
+		for {
+			cur, ok := pending[next]
+			if !ok {
+				break
+			}
+			if err := m.connectBlockBatch(cur.block, cur.stxos, batch); err != nil {
+				return err
+			}
+			batched++
+			if batched >= rebuildBatchBlocks || next == bestHeight {
+				m.storeIndexTip(batch, cur.block.Hash(), next)
+				if err := m.db.Write(batch, nil); err != nil {
+					return err
+				}
+				batch = new(leveldb.Batch)
+				batched = 0
+			}
+			if next%10000 == 0 {
+				log.Infof("Sugar index: indexed height %d", next)
+			}
+			delete(pending, next)
+			next++
 		}
-		if height%10000 == 0 {
-			log.Infof("Sugar index: indexed height %d", height)
-		}
+	}
+	if interruptRequested(interrupt) {
+		return errInterruptRequested
 	}
 	log.Infof("Sugar index caught up to height %d", bestHeight)
 	return nil
@@ -133,6 +266,20 @@ func (m *Manager) DisconnectBlock(_ database.Tx, block *btcutil.Block,
 func (m *Manager) connectBlock(block *btcutil.Block,
 	stxos []blockchain.SpentTxOut) error {
 
+	batch := new(leveldb.Batch)
+	if err := m.connectBlockBatch(block, stxos, batch); err != nil {
+		return err
+	}
+	m.storeIndexTip(batch, block.Hash(), block.Height())
+	return m.db.Write(batch, nil)
+}
+
+// connectBlockBatch 填充 batch 但不写库,供 Init 批量重建与单块 connectBlock
+// 共用。connectBlockBatch fills the batch without writing, shared by the
+// batched rebuild in Init and the single-block connectBlock.
+func (m *Manager) connectBlockBatch(block *btcutil.Block,
+	stxos []blockchain.SpentTxOut, batch *leveldb.Batch) error {
+
 	bd := newBlockDeltas()
 	height := block.Height()
 	stxoIndex := 0
@@ -157,8 +304,6 @@ func (m *Manager) connectBlock(block *btcutil.Block,
 		}
 	}
 
-	batch := new(leveldb.Batch)
-
 	for _, e := range bd.addressIndex {
 		ev := &enc{}
 		ev.i64(e.delta)
@@ -181,8 +326,7 @@ func (m *Manager) connectBlock(block *btcutil.Block,
 	}
 	m.putObfuscated(batch, tk.Key(), []byte{0})
 
-	m.storeIndexTip(batch, block.Hash(), height)
-	return m.db.Write(batch, nil)
+	return nil
 }
 
 // disconnectBlock 撤销 connectBlock:删除该区块产生的全部 address deltas 与
@@ -445,16 +589,36 @@ func (bd *blockDeltas) undoSpent(txIn *wire.TxIn,
 
 // wipeIndex 清空全部四类索引命名空间与尖点标记。
 // wipeIndex removes all four index namespaces plus the tip marker.
+//
+// 键按批次删除,避免把全库键累积进单个 leveldb.Batch 导致内存爆炸
+// (43.8M 高度时键数可达数亿,单个 batch 曾使进程内存飙至 ~6GB)。
+// Keys are deleted in bounded batches so the whole key set is never
+// accumulated in a single leveldb.Batch (at 43.8M blocks the key count
+// reaches hundreds of millions; one batch previously ballooned the process
+// to ~6GB).
 func (m *Manager) wipeIndex() error {
-	var keys [][]byte
+	// wipeBatchKeys bounds the number of deletes per leveldb batch write.
+	const wipeBatchKeys = 100000
+
 	iter := m.db.NewIterator(nil, nil)
+	batch := new(leveldb.Batch)
+	batched := 0
 	for iter.Next() {
 		k := iter.Key()
 		if len(k) > 0 {
 			switch k[0] {
 			case DBAddressIndex, DBAddressUnspent, DBTimestampIndex,
 				DBSpentIndex:
-				keys = append(keys, append([]byte{}, k...))
+				batch.Delete(append([]byte{}, k...))
+				batched++
+				if batched >= wipeBatchKeys {
+					if err := m.db.Write(batch, nil); err != nil {
+						iter.Release()
+						return err
+					}
+					batch = new(leveldb.Batch)
+					batched = 0
+				}
 			}
 		}
 	}
@@ -463,10 +627,6 @@ func (m *Manager) wipeIndex() error {
 		return err
 	}
 
-	batch := new(leveldb.Batch)
-	for _, k := range keys {
-		batch.Delete(k)
-	}
 	batch.Delete(indexTipKey)
 	return m.db.Write(batch, nil)
 }

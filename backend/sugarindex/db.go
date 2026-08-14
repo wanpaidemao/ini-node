@@ -35,6 +35,20 @@ func openIndexDB(path string, log btclog.Logger) (*leveldb.DB, []byte, error) {
 		// Open files with write access so the DB remains writable even
 		// though we only read during startup catchup.
 		ReadOnly: false,
+
+		// Rebuild tuning: raise the compaction budgets to match the main
+		// ffldb database (database/ffldb/db.go).  The goleveldb defaults
+		// (4 MB write buffer, 2 MB tables, L0 trigger 4) force a full
+		// 43.8M-block rebuild into thousands of tiny L0 tables with heavy
+		// write amplification; these values cut the rebuild from ~30h to a
+		// few hours.  The index is standalone and byte-compatible with
+		// umami, so these are pure performance knobs with no format impact.
+		WriteBuffer:            64 * 1024 * 1024, // 64 MB memtable
+		CompactionTableSize:    64 * 1024 * 1024, // 64 MB SST target
+		CompactionTotalSize:    256 * 1024 * 1024, // 256 MB level-1 budget
+		CompactionL0Trigger:    8,                 // batch L0 compactions
+		WriteL0SlowdownTrigger: 24,
+		WriteL0PauseTrigger:    48,
 	}
 	ldb, err := leveldb.OpenFile(path, opts)
 	if err != nil {

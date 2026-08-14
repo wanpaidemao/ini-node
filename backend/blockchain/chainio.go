@@ -294,6 +294,33 @@ func (b *BlockChain) FetchSpendJournal(targetBlock *btcutil.Block) ([]SpentTxOut
 	return spendEntries, nil
 }
 
+// FetchSpendJournals retrieves the spend journals for a batch of blocks in a
+// single database view, cutting the per-block read-transaction overhead during
+// a full index rebuild.  The returned slice is parallel to blocks.
+//
+// This function is safe for concurrent access.
+func (b *BlockChain) FetchSpendJournals(blocks []*btcutil.Block) ([][]SpentTxOut, error) {
+	b.chainLock.RLock()
+	defer b.chainLock.RUnlock()
+
+	journals := make([][]SpentTxOut, len(blocks))
+	err := b.db.View(func(dbTx database.Tx) error {
+		for i, block := range blocks {
+			entries, err := dbFetchSpendJournalEntry(dbTx, block)
+			if err != nil {
+				return err
+			}
+			journals[i] = entries
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return journals, nil
+}
+
 // spentTxOutHeaderCode returns the calculated header code to be used when
 // serializing the provided stxo entry.
 func spentTxOutHeaderCode(stxo *SpentTxOut) uint64 {
