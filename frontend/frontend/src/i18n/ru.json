@@ -234,6 +234,7 @@
   "shell.debug": "отладка",
   "shell.offline": "Офлайн",
   "shell.syncing": "Синхронизация",
+  "shell.indexing": "Индексация",
   "wal.address_reuse_warning": "Адрес уже тратился — избегайте повторного использования.",
   "wal.col_amount": "Сумма",
   "wal.col_dir": "Направление",

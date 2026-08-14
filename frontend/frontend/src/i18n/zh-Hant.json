@@ -241,6 +241,7 @@
   "shell.debug": "除錯",
   "shell.offline": "離線",
   "shell.syncing": "同步中",
+  "shell.indexing": "索引中",
   "wal.address_reuse_warning": "該位址已花費過 — 請避免重用。",
   "wal.col_amount": "金額",
   "wal.col_dir": "方向",

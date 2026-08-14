@@ -93,6 +93,22 @@ async function chainSample(): Promise<{ height: number; rate: number }> {
 
 export const Services = {
   // ── Node ──────────────────────────────────────────────────────
+  /** Index rebuild progress (served by the app's own /api/index-progress,
+   *  NOT btcd RPC, which is not listening during the rebuild). */
+  async getIndexProgress(): Promise<{
+    height: number;
+    total: number;
+    percent: number;
+  } | null> {
+    try {
+      const res = await fetch("/api/index-progress");
+      if (!res.ok) return null;
+      return (await res.json()) as { height: number; total: number; percent: number };
+    } catch {
+      return null;
+    }
+  },
+
   async getSyncStatus(): Promise<SyncStatus> {
     const [info, peers] = await Promise.all([
       rpc<{

@@ -14,6 +14,10 @@
   let timer: ReturnType<typeof setInterval> | undefined;
   let lastAt = $state<number | null>(null);
   let debugLevel = $state("info");
+  // Sugar index rebuild progress.  Shown on the same ribbon while btcd's RPC
+  // is not listening (rebuild and block sync never run at the same time).
+  // sugarindex 重建进度。RPC 未监听时在同一进度条上显示(重建与区块同步不会同时发生)。
+  let indexProgress = $state<{ height: number; total: number; percent: number } | null>(null);
 
   async function poll() {
     const [s, i, p, c, d] = await Promise.all([
@@ -27,6 +31,10 @@
       status = s;
       live = true;
       lastAt = Date.now();
+      indexProgress = null;
+    } else {
+      // RPC down: likely rebuilding the address index. / RPC 不可用:可能在重建索引。
+      indexProgress = await Services.getIndexProgress();
     }
     if (i) info = i;
     if (p) peers = p;
@@ -40,10 +48,13 @@
   });
   onDestroy(() => clearInterval(timer));
 
+  // Progress percent: index rebuild (RPC down) or block sync. / 进度百分比。
   function pct() {
+    if (indexProgress && indexProgress.total > 0) return Math.min(100, indexProgress.percent);
     return status ? Math.min(100, (status.blocks / status.headers) * 100) : 0;
   }
   function totalS() {
+    if (indexProgress && indexProgress.total > 0) return indexProgress.total;
     return status ? status.headers : 0;
   }
   // chain ribbon width: window (50k) scaled to full chain
@@ -119,11 +130,11 @@
     </div>
   </div>
 
-  <!-- signature: Chain Ribbon -->
+  <!-- signature: Chain Ribbon (index rebuild progress when RPC is down) -->
   <div class="card ribbon-card" aria-label={t("dash.sync_progress")}>
     <div class="ribbon-head">
       <span class="h-card">{t("dash.sync_progress")}</span>
-      {#if status}
+      {#if status || (indexProgress && indexProgress.total > 0)}
         <span class="ribbon-pct mono">{pct().toFixed(2)}%</span>
       {/if}
     </div>
@@ -138,6 +149,19 @@
           <span class="dot" aria-hidden="true"></span>
           <span class="mono" translate="no">{fmt(status.headers)}</span>
           {t("dash.target_height")}
+        </span>
+      </div>
+    {:else if indexProgress && indexProgress.total > 0}
+      <div class="ribbon-heights">
+        <span class="chip">
+          <span class="dot mint" aria-hidden="true"></span>
+          <span class="mono" translate="no">{fmt(indexProgress.height)}</span>
+          index
+        </span>
+        <span class="chip honey">
+          <span class="dot" aria-hidden="true"></span>
+          <span class="mono" translate="no">{fmt(indexProgress.total)}</span>
+          blocks
         </span>
       </div>
     {/if}
@@ -161,6 +185,8 @@
           {t("dash.rate", { rate: status.rateBlPerSec })}
         </span>
         <span class="chip">{t("dash.eta", { eta: eta() ?? "—" })}</span>
+      {:else if indexProgress && indexProgress.total > 0}
+        <span class="mono" translate="no">indexing {fmt(indexProgress.height)}</span>
       {/if}
     </div>
   </div>

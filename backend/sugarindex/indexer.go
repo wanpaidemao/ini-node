@@ -1,7 +1,10 @@
 package sugarindex
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/btcsuite/btcd/blockchain"
@@ -228,6 +231,7 @@ func (m *Manager) Init(chain *blockchain.BlockChain,
 			}
 			if next%10000 == 0 {
 				log.Infof("Sugar index: indexed height %d", next)
+				m.writeProgress(next, bestHeight)
 			}
 			delete(pending, next)
 			next++
@@ -586,6 +590,22 @@ func (bd *blockDeltas) undoSpent(txIn *wire.TxIn,
 
 // ---------------------------------------------------------------------------
 // wipe / interrupt helpers
+
+// writeProgress 把重建进度写为 JSON 到 index 目录下的 progress.json,供前端
+// 在 RPC 尚未就绪时轮询显示。writeProgress writes the rebuild progress as
+// JSON to progress.json under the index dir so the frontend can poll it while
+// the RPC server is still starting.
+func (m *Manager) writeProgress(height, total int32) {
+	raw, err := json.Marshal(map[string]interface{}{
+		"height":  height,
+		"total":   total,
+		"percent": float64(height) / float64(total) * 100,
+	})
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(m.path, "progress.json"), raw, 0o600)
+}
 
 // wipeIndex 清空全部四类索引命名空间与尖点标记。
 // wipeIndex removes all four index namespaces plus the tip marker.

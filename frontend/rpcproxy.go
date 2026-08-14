@@ -255,6 +255,56 @@ func handleNodeConfig(iniPath string, o map[string]string, w http.ResponseWriter
 	})
 }
 
+// handleIndexProgress serves the sugarindex rebuild progress written by the
+// node to <datadir>/*/index/progress.json.  It does NOT go through btcd's RPC,
+// because the RPC server is not listening while the index is being rebuilt.
+// Returns {"height":N,"total":N,"percent":F} or 404 when absent.
+func handleIndexProgress(iniPath string, o map[string]string, w http.ResponseWriter, req *http.Request) {
+	w.Header().Set("content-type", "application/json")
+	datadir := strings.TrimSpace(o["datadir"])
+	if datadir == "" {
+		// Default data directory (matches btcd's default). / 默认数据目录。
+		home, err := os.UserHomeDir()
+		if err != nil {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"height": 0, "total": 0, "percent": 0})
+			return
+		}
+		datadir = filepath.Join(home, "AppData", "Local", "Btcd")
+	}
+	// The network subdir (e.g. sugarmainnet) is unknown here; glob for it.
+	// 网络子目录(如 sugarmainnet)此处未知,用 glob 查找。
+	matches, err := filepath.Glob(filepath.Join(datadir, "*", "index", "progress.json"))
+	if err != nil || len(matches) == 0 {
+		// Also try the bare datadir (no network subdir). / 也尝试裸数据目录。
+		matches, err = filepath.Glob(filepath.Join(datadir, "index", "progress.json"))
+	}
+	if err != nil || len(matches) == 0 {
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"height": 0, "total": 0, "percent": 0})
+		return
+	}
+	// Pick the newest matching file. / 取最新的匹配文件。
+	best := matches[0]
+	var bestMod int64
+	for _, m := range matches {
+		if st, err := os.Stat(m); err == nil && st.ModTime().Unix() > bestMod {
+			best = m
+			bestMod = st.ModTime().Unix()
+		}
+	}
+	raw, err := os.ReadFile(best)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"height": 0, "total": 0, "percent": 0})
+		return
+	}
+	var p map[string]interface{}
+	if err := json.Unmarshal(raw, &p); err != nil {
+		p = map[string]interface{}{"height": 0, "total": 0, "percent": 0}
+	}
+	_ = json.NewEncoder(w).Encode(p)
+}
+
 // rpcProxyMiddleware intercepts the RPC proxy and node-config routes that the
 // frontend hits relative to its own origin; everything else falls through to the
 // embedded asset server.
@@ -268,6 +318,8 @@ func rpcProxyMiddleware() application.Middleware {
 				handleRPCProxy(opts, w, req)
 			case req.URL.Path == "/api/node-config":
 				handleNodeConfig(iniPath, opts, w, req)
+			case req.URL.Path == "/api/index-progress":
+				handleIndexProgress(iniPath, opts, w, req)
 			default:
 				next.ServeHTTP(w, req)
 			}

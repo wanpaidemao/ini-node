@@ -38,8 +38,11 @@ $outFile = Join-Path $logDir "node.stdout.log"
 $errFile = Join-Path $logDir "node.stderr.log"
 
 # 5) 启动
+# 注意: sugarindex=1 显式传入, 开启地址索引(供 getaddressbalance/
+# getaddressutxos 使用), 首次会全量重建(约 7.2 万块/分钟, 全程约 8h)。
 $args = @(
-    "--configfile=$IniFile"
+    "--configfile=$IniFile",
+    "--sugarindex=1"
 )
 Start-Process -FilePath $ExePath -ArgumentList $args `
     -RedirectStandardOutput $outFile -RedirectStandardError $errFile `

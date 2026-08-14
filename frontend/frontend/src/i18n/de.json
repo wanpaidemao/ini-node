@@ -234,6 +234,7 @@
   "shell.debug": "Debug",
   "shell.offline": "Offline",
   "shell.syncing": "Synchronisiere",
+  "shell.indexing": "Indiziere",
   "wal.address_reuse_warning": "Adresse bereits ausgegeben — erneute Verwendung vermeiden.",
   "wal.col_amount": "Betrag",
   "wal.col_dir": "Richtung",

@@ -241,6 +241,7 @@
   "shell.debug": "debug",
   "shell.offline": "Offline",
   "shell.syncing": "Syncing",
+  "shell.indexing": "Indexing",
   "wal.address_reuse_warning": "Address already spent — avoid reusing it.",
   "wal.col_amount": "Amount",
   "wal.col_dir": "Direction",

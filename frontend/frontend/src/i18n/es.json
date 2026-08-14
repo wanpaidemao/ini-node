@@ -234,6 +234,7 @@
   "shell.debug": "depuración",
   "shell.offline": "Sin conexión",
   "shell.syncing": "Sincronizando",
+  "shell.indexing": "Indexando",
   "wal.address_reuse_warning": "Dirección ya gastada — evita reutilizarla.",
   "wal.col_amount": "Cantidad",
   "wal.col_dir": "Dirección",

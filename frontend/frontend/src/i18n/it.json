@@ -234,6 +234,7 @@
   "shell.debug": "debug",
   "shell.offline": "Offline",
   "shell.syncing": "Sincronizzazione",
+  "shell.indexing": "Indicizzazione",
   "wal.address_reuse_warning": "Indirizzo già speso — evita di riutilizzarlo.",
   "wal.col_amount": "Importo",
   "wal.col_dir": "Direzione",
