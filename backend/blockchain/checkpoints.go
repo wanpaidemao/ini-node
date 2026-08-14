@@ -144,6 +144,13 @@ func (b *BlockChain) findPreviousCheckpoint() (*blockNode, error) {
 	// passed the checkpoint which was verified as accurate before inserting
 	// it.
 	checkpointNode := b.index.LookupNode(b.nextCheckpoint.Hash)
+	if checkpointNode == nil && b.coldReadEnabled() {
+		// The checkpoint may have fallen out of the in-memory header
+		// window.  It is a known good main-chain block, so page it back in
+		// from the cold index; without this, header sync stalls because
+		// every header verification fails checkpoint lookup.
+		checkpointNode = b.materializeColdNode(b.nextCheckpoint.Hash)
+	}
 	if checkpointNode == nil {
 		return nil, AssertError(fmt.Sprintf("findPreviousCheckpoint "+
 			"failed lookup of known good block node %s",

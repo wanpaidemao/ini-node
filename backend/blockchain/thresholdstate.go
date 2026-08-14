@@ -210,7 +210,8 @@ func thresholdStateTransition(state ThresholdState, prevNode *blockNode,
 		// confirmation window to count all of the votes in it.
 		var count uint32
 		countNode := prevNode
-		for i := int32(0); i < confirmationWindow; i++ {
+		var i int32
+		for i = int32(0); i < confirmationWindow && countNode != nil; i++ {
 			condition, err := checker.Condition(countNode)
 			if err != nil {
 				return ThresholdFailed, err
@@ -221,6 +222,19 @@ func thresholdStateTransition(state ThresholdState, prevNode *blockNode,
 
 			// Get the previous block node.
 			countNode = countNode.parent
+		}
+
+		// If the ancestor chain was severed by the in-memory header window
+		// before the full confirmation window could be walked (cold-start
+		// threshold cache, or a node whose ancestors fell out of the
+		// window), count the votes that are available and continue.  This
+		// mirrors the nil-tolerant behavior of the windowed ancestor walks
+		// elsewhere: the chain genuinely continues on disk below the window,
+		// but the in-memory view ends here.
+		if countNode == nil && i < confirmationWindow {
+			log.Debugf("Threshold vote count for %v stopped early at "+
+				"severed ancestor (walked %d/%d blocks)", prevNode.hash,
+				i, confirmationWindow)
 		}
 
 		switch {
@@ -290,13 +304,15 @@ func (b *BlockChain) thresholdState(prevNode *blockNode,
 
 	// The BIP9 state calculation walks back a full miner confirmation window
 	// (MinerConfirmationWindow) through parent pointers while counting votes,
-	// and the windowed ancestor walk below can reach even further back.  The
-	// in-memory header window may have severed some of those links (see
-	// evictWindow), which would make the walk dereference a nil parent and
-	// crash the node during block connection.  Re-link any severed ancestors
-	// from the cold index first so the walk always sees the true chain; the
-	// repair is a no-op when the chain is already intact.
-	b.repairAncestorChain(prevNode, 2*int32(checker.MinerConfirmationWindow()))
+	// and the windowed ancestor walk below can reach even further back (on a
+	// cold start the threshold cache is empty and several windows are walked
+	// before a cached state is found).  The in-memory header window may have
+	// severed some of those links (see evictWindow), which would make the
+	// walk dereference a nil parent and crash the node during block
+	// connection.  Re-link any severed ancestors from the cold index first so
+	// the walk always sees the true chain; the repair is a no-op when the
+	// chain is already intact.
+	b.repairAncestorChain(prevNode, 4*int32(checker.MinerConfirmationWindow()))
 
 	// If the deployment has a nonzero AlwaysActiveHeight and the next
 	// block’s height is at or above that threshold, then force the state
