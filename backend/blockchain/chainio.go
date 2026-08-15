@@ -1603,6 +1603,11 @@ func (b *BlockChain) initChainState() error {
 	var headerStateHash chainhash.Hash
 	var headerStateHeight int32
 	var needHeightRebuild bool
+	// useSnapshot is set when the persisted best-tip snapshot validated and
+	// was used to skip the full block-index scan.  It is read again after the
+	// view closes so a fresh snapshot can be persisted when the full scan
+	// path ran instead (the snapshot is only written on connect otherwise).
+	var useSnapshot bool
 	err = b.db.View(func(dbTx database.Tx) error {
 		// Fetch the stored chain state from the database metadata.
 		// When it doesn't exist, it means the database hasn't been
@@ -1665,8 +1670,66 @@ func (b *BlockChain) initChainState() error {
 		// materialized.
 		var runningWorkSum *big.Int
 
-		cursor := blockIndexBucket.Cursor()
-		for ok := cursor.First(); ok; ok = cursor.Next() {
+		// Attempt to load the block index from the persisted best-tip snapshot
+		// to skip the full 43.8M-row scan.  The snapshot is a pure cache: it
+		// is validated against the DB height index and falls back to the full
+		// scan below on any mismatch.
+		snapHash, snapHeight, snapWork, snapOK, serr := dbFetchBestTipSnapshot(dbTx)
+		if serr != nil {
+			return serr
+		}
+		useSnapshot = false
+		if snapOK {
+			mainHash, herr := dbFetchHashByHeight(dbTx, snapHeight)
+			if herr == nil && mainHash != nil && *mainHash == snapHash {
+				useSnapshot = true
+			}
+		}
+
+		if useSnapshot {
+			// Snapshot path: materialize only the in-memory window, walking
+			// back from the snapshot tip via the DB height index.  The window
+			// boundary anchor is seeded with the snapshot's cumulative work so
+			// consensus walks see the correct workSum.
+			log.Infof("Loading block index from snapshot (height %d)...",
+				snapHeight)
+			startH := b.index.windowBoundary(snapHeight)
+			if startH < 0 {
+				startH = 0
+			}
+			i = startH
+			runningWorkSum = new(big.Int).Set(snapWork)
+			for h := startH; h <= snapHeight; h++ {
+				hash, herr := dbFetchHashByHeight(dbTx, h)
+				if herr != nil {
+					return herr
+				}
+				header, status, _, rerr := dbFetchBlockRowByHash(dbTx, hash)
+				if rerr != nil {
+					return rerr
+				}
+				var parent *blockNode
+				if lastNode != nil && header.PrevBlock == lastNode.hash {
+					parent = lastNode
+				} else if parent = b.index.LookupNode(&header.PrevBlock); parent != nil {
+					// Side chain within the window.
+				}
+				node := new(blockNode)
+				initBlockNode(node, header, parent)
+				node.height = h
+				node.status = status
+				if h == startH {
+					// Boundary anchor: seed with the snapshot's cumulative
+					// work (initBlockNode allocated a pooled workSum).
+					node.workSum = node.workSum.Set(snapWork)
+				}
+				b.index.addNode(node)
+				lastNode = node
+				i = h
+			}
+		} else {
+			cursor := blockIndexBucket.Cursor()
+			for ok := cursor.First(); ok; ok = cursor.Next() {
 			header, status, err := deserializeBlockRow(cursor.Value())
 			if err != nil {
 				return err
@@ -1752,6 +1815,7 @@ func (b *BlockChain) initChainState() error {
 			lastNode = node
 			i++
 		}
+		} // end else (full scan fallback) / else 结束（全量扫描回退）
 
 		// Set the best chain view and the best header to the stored best state.
 		tip := b.index.LookupNode(&state.hash)
@@ -1849,6 +1913,21 @@ func (b *BlockChain) initChainState() error {
 		return err
 	}
 
+	// When the full-scan path ran (no valid snapshot), persist a fresh
+	// best-tip snapshot now so the next startup can skip the scan.  The
+	// snapshot is only otherwise written on connect/disconnect.
+	if !useSnapshot {
+		if tip := b.bestChain.Tip(); tip != nil {
+			if err := b.db.Update(func(dbTx database.Tx) error {
+				return dbPutBestTipSnapshot(dbTx, &tip.hash, tip.height,
+					tip.workSum)
+			}); err != nil {
+				return err
+			}
+			log.Infof("Persisted best-tip snapshot (height %d)", tip.height)
+		}
+	}
+
 	// Rebuild the height-to-hash index for the best header chain when the
 	// stored copy is missing or stale.  This is a one-time O(n) sequential
 	// backfill over the persisted block index for databases that were synced
@@ -1869,6 +1948,48 @@ func (b *BlockChain) initChainState() error {
 
 // deserializeBlockRow parses a value in the block index bucket into a block
 // header and block status bitfield.
+// bestTipSnapshotKey is the key under which the best-tip snapshot is stored
+// in the blockheaderidx bucket.  It is a pure cache used to skip the full
+// 43.8M-row block-index scan at startup: the DB height index remains the
+// source of truth, and the snapshot is validated (height -> main-chain hash
+// comparison) before being trusted, falling back to a full scan otherwise.
+var bestTipSnapshotKey = []byte("\x00best_tip_snapshot")
+
+// dbFetchBestTipSnapshot loads the persisted best-tip snapshot.  Returns
+// ok=false when absent or malformed.
+func dbFetchBestTipSnapshot(dbTx database.Tx) (hash chainhash.Hash, height int32, work *big.Int, ok bool, err error) {
+	meta := dbTx.Metadata()
+	bucket := meta.Bucket(blockIndexBucketName)
+	if bucket == nil {
+		return chainhash.Hash{}, 0, nil, false, nil
+	}
+	raw := bucket.Get(bestTipSnapshotKey)
+	if raw == nil || len(raw) != 32+4+32 {
+		return chainhash.Hash{}, 0, nil, false, nil
+	}
+	copy(hash[:], raw[:32])
+	height = int32(binary.LittleEndian.Uint32(raw[32:36]))
+	work = new(big.Int).SetBytes(raw[36:68])
+	return hash, height, work, true, nil
+}
+
+// dbPutBestTipSnapshot persists the best-tip snapshot in the same
+// transaction as the block index so a crash never leaves the snapshot and
+// the block index out of sync.
+func dbPutBestTipSnapshot(dbTx database.Tx, hash *chainhash.Hash, height int32, work *big.Int) error {
+	meta := dbTx.Metadata()
+	bucket, err := meta.CreateBucketIfNotExists(blockIndexBucketName)
+	if err != nil {
+		return err
+	}
+	raw := make([]byte, 32+4+32)
+	copy(raw[:32], hash[:])
+	binary.LittleEndian.PutUint32(raw[32:36], uint32(height))
+	wb := work.Bytes()
+	copy(raw[36+32-len(wb):], wb) // right-align to 32B big-endian
+	return bucket.Put(bestTipSnapshotKey, raw)
+}
+
 func deserializeBlockRow(blockRow []byte) (*wire.BlockHeader, blockStatus, error) {
 	buffer := bytes.NewReader(blockRow)
 

@@ -673,6 +673,13 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 			return err
 		}
 
+		// Persist the best-tip snapshot in the same transaction so a crash
+		// never leaves it out of sync with the block index.  It is a pure
+		// cache used to skip the full index scan at startup.
+		if err := dbPutBestTipSnapshot(dbTx, &node.hash, node.height, node.workSum); err != nil {
+			return err
+		}
+
 		// If the pruneTarget isn't 0, we should attempt to delete older blocks
 		// from the database.
 		if b.pruneTarget != 0 {
@@ -830,6 +837,15 @@ func (b *BlockChain) disconnectBlock(node *blockNode, block *btcutil.Block, view
 		err := dbPutBestState(dbTx, state, node.workSum)
 		if err != nil {
 			return err
+		}
+
+		// Persist the best-tip snapshot for the new tip (the parent of the
+		// disconnected node) in the same transaction.
+		if node.parent != nil {
+			if err := dbPutBestTipSnapshot(dbTx, &node.parent.hash,
+				node.parent.height, node.parent.workSum); err != nil {
+				return err
+			}
 		}
 
 		// Remove the block hash and height from the block index which

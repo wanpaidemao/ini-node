@@ -150,7 +150,7 @@ func (m *Manager) Init(chain *blockchain.BlockChain,
 			// them in height order, so out-of-order emission is fine.
 			// 批量读 spend journal:每 fetchBatchBlocks 块一次数据库视图读取,
 			// 摊薄每块读事务开销;结果仍按块发出,由消费端按高度顺序合并。
-			const fetchBatchBlocks = 32
+			const fetchBatchBlocks = 128
 			var blocks []*btcutil.Block
 			var blockHeights []int32
 
