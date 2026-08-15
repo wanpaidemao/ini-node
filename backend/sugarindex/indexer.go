@@ -78,11 +78,23 @@ func (m *Manager) Init(chain *blockchain.BlockChain,
 	// index from scratch (~30h on 43.8M blocks).
 	// MainChainHasBlock 只查内存索引,重启后 tip 远低于窗口会被驱逐;改用
 	// 走数据库的高度查询,避免把合法 tip 误判为孤儿而整库重来。
+	//
+	// BlockHashByHeight resolves the main-chain block at the tip height via
+	// the node-at-height cold read (best-chain window first, DB height index
+	// fallback).  Comparing hashes at that height is the reliable orphan
+	// test: only a genuine reorg (a different block occupying the tip
+	// height) rebuilds from scratch.  BlockHeightByHash was replaced because
+	// its materializeColdNode path can miss blocks near the header-window
+	// boundary and falsely declare a valid tip orphaned.
+	// BlockHashByHeight 经 node-at-height 冷读(窗口优先、DB 高度索引兜底)解析
+	// tip 高度处的主链块,再比较哈希是可靠的孤儿判定:仅当该高度被重组为不同块
+	// 才整库重建。替换 BlockHeightByHash 因其 materializeColdNode 路径在窗口
+	// 边界可能漏块而误判合法 tip 为孤儿。
 	if tipHash != nil {
-		mainHeight, herr := chain.BlockHeightByHash(tipHash)
-		if herr != nil || mainHeight != tipHeight {
-			log.Warnf("Sugar index tip %v is orphaned; rebuilding from scratch",
-				tipHash)
+		mainHash, herr := chain.BlockHashByHeight(tipHeight)
+		if herr != nil || mainHash == nil || *mainHash != *tipHash {
+			log.Warnf("Sugar index tip %v (height %d) not on main chain (main=%v); rebuilding from scratch",
+				tipHash, tipHeight, mainHash)
 			if err := m.wipeIndex(); err != nil {
 				return err
 			}

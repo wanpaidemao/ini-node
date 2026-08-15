@@ -32,6 +32,15 @@ func DecodeIndexKey(addrStr string, params *chaincfg.Params) (int, []byte, error
 		return AddrIndtPubkeyAddress, a.ScriptAddress(), nil
 	case *address.AddressScriptHash:
 		return AddrIndtScriptAddress, a.ScriptAddress(), nil
+	case *address.AddressWitnessPubKeyHash:
+		// bech32 P2WPKH (sugar1...): address/v2 returns this exact type,
+		// which embeds but is NOT AddressSegWit, so it needs its own case.
+		// bech32 P2WPKH: address/v2 返回此确切类型(内嵌 AddressSegWit 但
+		// 不是它),必须单独 case,否则落入 unknown 导致 -5 Invalid address。
+		return AddrIndtWitnessV0KeyHash, a.ScriptAddress(), nil
+	case *address.AddressWitnessScriptHash:
+		// bech32 P2WSH: same reasoning as above. / bech32 P2WSH:同上。
+		return AddrIndtWitnessV0ScriptHash, a.ScriptAddress(), nil
 	case *address.AddressSegWit:
 		prog := a.ScriptAddress()
 		switch {
