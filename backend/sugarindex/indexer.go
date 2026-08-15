@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/btcsuite/btcd/blockchain"
 	"github.com/btcsuite/btcd/btcutil/v2"
@@ -73,32 +74,44 @@ func (m *Manager) Init(chain *blockchain.BlockChain,
 
 	// MainChainHasBlock only consults the in-memory index, which evicts the
 	// tip after a restart (the tip sits far below the header window).  Use
-	// the database-backed height lookup instead so a valid tip is not
-	// falsely declared orphaned, which would wipe and rebuild the whole
-	// index from scratch (~30h on 43.8M blocks).
-	// MainChainHasBlock 只查内存索引,重启后 tip 远低于窗口会被驱逐;改用
-	// 走数据库的高度查询,避免把合法 tip 误判为孤儿而整库重来。
+	// the DB height index directly instead (MainChainHashByHeight), which is
+	// authoritative for every height regardless of the in-memory window, so
+	// a valid tip is never falsely declared orphaned (which would wipe and
+	// rebuild the whole 43.8M-block index from scratch).
 	//
-	// BlockHashByHeight resolves the main-chain block at the tip height via
-	// the node-at-height cold read (best-chain window first, DB height index
-	// fallback).  Comparing hashes at that height is the reliable orphan
-	// test: only a genuine reorg (a different block occupying the tip
-	// height) rebuilds from scratch.  BlockHeightByHash was replaced because
-	// its materializeColdNode path can miss blocks near the header-window
-	// boundary and falsely declare a valid tip orphaned.
-	// BlockHashByHeight 经 node-at-height 冷读(窗口优先、DB 高度索引兜底)解析
-	// tip 高度处的主链块,再比较哈希是可靠的孤儿判定:仅当该高度被重组为不同块
-	// 才整库重建。替换 BlockHeightByHash 因其 materializeColdNode 路径在窗口
-	// 边界可能漏块而误判合法 tip 为孤儿。
+	// Only a genuine reorg — the main-chain block at the tip height being a
+	// different hash — rebuilds.  An unresolvable height (DB has no block at
+	// that height) is treated conservatively: keep the index and continue
+	// incrementally rather than wiping, so a snapshot-window edge or a
+	// transient height-index gap can never trigger a full rebuild.
+	// MainChainHasBlock 只查内存索引,重启后 tip 远低于窗口会被驱逐;改用直接走
+	// DB 高度索引的 MainChainHashByHeight,它对任意高度都权威(不依赖内存窗口),
+	// 合法 tip 不会再被误判孤儿而整库重来。仅当该高度主链块 hash 确实不同
+	// (真重组)才重建;高度无法解析(DB 无该高度块)时保守处理:保留索引继续增量,
+	// 避免快照窗口边缘或高度索引瞬时缺口触发整库重建。
 	if tipHash != nil {
-		mainHash, herr := chain.BlockHashByHeight(tipHeight)
-		if herr != nil || mainHash == nil || *mainHash != *tipHash {
-			log.Warnf("Sugar index tip %v (height %d) not on main chain (main=%v); rebuilding from scratch",
+		mainHash, herr := chain.MainChainHashByHeight(tipHeight)
+		switch {
+		case herr == nil && mainHash != nil && *mainHash != *tipHash:
+			// Genuine reorg: a different block occupies the tip height.
+			// 真重组:该高度主链块已不同,重建。
+			log.Warnf("Sugar index tip %v (height %d) replaced by %v; rebuilding from scratch",
 				tipHash, tipHeight, mainHash)
 			if err := m.wipeIndex(); err != nil {
 				return err
 			}
 			tipHeight = -1
+		case herr != nil && mainHash == nil:
+			// Unresolvable height: DB has no main-chain block at the tip
+			// height (snapshot-window edge / transient height-index gap).
+			// Keep the index and continue incrementally; a real reorg would
+			// surface via connectBlock instead.
+			// 高度无法解析:DB 无该高度主链块(快照窗口边缘/高度索引瞬时缺口)。
+			// 保留索引继续增量;真重组会在 connectBlock 时暴露。
+			log.Warnf("Sugar index tip %v (height %d) unresolvable (%v); continuing incrementally",
+				tipHash, tipHeight, herr)
+		default:
+			// Tip is on the main chain (hash matches). / tip 在主链上(hash 匹配)。
 		}
 	}
 
@@ -609,9 +622,11 @@ func (bd *blockDeltas) undoSpent(txIn *wire.TxIn,
 // the RPC server is still starting.
 func (m *Manager) writeProgress(height, total int32) {
 	raw, err := json.Marshal(map[string]interface{}{
-		"height":  height,
-		"total":   total,
-		"percent": float64(height) / float64(total) * 100,
+		"phase":     "index", // distinguishes index rebuild from block-index load / 区分索引重建与区块索引加载
+		"height":    height,
+		"total":     total,
+		"percent":   float64(height) / float64(total) * 100,
+		"updatedAt": time.Now().Unix(),
 	})
 	if err != nil {
 		return

@@ -7,8 +7,11 @@ package blockchain
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"math/big"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -1139,6 +1142,45 @@ func dbFetchHashByHeight(dbTx database.Tx, height int32) (*chainhash.Hash, error
 	return &hash, nil
 }
 
+// MainChainHashByHeight returns the main-chain block hash at the given
+// height directly from the DB height index.  Unlike BlockHashByHeight /
+// nodeAtHeight it does NOT depend on the in-memory header window, so it
+// works for any height — including a sugar-index tip that sits just above
+// the window materialized from the best-tip snapshot.  Returns
+// errNotInMainChain when the height has no main-chain block.
+func (b *BlockChain) MainChainHashByHeight(height int32) (*chainhash.Hash, error) {
+	var hash *chainhash.Hash
+	err := b.db.View(func(dbTx database.Tx) error {
+		var herr error
+		hash, herr = dbFetchHashByHeight(dbTx, height)
+		return herr
+	})
+	return hash, err
+}
+
+// writeLoadProgress writes the block-index load progress to
+// <sugarIndexDir>/progress.json so the frontend can show it via
+// /api/index-progress while the RPC server is still starting.  The format
+// matches sugarindex's progress file ({height,total,percent}) plus phase
+// and updatedAt so both the load and the index rebuild share one progress
+// bar and an ETA can be derived from successive polls.
+func (b *BlockChain) writeLoadProgress(height, total int32) {
+	if b.sugarIndexDir == "" {
+		return
+	}
+	raw, err := json.Marshal(map[string]interface{}{
+		"phase":     "load",
+		"height":    height,
+		"total":     total,
+		"percent":   float64(height) / float64(total) * 100,
+		"updatedAt": time.Now().Unix(),
+	})
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(b.sugarIndexDir, "progress.json"), raw, 0o600)
+}
+
 // dbFetchBlockRowByHash uses an existing database transaction to retrieve the
 // block header and status for the provided hash from the block index via the
 // two-hop hash to-height to-block-index mapping, without reading the block
@@ -1814,6 +1856,11 @@ func (b *BlockChain) initChainState() error {
 
 			lastNode = node
 			i++
+			if i%500000 == 0 {
+				// Surface load progress (frontend shows it via
+				// /api/index-progress while RPC is still starting).
+				b.writeLoadProgress(i, headerStateHeight)
+			}
 		}
 		} // end else (full scan fallback) / else 结束（全量扫描回退）
 

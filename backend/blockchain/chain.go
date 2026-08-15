@@ -110,6 +110,7 @@ type BlockChain struct {
 	sigCache            *txscript.SigCache
 	indexManager        IndexManager
 	hashCache           *txscript.HashCache
+	sugarIndexDir       string // datadir/index; progress.json written during load / 加载期写 progress.json
 
 	// The following fields are calculated based upon the provided chain
 	// parameters.  They are also set when the instance is created and
@@ -2394,6 +2395,15 @@ type Config struct {
 	// This field is required.
 	UtxoCacheMaxSize uint64
 
+	// SugarIndexDir is the directory of the sugar index (the standalone
+	// LevelDB under datadir/index).  When non-empty, initChainState writes
+	// periodic load progress to progress.json there so the frontend can
+	// show the block-index load progress before the RPC server starts.
+	// SugarIndexDir 是 sugar 索引目录(datadir/index 下的独立 LevelDB)。
+	// 非空时 initChainState 会定期把加载进度写入该目录的 progress.json,
+	// 让前端在 RPC 服务启动前也能显示区块索引加载进度。
+	SugarIndexDir string
+
 	// HeaderWindow, when greater than zero, bounds the number of recent
 	// headers/blocks kept in memory to this many nodes at the tip of both the
 	// best chain and best header chain.  Headers outside the window are read
@@ -2511,6 +2521,7 @@ func New(config *Config) (*BlockChain, error) {
 		index:               newBlockIndex(config.DB, params),
 		utxoCache:           newUtxoCache(config.DB, config.UtxoCacheMaxSize),
 		hashCache:           config.HashCache,
+		sugarIndexDir:       config.SugarIndexDir,
 		bestChain:           newChainView(nil),
 		bestHeader:          newChainView(nil),
 		coldCache:           newColdNodeCache(),

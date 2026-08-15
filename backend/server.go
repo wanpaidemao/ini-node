@@ -66,7 +66,7 @@ const (
 var (
 	// userAgentName is the user agent name and is used to help identify
 	// ourselves to other bitcoin peers.
-	userAgentName = "btcd"
+	userAgentName = "ini"
 
 	// userAgentVersion is the user agent version and is used to help
 	// identify ourselves to other bitcoin peers.
@@ -3182,6 +3182,7 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 		HashCache:        s.hashCache,
 		Prune:            cfg.Prune * 1024 * 1024,
 		UtxoCacheMaxSize: uint64(cfg.UtxoCacheMaxSizeMiB) * 1024 * 1024,
+		SugarIndexDir:    filepath.Join(cfg.DataDir, "index"),
 		HeaderWindow:     cfg.HeaderWindow,
 	})
 	if err != nil {
