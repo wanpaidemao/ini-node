@@ -116,7 +116,7 @@ func (c *client) call(method string, params []interface{}) (json.RawMessage, *rp
 
 // balance maps getaddressbalance -> {confirmed, unconfirmed}.
 func (c *client) handleBalance(w http.ResponseWriter, r *http.Request, addr string) {
-	raw, rpcErr := c.call("getaddressbalance", []interface{}{[]string{addr}})
+	raw, rpcErr := c.call("getaddressbalance", []interface{}{addr})
 	if rpcErr != nil {
 		writeReply(w, nil, rpcErr)
 		return
@@ -141,7 +141,11 @@ func (c *client) handleBalance(w http.ResponseWriter, r *http.Request, addr stri
 func (c *client) handleUnspent(w http.ResponseWriter, r *http.Request, addr string) {
 	amount, _ := strconv.ParseInt(r.URL.Query().Get("amount"), 10, 64)
 
-	raw, rpcErr := c.call("getaddressutxos", []interface{}{[]string{addr}})
+	// getaddressutxos expects an object {"addresses":[...]}, not a bare array.
+	// getaddressutxos 参数是对象 {"addresses":[...]},不是裸数组。
+	raw, rpcErr := c.call("getaddressutxos", []interface{}{
+		map[string]interface{}{"addresses": []string{addr}},
+	})
 	if rpcErr != nil {
 		// New address with no history -> empty set, like the original backend.
 		if rpcErr.Code == -5 {
