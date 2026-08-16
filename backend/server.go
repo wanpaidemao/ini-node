@@ -3189,6 +3189,14 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 		return nil, err
 	}
 
+	// Wire the sugar index to the chain so txid lookups (getrawtransaction
+	// via the txid table) can resolve (height, txIndex) entries.
+	// 把 sugar index 挂接上链,使 txid 查询(getrawtransaction 走 txid 表)
+	// 能把 (height, txIndex) 解析为真实交易。
+	if s.sugarIndex != nil {
+		s.sugarIndex.SetChain(s.chain)
+	}
+
 	// Search for a FeeEstimator state in the database. If none can be found
 	// or if it cannot be loaded, create a new one.
 	db.Update(func(tx database.Tx) error {

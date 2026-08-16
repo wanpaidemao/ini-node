@@ -21,6 +21,47 @@ import (
 // or the '\x00obfuscate_key' key.
 var indexTipKey = []byte("\x00btcd_sugarindex_tip")
 
+// txIndexKeyPrefix 是 txid -> (height, txIndex) 映射表的前缀。它不用混淆键,
+// 固定首字节 0x07;getrawtransaction 用 txid 解析出块高度+块内索引后,
+// 经 BlockByHeight 从主库读块取交易。
+// txIndexKeyPrefix is the key prefix for the txid -> (height, txIndex)
+// mapping table inside the sugar index.  Unlike the obfuscated address
+// keys it uses a fixed 0x07 first byte; getrawtransaction resolves a txid
+// to a block height + in-block index, then reads the block from the main
+// database via BlockByHeight.
+const txIndexKeyPrefix = 0x07
+
+// txIndexValue 编码块高度(4B LE)+块内交易索引(2B LE)。
+// txIndexValue encodes a block height (4B LE) + in-block tx index (2B LE).
+type txIndexValue struct {
+	height  int32
+	txIndex uint16
+}
+
+func (v txIndexValue) bytes() []byte {
+	raw := make([]byte, 6)
+	binary.LittleEndian.PutUint32(raw[0:4], uint32(v.height))
+	binary.LittleEndian.PutUint16(raw[4:6], v.txIndex)
+	return raw
+}
+
+func decodeTxIndexValue(raw []byte) (txIndexValue, bool) {
+	if len(raw) != 6 {
+		return txIndexValue{}, false
+	}
+	return txIndexValue{
+		height:  int32(binary.LittleEndian.Uint32(raw[0:4])),
+		txIndex: binary.LittleEndian.Uint16(raw[4:6]),
+	}, true
+}
+
+func txIndexKey(txid *chainhash.Hash) []byte {
+	k := make([]byte, 1+chainhash.HashSize)
+	k[0] = txIndexKeyPrefix
+	copy(k[1:], txid[:])
+	return k
+}
+
 // openIndexDB 打开(必要时创建)位于 path 的 raw LevelDB,并加载或生成 8 字节
 // 混淆密钥。目录不存在时自动创建。
 // openIndexDB opens (creating if needed) the raw LevelDB at path and loads or

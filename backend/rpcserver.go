@@ -2719,6 +2719,40 @@ func handleGetRawTransaction(s *rpcServer, cmd interface{}, closeChan <-chan str
 	var blkHeight int32
 	tx, err := s.cfg.TxMemPool.FetchTransaction(txHash)
 	if err != nil {
+		// Plan A: resolve historical transactions via the sugar index
+		// txid table (no native txindex needed).  Handled inline so the
+		// existing TxIndex path below stays untouched.
+		// 方案 A:通过 sugar index 的 txid 表解析历史交易(无需原生 txindex)。
+		// 内联处理,不动下方原有 TxIndex 路径。
+		if s.cfg.SugarIndex != nil {
+			if smtx, smHeight, gErr := s.cfg.SugarIndex.GetTxByHash(txHash); gErr == nil && smtx != nil {
+				if !verbose {
+					hexStr, hexErr := messageToHex(smtx)
+					if hexErr != nil {
+						return nil, hexErr
+					}
+					return hexStr, nil
+				}
+				blkHash, hErr := s.cfg.Chain.BlockHashByHeight(smHeight)
+				if hErr != nil {
+					return nil, internalRPCError(hErr.Error(),
+						"Failed to retrieve block hash")
+				}
+				header, hErr := s.cfg.Chain.HeaderByHash(blkHash)
+				if hErr != nil {
+					return nil, internalRPCError(hErr.Error(),
+						"Failed to fetch block header")
+				}
+				chainHeight := s.cfg.Chain.BestSnapshot().Height
+				rawTxn, rErr := createTxRawResult(s.cfg.ChainParams, smtx,
+					txHash.String(), &header, blkHash.String(), smHeight,
+					chainHeight)
+				if rErr != nil {
+					return nil, rErr
+				}
+				return *rawTxn, nil
+			}
+		}
 		if s.cfg.TxIndex == nil {
 			return nil, &btcjson.RPCError{
 				Code: btcjson.ErrRPCNoTxInfo,

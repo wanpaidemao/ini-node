@@ -34,9 +34,48 @@ func UseLogger(logger btclog.Logger) { log = logger }
 // mirrors the umami address/spent/timestamp index byte-for-byte, and implements
 // blockchain.IndexManager.
 type Manager struct {
-	db   *leveldb.DB
-	key  []byte // 8 字节混淆密钥
-	path string
+	db    *leveldb.DB
+	key   []byte // 8 字节混淆密钥
+	path  string
+	chain *blockchain.BlockChain // set after chain is built (for BlockByHeight) / 链建好后设置(供 BlockByHeight)
+}
+
+// SetChain attaches the blockchain so txid lookups can resolve a
+// (height, txIndex) entry to the actual transaction.  The chain is built
+// after the sugar index is opened, so it is wired up afterwards.
+// SetChain 挂接 blockchain,使 txid 查询能把 (height, txIndex) 解析为真实交易。
+// 链在 sugar index 打开之后才构建,故稍后接线。
+func (m *Manager) SetChain(chain *blockchain.BlockChain) {
+	m.chain = chain
+}
+
+// GetTxByHash resolves a transaction hash to the raw transaction using the
+// txid table (txid -> height, txIndex) and the main-chain block.  Returns
+// (nil, 0, nil) when the txid is unknown.
+// GetTxByHash 用 txid 表(txid -> height, txIndex)与主链块,把交易哈希解析为
+// 原始交易。txid 未知时返回 (nil, 0, nil)。
+func (m *Manager) GetTxByHash(txid *chainhash.Hash) (*wire.MsgTx, int32, error) {
+	raw, err := m.db.Get(txIndexKey(txid), nil)
+	if err != nil {
+		return nil, 0, nil // unknown txid / txid 未知
+	}
+	v, ok := decodeTxIndexValue(raw)
+	if !ok {
+		return nil, 0, fmt.Errorf("sugarindex: corrupt txid entry for %v", txid)
+	}
+	if m.chain == nil {
+		return nil, 0, fmt.Errorf("sugarindex: chain not set")
+	}
+	block, err := m.chain.BlockByHeight(v.height)
+	if err != nil {
+		return nil, 0, err
+	}
+	txs := block.Transactions()
+	if int(v.txIndex) >= len(txs) {
+		return nil, 0, fmt.Errorf("sugarindex: tx index %d out of range in block %d",
+			v.txIndex, v.height)
+	}
+	return txs[v.txIndex].MsgTx(), v.height, nil
 }
 
 // Ensure Manager satisfies the blockchain.IndexManager interface.
@@ -316,6 +355,14 @@ func (m *Manager) connectBlockBatch(block *btcutil.Block,
 	for txIdx, tx := range block.Transactions() {
 		msgTx := tx.MsgTx()
 		txHash := msgTx.TxHash()
+
+		// Record txid -> (height, txIndex) so getrawtransaction can
+		// resolve any historical transaction by hash.  The key uses the
+		// fixed 0x07 prefix (not obfuscated).
+		// 记录 txid -> (height, txIndex),供 getrawtransaction 按哈希解析
+		// 任意历史交易。键用固定 0x07 前缀(不混淆)。
+		batch.Put(txIndexKey(&txHash),
+			txIndexValue{height: height, txIndex: uint16(txIdx)}.bytes())
 
 		// The coinbase (txIdx 0) has no entries in the spend journal.
 		if txIdx != 0 {
