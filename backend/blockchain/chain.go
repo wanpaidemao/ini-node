@@ -1210,16 +1210,13 @@ func (b *BlockChain) verifyReorganizationValidity(detachNodes, attachNodes *list
 		// descendants as having an invalid ancestor.
 		err = b.checkConnectBlock(n, block, view, nil)
 		if err != nil {
-			// SugarChain: do NOT persist statusValidateFailed /
-			// statusInvalidAncestor marks.  A validation failure here is
-			// often transient (e.g. relaxed rules accepting blocks that
-			// the network already mined); refusing the block without a
-			// persistent mark lets the node automatically retry and
-			// re-sync the same height from peers once the rules are
-			// aligned.  Per-block cost of revalidation is acceptable.
-			// 链上:不持久化 statusValidateFailed/statusInvalidAncestor 标记。
-			// 校验失败多为暂时性(如规则放宽后接受网络已挖出的块);不标记
-			// 仅拒绝当前块,节点可自动重试并从 peer 重新同步同一高度。
+			if _, ok := err.(RuleError); ok {
+				b.index.SetStatusFlags(n, statusValidateFailed)
+				for de := e.Next(); de != nil; de = de.Next() {
+					dn := de.Value.(*blockNode)
+					b.index.SetStatusFlags(dn, statusInvalidAncestor)
+				}
+			}
 			return nil, nil, nil, err
 		}
 		b.index.SetStatusFlags(n, statusValid)
