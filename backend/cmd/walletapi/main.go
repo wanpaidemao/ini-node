@@ -137,6 +137,40 @@ func (c *client) handleBalance(w http.ResponseWriter, r *http.Request, addr stri
 	}, nil)
 }
 
+// history maps getaddressdeltas -> [{txid,height,satoshis,index}].
+// history 转发 getaddressdeltas -> [{txid,height,satoshis,index}]。
+func (c *client) handleHistory(w http.ResponseWriter, r *http.Request, addr string) {
+	raw, rpcErr := c.call("getaddressdeltas", []interface{}{
+		map[string]interface{}{"addresses": []string{addr}},
+	})
+	if rpcErr != nil {
+		// New address with no history -> empty set.
+		if rpcErr.Code == -5 {
+			writeReply(w, []interface{}{}, nil)
+			return
+		}
+		writeReply(w, nil, rpcErr)
+		return
+	}
+	var results []struct {
+		Txid     string `json:"txid"`
+		Height   int32  `json:"height"`
+		Satoshis int64  `json:"satoshis"`
+		Index    int32  `json:"index"`
+	}
+	if err := json.Unmarshal(raw, &results); err != nil {
+		writeReply(w, nil, &rpcError{Code: -32603, Message: err.Error()})
+		return
+	}
+	hist := make([]interface{}, 0, len(results))
+	for _, h := range results {
+		hist = append(hist, map[string]interface{}{
+			"txid": h.Txid, "height": h.Height, "satoshis": h.Satoshis, "index": h.Index,
+		})
+	}
+	writeReply(w, hist, nil)
+}
+
 // unspent maps getaddressutxos -> [{txid,index,value,script}].
 func (c *client) handleUnspent(w http.ResponseWriter, r *http.Request, addr string) {
 	amount, _ := strconv.ParseInt(r.URL.Query().Get("amount"), 10, 64)
@@ -255,6 +289,8 @@ func route(c *client, w http.ResponseWriter, r *http.Request) {
 		c.handleBalance(w, r, parts[1])
 	case len(parts) == 2 && parts[0] == "unspent":
 		c.handleUnspent(w, r, parts[1])
+	case len(parts) == 2 && parts[0] == "history":
+		c.handleHistory(w, r, parts[1])
 	case len(parts) == 1 && parts[0] == "fee":
 		c.handleFee(w, r)
 	case len(parts) == 2 && parts[0] == "transaction":

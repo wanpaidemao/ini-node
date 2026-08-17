@@ -9,9 +9,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
 )
@@ -35,13 +38,12 @@ var (
 	rpcHTTP     = &http.Client{}
 )
 
-// findIniPath locates backend/btcd-runtime.ini. Prefers an explicit override,
-// then paths relative to the executable (bin/../../backend), then the CWD.
+// findIniPath locates btcd-runtime.ini. Prefers an explicit INI_NODE_INI
+// override, then a btcd-runtime.ini in the current working directory.
+// findIniPath 定位 btcd-runtime.ini。优先显式 INI_NODE_INI 覆盖,其次是
+// 当前工作目录下的 btcd-runtime.ini。
 func findIniPath() string {
-	var exeDir, cwd string
-	if exe, err := os.Executable(); err == nil {
-		exeDir = filepath.Dir(exe)
-	}
+	var cwd string
 	if wd, err := os.Getwd(); err == nil {
 		cwd = wd
 	}
@@ -49,16 +51,8 @@ func findIniPath() string {
 	if p := os.Getenv("INI_NODE_INI"); p != "" {
 		candidates = append(candidates, p)
 	}
-	if exeDir != "" {
-		candidates = append(candidates,
-			filepath.Join(exeDir, "..", "..", "backend", "btcd-runtime.ini"),
-			filepath.Join(exeDir, "..", "backend", "btcd-runtime.ini"),
-			filepath.Join(exeDir, "backend", "btcd-runtime.ini"),
-		)
-	}
 	if cwd != "" {
 		candidates = append(candidates,
-			filepath.Join(cwd, "backend", "btcd-runtime.ini"),
 			filepath.Join(cwd, "btcd-runtime.ini"),
 		)
 	}
@@ -247,12 +241,19 @@ func handleNodeConfig(iniPath string, o map[string]string, w http.ResponseWriter
 			rpcEndpoint = "http://" + rl
 		}
 	}
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	// Return the FULL parsed ini (datadir/headerwindow/rpclisten/rpcuser/...)
+	// plus the connection summary, so the control center can show and edit
+	// every startup parameter.
+	// 返回完整解析的 ini 参数(datadir/headerwindow/rpclisten/rpcuser/...)
+	// 外加连接摘要,供控制中心展示和编辑全部启动参数。
+	out := map[string]interface{}{
 		"rpcEndpoint": rpcEndpoint,
-		"rpcUser":     o["rpcuser"],
-		"rpcPass":     o["rpcpass"],
 		"credFromIni": true,
-	})
+	}
+	for k, v := range o {
+		out[k] = v
+	}
+	_ = json.NewEncoder(w).Encode(out)
 }
 
 // handleIndexProgress serves the sugarindex rebuild progress written by the
@@ -305,6 +306,112 @@ func handleIndexProgress(iniPath string, o map[string]string, w http.ResponseWri
 	_ = json.NewEncoder(w).Encode(p)
 }
 
+// handleNodeStart starts the btcd node unless it is already listening on
+// the configured rpclisten (probe first to avoid a double start).
+// handleNodeStart 启动 btcd 节点；先探测 rpclisten 防双开。
+func handleNodeStart(opts map[string]string, w http.ResponseWriter, req *http.Request) {
+	port := opts["rpclisten"]
+	if port == "" {
+		port = "127.0.0.1:8334"
+	}
+	if !strings.Contains(port, ":") {
+		port = "127.0.0.1:" + port
+	}
+	if conn, err := net.DialTimeout("tcp", port, 800*time.Millisecond); err == nil {
+		conn.Close()
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "running": true})
+		return
+	}
+	// Locate the backend via findIniPath (CWD or INI_NODE_INI); btcd.exe
+	// lives next to the ini in backend/.  Do NOT rely on os.Args[0], which
+	// points at the Wails binary and is not reliably next to backend/.
+	// 用 findIniPath 定位后端目录(CWD 或 INI_NODE_INI);btcd.exe 与 ini 同在
+	// backend/。不要依赖 os.Args[0](指向 Wails 二进制,不一定在 backend/ 旁)。
+	ini := findIniPath()
+	if ini == "" {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"ok":    false,
+			"error": "btcd-runtime.ini not found (set INI_NODE_INI or run from backend/) / 未找到 btcd-runtime.ini(设置 INI_NODE_INI 或在 backend/ 目录运行)",
+		})
+		return
+	}
+	backendDir := filepath.Dir(ini)
+	btcd := filepath.Join(backendDir, "btcd.exe")
+	logDir := filepath.Join(backendDir, "logs")
+	_ = os.MkdirAll(logDir, 0700)
+	out, _ := os.OpenFile(filepath.Join(logDir, "node.stdout.log"),
+		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	errf, _ := os.OpenFile(filepath.Join(logDir, "node.stderr.log"),
+		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	cmd := exec.Command(btcd, "--configfile="+ini)
+	cmd.Dir = filepath.Dir(btcd)
+	cmd.Stdout = out
+	cmd.Stderr = errf
+	if err := cmd.Start(); err != nil {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": err.Error()})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok": true, "running": false, "pid": cmd.Process.Pid,
+	})
+}
+
+// handleNodeStop stops the btcd process (idempotent).
+// handleNodeStop 停止 btcd 进程（幂等）。
+func handleNodeStop(w http.ResponseWriter, req *http.Request) {
+	cmd := exec.Command("powershell", "-NoProfile", "-Command",
+		"Stop-Process -Name btcd -Force -ErrorAction SilentlyContinue")
+	_ = cmd.Run()
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
+}
+
+// handleLogs serves the node log tail (GET ?lines=N) and clears it (POST).
+// handleLogs 返回节点日志尾部(GET ?lines=N)或清空(POST)。
+func handleLogs(w http.ResponseWriter, req *http.Request) {
+	w.Header().Set("content-type", "application/json")
+	exeDir, _ := filepath.Abs(filepath.Dir(os.Args[0]))
+	logPath := filepath.Join(exeDir, "..", "backend", "logs", "node.stdout.log")
+	if req.Method == http.MethodPost {
+		_ = os.Truncate(logPath, 0)
+		_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+		return
+	}
+	lines := 200
+	if q := req.URL.Query().Get("lines"); q != "" {
+		if n, err := strconv.Atoi(q); err == nil && n > 0 {
+			lines = n
+		}
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": err.Error()})
+		return
+	}
+	all := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(all) > lines {
+		all = all[len(all)-lines:]
+	}
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "lines": all})
+}
+
+// handleDBParams returns the currently tuned index/database parameters.
+// Changing these does NOT rebuild anything (they take effect on restart).
+// handleDBParams 返回当前调优的索引/数据库参数。修改这些参数不会触发重建
+// (重启后生效)。
+func handleDBParams(w http.ResponseWriter, req *http.Request) {
+	w.Header().Set("content-type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"writeBuffer":        "64 MiB",
+		"tableSize":          "64 MiB",
+		"compactionTotal":    "256 MiB",
+		"l0Files":            8,
+		"rebuildWorkers":     4,
+		"fetchBatchBlocks":   128,
+		"rebuildBatchBlocks": 100,
+		"headerWindow":       50000,
+	})
+}
+
 // rpcProxyMiddleware intercepts the RPC proxy and node-config routes that the
 // frontend hits relative to its own origin; everything else falls through to the
 // embedded asset server.
@@ -320,6 +427,14 @@ func rpcProxyMiddleware() application.Middleware {
 				handleNodeConfig(iniPath, opts, w, req)
 			case req.URL.Path == "/api/index-progress":
 				handleIndexProgress(iniPath, opts, w, req)
+			case req.URL.Path == "/api/node-start":
+				handleNodeStart(opts, w, req)
+			case req.URL.Path == "/api/node-stop":
+				handleNodeStop(w, req)
+			case req.URL.Path == "/api/logs":
+				handleLogs(w, req)
+			case req.URL.Path == "/api/db-params":
+				handleDBParams(w, req)
 			default:
 				next.ServeHTTP(w, req)
 			}

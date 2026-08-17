@@ -236,6 +236,15 @@
       <span class="topbar-title">{t(titles[app.route])}</span>
     </header>
 
+    {#if !app.connected}
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin:10px 16px;padding:10px 14px;border:1px solid #d97706;border-radius:8px;background:#fef3c7;font-size:13px">
+        <span>Node RPC not reachable / 节点 RPC 不可达</span>
+        <button class="btn btn-primary" onclick={() => navigate("control")} style="font-size:12px">
+          Open Control Center / 打开控制中心
+        </button>
+      </div>
+    {/if}
+
     <main id="main" class="page">
       {#if app.route === "dashboard"}
         <Dashboard />
