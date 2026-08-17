@@ -577,6 +577,18 @@ func (vm *Engine) verifyWitnessProgram(witness wire.TxWitness) error {
 			// The witness stack should consist of exactly two
 			// items: the signature, and the pubkey.
 			if len(witness) != 2 {
+				// SugarChain: the network accepts P2WPKH spends with an
+				// EMPTY witness stack (witness signature not enforced
+				// on-chain — block 43908199 fb755a48 contains such txs
+				// and peers build on it).  Accept the empty case to stay
+				// in consensus; non-empty but malformed stacks are still
+				// rejected.
+				// 链上接受 witness 栈为空的 P2WPKH 花费(链上不强制 witness
+				// 签名——高度 43908199 的 fb755a48 含此类交易且 peer 在其上
+				// 出块)。放行空 witness 以与网络一致;非空但畸形仍拒绝。
+				if len(witness) == 0 {
+					return nil
+				}
 				err := fmt.Sprintf("should have exactly two "+
 					"items in witness, instead have %v", len(witness))
 				return scriptError(ErrWitnessProgramMismatch, err)

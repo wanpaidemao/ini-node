@@ -26,6 +26,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -140,26 +141,13 @@ func (c *client) handleBalance(w http.ResponseWriter, r *http.Request, addr stri
 // history maps getaddressdeltas -> {items,total,offset} with pagination.
 // history 转发 getaddressdeltas -> {items,total,offset}(支持分页)。
 func (c *client) handleHistory(w http.ResponseWriter, r *http.Request, addr string) {
-	limit := 20
-	if q := r.URL.Query().Get("limit"); q != "" {
-		if n, err := strconv.Atoi(q); err == nil && n > 0 && n <= 200 {
-			limit = n
-		}
-	}
-	offset := 0
-	if q := r.URL.Query().Get("offset"); q != "" {
-		if n, err := strconv.Atoi(q); err == nil && n >= 0 {
-			offset = n
-		}
-	}
-
 	raw, rpcErr := c.call("getaddressdeltas", []interface{}{
 		map[string]interface{}{"addresses": []string{addr}},
 	})
 	if rpcErr != nil {
 		// New address with no history -> empty set.
 		if rpcErr.Code == -5 {
-			writeReply(w, map[string]interface{}{"items": []interface{}{}, "total": 0, "offset": 0}, nil)
+			writeReply(w, []interface{}{}, nil)
 			return
 		}
 		writeReply(w, nil, rpcErr)
@@ -175,23 +163,42 @@ func (c *client) handleHistory(w http.ResponseWriter, r *http.Request, addr stri
 		writeReply(w, nil, &rpcError{Code: -32603, Message: err.Error()})
 		return
 	}
-	total := len(results)
-	if offset > total {
-		offset = total
+	// Aggregate deltas by txid: one tx with several in/out for the same
+	// address yields several deltas; show one row per tx (amount = net sum,
+	// height = min). / 按 txid 聚合:同一地址在一笔交易的多笔输入/输出会生成
+	// 多条 delta;每个 txid 只显示一行(金额=净和,高度=最小)。
+	type aggT struct {
+		Txid     string
+		Height   int32
+		Satoshis int64
 	}
-	end := offset + limit
-	if end > total {
-		end = total
+	agg := map[string]aggT{}
+	for _, h := range results {
+		a := agg[h.Txid]
+		a.Txid = h.Txid
+		if a.Height == 0 || h.Height < a.Height {
+			a.Height = h.Height
+		}
+		a.Satoshis += h.Satoshis
+		agg[h.Txid] = a
 	}
-	items := make([]interface{}, 0, end-offset)
-	for _, h := range results[offset:end] {
+	aggr := make([]aggT, 0, len(agg))
+	for _, a := range agg {
+		aggr = append(aggr, a)
+	}
+	// Go map iteration order is random: sort by height for a stable page
+	// order (ascending = chain order, aligns with api-server/ElectrumX).
+	// Go map 遍历顺序随机:按高度排序保证分页顺序稳定(升序=链上顺序)。
+	sort.Slice(aggr, func(i, j int) bool {
+		return aggr[i].Height < aggr[j].Height
+	})
+	items := make([]interface{}, 0, len(aggr))
+	for _, h := range aggr {
 		items = append(items, map[string]interface{}{
-			"txid": h.Txid, "height": h.Height, "satoshis": h.Satoshis, "index": h.Index,
+			"txid": h.Txid, "height": h.Height, "satoshis": h.Satoshis,
 		})
 	}
-	writeReply(w, map[string]interface{}{
-		"items": items, "total": total, "offset": offset,
-	}, nil)
+	writeReply(w, items, nil)
 }
 
 // unspent maps getaddressutxos -> [{txid,index,value,script}].

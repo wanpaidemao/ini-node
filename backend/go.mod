@@ -4,10 +4,13 @@ go 1.25.0
 
 replace github.com/btcsuite/btcd/chaincfg/v2 => ./chaincfg
 
+replace github.com/btcsuite/btcd/txscript/v2 => ./txscript
+
 require (
 	github.com/btcsuite/btcd/address/v2 v2.0.0
 	github.com/btcsuite/btcd/btcec/v2 v2.5.0
 	github.com/btcsuite/btcd/btcutil/v2 v2.0.1
+	github.com/btcsuite/btcd/chaincfg/chainhash v1.2.0
 	github.com/btcsuite/btcd/chaincfg/v2 v2.0.0
 	github.com/btcsuite/btcd/chainhash/v2 v2.0.0
 	github.com/btcsuite/btcd/txscript/v2 v2.0.0

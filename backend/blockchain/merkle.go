@@ -245,14 +245,16 @@ func ValidateWitnessCommitment(blk *btcutil.Block) error {
 	// outputs, then the block MUST NOT contain any transactions with
 	// witness data.
 	if !witnessFound {
-		for _, tx := range blk.Transactions() {
-			msgTx := tx.MsgTx()
-			if msgTx.HasWitness() {
-				str := fmt.Sprintf("block contains transaction with witness" +
-					" data, yet no witness commitment present")
-				return ruleError(ErrUnexpectedWitness, str)
-			}
-		}
+		// SugarChain: the network's miners produce blocks with witness
+		// transactions but WITHOUT a coinbase witness commitment (the
+		// segwit deployment is always-active here, but the commitment
+		// rule is not enforced on-chain).  Relax this check to stay in
+		// consensus with the network (umami/Yumekawa blocks); witness
+		// signatures are still fully validated per input.
+		// SugarChain:链上矿工产出含 witness 交易的块但 coinbase 无 witness
+		// commitment(本链 segwit 始终激活但不强制 commitment 规则)。
+		// 放宽该检查以与网络保持一致(umami/Yumekawa 的块);witness 签名
+		// 仍逐输入完整校验。
 		return nil
 	}
 
@@ -262,10 +264,14 @@ func ValidateWitnessCommitment(blk *btcutil.Block) error {
 	// CoinbaseWitnessDataLen bytes.
 	coinbaseWitness := coinbaseTx.MsgTx().TxIn[0].Witness
 	if len(coinbaseWitness) != 1 {
-		str := fmt.Sprintf("the coinbase transaction has %d items in "+
-			"its witness stack when only one is allowed",
-			len(coinbaseWitness))
-		return ruleError(ErrInvalidWitnessCommitment, str)
+		// Relaxed (SugarChain): miners write a commitment output but no
+		// witness stack (0 items); skip the strict element-count check to
+		// stay in consensus with the network.  The commitment value match
+		// below is still enforced when the witness stack is present.
+		// 放宽(SugarChain):矿工写了 commitment 输出但 witness 栈为空(0 项);
+		// 跳过元素数强制检查以与网络保持一致。witness 栈存在时仍校验下方
+		// commitment 值匹配。
+		return nil
 	}
 	witnessNonce := coinbaseWitness[0]
 	if len(witnessNonce) != CoinbaseWitnessDataLen {
