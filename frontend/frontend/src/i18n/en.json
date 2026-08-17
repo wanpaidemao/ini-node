@@ -154,6 +154,7 @@
   "int.window_status": "Window status",
   "lang.name": "English",
   "nav.console": "Console",
+  "nav.control": "Control Center",
   "nav.dashboard": "Dashboard",
   "nav.history": "History",
   "nav.internals": "Internals",

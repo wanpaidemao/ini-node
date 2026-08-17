@@ -11,6 +11,7 @@
   import Create from "./pages/Create.svelte";
   import Settings from "./pages/Settings.svelte";
   import Console from "./pages/Console.svelte";
+  import ControlCenter from "./pages/ControlCenter.svelte";
 
   const sections: { title: string; items: { route: Route; label: string }[] }[] = [
     {
@@ -18,6 +19,7 @@
       items: [
         { route: "dashboard", label: "nav.dashboard" },
         { route: "internals", label: "nav.internals" },
+        { route: "control", label: "nav.control" },
       ],
     },
     {
@@ -40,6 +42,7 @@
   const titles: Record<Route, string> = {
     dashboard: "nav.dashboard",
     internals: "nav.internals",
+    control: "nav.control",
     wallet: "nav.wallet",
     send: "nav.send",
     create: "create.title",
@@ -248,6 +251,8 @@
         <Settings />
       {:else if app.route === "console"}
         <Console />
+      {:else if app.route === "control"}
+        <ControlCenter />
       {/if}
     </main>
   </div>

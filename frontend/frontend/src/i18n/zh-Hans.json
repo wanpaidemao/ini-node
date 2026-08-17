@@ -154,6 +154,7 @@
   "int.window_status": "窗口状态",
   "lang.name": "简体中文",
   "nav.console": "控制台",
+  "nav.control": "控制中心",
   "nav.dashboard": "仪表盘",
   "nav.history": "历史",
   "nav.internals": "内部观测",

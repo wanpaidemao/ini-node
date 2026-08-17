@@ -7,7 +7,8 @@ export type Route =
   | "send"
   | "create"
   | "settings"
-  | "console";
+  | "console"
+  | "control";
 
 export type ConnState = "online" | "syncing" | "offline";
 
