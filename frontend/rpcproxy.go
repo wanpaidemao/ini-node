@@ -212,6 +212,10 @@ func writeIni(iniPath string, val map[string]string) {
 
 func handleNodeConfig(iniPath string, o map[string]string, w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("content-type", "application/json")
+	// Optional explicit ini path (control center ini picker). / 可选显式 ini 路径（控制中心 ini 选择）。
+	if p := strings.TrimSpace(req.URL.Query().Get("path")); p != "" {
+		iniPath = p
+	}
 	if req.Method == http.MethodPost {
 		var cfg map[string]interface{}
 		body, err := io.ReadAll(req.Body)
@@ -241,6 +245,17 @@ func handleNodeConfig(iniPath string, o map[string]string, w http.ResponseWriter
 			rpcEndpoint = "http://" + rl
 		}
 	}
+	// raw=1 returns the raw ini file text (control center "view ini").
+	// raw=1 返回 ini 原始文本（控制中心"查看 ini"）。
+	if req.URL.Query().Get("raw") == "1" {
+		b, err := os.ReadFile(iniPath)
+		if err != nil {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "content": string(b)})
+		return
+	}
 	// Return the FULL parsed ini (datadir/headerwindow/rpclisten/rpcuser/...)
 	// plus the connection summary, so the control center can show and edit
 	// every startup parameter.
@@ -249,6 +264,7 @@ func handleNodeConfig(iniPath string, o map[string]string, w http.ResponseWriter
 	out := map[string]interface{}{
 		"rpcEndpoint": rpcEndpoint,
 		"credFromIni": true,
+		"iniPath":     iniPath,
 	}
 	for k, v := range o {
 		out[k] = v
@@ -412,6 +428,105 @@ func handleDBParams(w http.ResponseWriter, req *http.Request) {
 	})
 }
 
+// handleWalletapiStatus probes the walletapi gateway on 8335 (no side effect).
+// handleWalletapiStatus 探测 walletapi 网关 8335（无副作用）。
+func handleWalletapiStatus(w http.ResponseWriter, req *http.Request) {
+	w.Header().Set("content-type", "application/json")
+	conn, err := net.DialTimeout("tcp", "127.0.0.1:8335", 800*time.Millisecond)
+	running := err == nil
+	if running {
+		conn.Close()
+	}
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "running": running})
+}
+
+// handleWalletapiStart starts walletapi.exe unless 8335 is already listening.
+// handleWalletapiStart 启动 walletapi.exe（8335 已监听则防双开）。
+func handleWalletapiStart(o map[string]string, w http.ResponseWriter, req *http.Request) {
+	w.Header().Set("content-type", "application/json")
+	if conn, err := net.DialTimeout("tcp", "127.0.0.1:8335", 800*time.Millisecond); err == nil {
+		conn.Close()
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "running": true})
+		return
+	}
+	ini := findIniPath()
+	if ini == "" {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": "ini not found / ini 未找到"})
+		return
+	}
+	backendDir := filepath.Dir(ini)
+	exe := filepath.Join(backendDir, "walletapi.exe")
+	cmd := exec.Command(exe, "-rpcpass="+o["rpcpass"])
+	cmd.Dir = backendDir
+	if err := cmd.Start(); err != nil {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": err.Error()})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "running": false, "pid": cmd.Process.Pid})
+}
+
+// handleWalletapiStop stops the walletapi process (idempotent).
+// handleWalletapiStop 停止 walletapi 进程（幂等）。
+func handleWalletapiStop(w http.ResponseWriter, req *http.Request) {
+	w.Header().Set("content-type", "application/json")
+	cmd := exec.Command("powershell", "-NoProfile", "-Command",
+		"Stop-Process -Name walletapi -Force -ErrorAction SilentlyContinue")
+	_ = cmd.Run()
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
+}
+
+// handleLoglevel reads (GET) or sets (POST) the node log level.  POST calls
+// btcd's debuglevel RPC for immediate effect (needs RPC reachable).
+// handleLoglevel 读取(GET)或设置(POST)节点日志等级。POST 调用 btcd 的
+// debuglevel RPC 即时生效(需 RPC 可达)。
+func handleLoglevel(o map[string]string, w http.ResponseWriter, req *http.Request) {
+	w.Header().Set("content-type", "application/json")
+	if req.Method == http.MethodPost {
+		var body struct {
+			Level string `json:"level"`
+		}
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil || body.Level == "" {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": "level required / 缺少 level"})
+			return
+		}
+		if err := setBtcdLogLevel(o, body.Level); err != nil {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "level": body.Level})
+		return
+	}
+	level := strings.TrimSpace(o["loglevel"])
+	if level == "" {
+		level = "info"
+	}
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "level": level})
+}
+
+// setBtcdLogLevel issues btcd's debuglevel RPC (live, no restart).
+// setBtcdLogLevel 调用 btcd 的 debuglevel RPC（即时生效，无需重启）。
+func setBtcdLogLevel(o map[string]string, level string) error {
+	host := strings.TrimSpace(o["rpclisten"])
+	if host == "" {
+		host = "127.0.0.1:8334"
+	}
+	if !strings.Contains(host, ":") {
+		host = "127.0.0.1:" + host
+	}
+	payload, _ := json.Marshal(map[string]interface{}{
+		"jsonrpc": "1.0", "id": "loglevel", "method": "debuglevel",
+		"params": []string{level},
+	})
+	r, _ := http.NewRequest(http.MethodPost, "http://"+host+"/", bytes.NewReader(payload))
+	r.SetBasicAuth(o["rpcuser"], o["rpcpass"])
+	resp, err := rpcHTTP.Do(r)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return nil
+}
+
 // rpcProxyMiddleware intercepts the RPC proxy and node-config routes that the
 // frontend hits relative to its own origin; everything else falls through to the
 // embedded asset server.
@@ -435,6 +550,14 @@ func rpcProxyMiddleware() application.Middleware {
 				handleLogs(w, req)
 			case req.URL.Path == "/api/db-params":
 				handleDBParams(w, req)
+			case req.URL.Path == "/api/walletapi-status":
+				handleWalletapiStatus(w, req)
+			case req.URL.Path == "/api/walletapi-start":
+				handleWalletapiStart(opts, w, req)
+			case req.URL.Path == "/api/walletapi-stop":
+				handleWalletapiStop(w, req)
+			case req.URL.Path == "/api/loglevel":
+				handleLoglevel(opts, w, req)
 			default:
 				next.ServeHTTP(w, req)
 			}

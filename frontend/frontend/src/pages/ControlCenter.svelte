@@ -59,10 +59,25 @@
 
   // Startup params / 启动参数
   let params: Record<string, string> = {}
+  let paramsOpen = false    // collapsed by default / 默认折叠
+  let iniPath = ''          // current ini file path / 当前 ini 文件路径
+  let iniContent = ''       // raw ini text (shown on demand) / ini 原始文本（按需显示）
   async function loadParams() {
     try {
       const res = await fetch('/api/node-config')
-      if (res.ok) params = await res.json()
+      if (res.ok) {
+        const d = await res.json()
+        params = d
+        iniPath = d.iniPath || ''
+      }
+    } catch { /* ignore */ }
+  }
+  async function viewIni() {
+    iniContent = ''
+    try {
+      const res = await fetch('/api/node-config?raw=1&path=' + encodeURIComponent(iniPath))
+      const d = await res.json()
+      if (d.ok) iniContent = d.content || ''
     } catch { /* ignore */ }
   }
   async function saveParams() {
@@ -88,8 +103,10 @@
     busy = false
   }
 
-  // Logs / 日志
+  // Logs / 日志（默认不显示内容，只显示等级；点击查看才加载）
   let logLines: string[] = []
+  let logLevel = 'info'
+  let logsOpen = false
   async function loadLogs() {
     try {
       const res = await fetch('/api/logs?lines=100')
@@ -99,11 +116,25 @@
       }
     } catch { /* ignore */ }
   }
-  async function clearLogs() {
+  async function loadLogLevel() {
     try {
-      await fetch('/api/logs', { method: 'POST' })
-      logLines = []
+      const res = await fetch('/api/loglevel')
+      const d = await res.json()
+      if (d.ok) logLevel = d.level || 'info'
     } catch { /* ignore */ }
+  }
+  async function applyLogLevel() {
+    try {
+      await fetch('/api/loglevel', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ level: logLevel }),
+      })
+    } catch { /* ignore */ }
+  }
+  function toggleLogs() {
+    logsOpen = !logsOpen
+    if (logsOpen) loadLogs()
   }
 
   // DB params (tuned values, no rebuild) / 数据库参数（调优值，不重建）
@@ -115,14 +146,46 @@
     } catch { /* ignore */ }
   }
 
+  // Wallet API (walletapi gateway 8335) / 钱包网关
+  let wapiRunning = false
+  let wapiBusy = false
+  let wapiErr = ''
+  async function pollWapi() {
+    try {
+      const res = await fetch('/api/walletapi-status')
+      const d = await res.json()
+      wapiRunning = !!(d.ok && d.running)
+    } catch { wapiRunning = false }
+  }
+  async function startWapi() {
+    wapiBusy = true
+    wapiErr = ''
+    try {
+      const res = await fetch('/api/walletapi-start')
+      const d = await res.json().catch(() => ({}))
+      if (!d.ok) wapiErr = d.error || 'Start failed / 启动失败'
+      setTimeout(pollWapi, 3000)
+    } catch { wapiErr = 'Network error / 网络错误' }
+    wapiBusy = false
+  }
+  async function stopWapi() {
+    wapiBusy = true
+    try {
+      await fetch('/api/walletapi-stop')
+      setTimeout(pollWapi, 3000)
+    } catch { /* ignore */ }
+    wapiBusy = false
+  }
+
   onMount(() => {
     poll()
+    pollWapi()
     loadParams()
-    loadLogs()
+    loadLogLevel()
     loadDBParams()
     const id = setInterval(poll, 5000)
-    const logId = setInterval(loadLogs, 5000)
-    return () => { clearInterval(id); clearInterval(logId) }
+    const wapiId = setInterval(pollWapi, 5000)
+    return () => { clearInterval(id); clearInterval(wapiId) }
   })
 
   const phaseLabel: Record<string, string> = {
@@ -172,28 +235,62 @@
       </span>
     </div>
     <div style="display:flex;gap:8px">
-      <button class="btn btn-primary" on:click={startNode} disabled={busy} style="flex:1">Start / 启动</button>
-      <button class="btn btn-ghost" on:click={stopNode} disabled={busy} style="flex:1">Stop / 停止</button>
+      <button class="btn btn-primary" onclick={startNode} disabled={busy} style="flex:1">Start / 启动</button>
+      <button class="btn btn-ghost" onclick={stopNode} disabled={busy} style="flex:1">Stop / 停止</button>
     </div>
     {#if startErr}
       <p style="font-size:12px;margin-top:8px;color:#b91c1c">{startErr}</p>
     {/if}
   </div>
 
-  <!-- Startup params / 启动参数 -->
+  <!-- Wallet API / 钱包网关 -->
   <div class="card" style="border:1px solid var(--c-border);border-radius:10px;padding:14px">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+      <span style="font-weight:600">Wallet API / 钱包网关</span>
+      <span class="badge" class:badge-green={wapiRunning} style="font-size:11px">
+        {wapiRunning ? 'Running / 运行中' : 'Stopped / 已停止'}
+      </span>
+    </div>
+    <div style="display:flex;gap:8px">
+      <button class="btn btn-primary" onclick={startWapi} disabled={wapiBusy} style="flex:1">Start / 启动</button>
+      <button class="btn btn-ghost" onclick={stopWapi} disabled={wapiBusy} style="flex:1">Stop / 停止</button>
+    </div>
+    {#if wapiErr}
+      <p style="font-size:12px;margin-top:8px;color:#b91c1c">{wapiErr}</p>
+    {/if}
+  </div>
+
+  <!-- Startup params / 启动参数 -->
+  <div class="card" style="border:1px solid var(--c-border);border-radius:10px;padding:14px">
+    <div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer" onclick={() => paramsOpen = !paramsOpen}>
       <span style="font-weight:600">Startup params / 启动参数</span>
-      <button class="btn btn-primary" on:click={saveParams} disabled={busy} style="font-size:12px">Save / 保存</button>
+      <span class="dim" style="font-size:12px">{paramsOpen ? '▾ 收起' : '▸ 展开'}</span>
     </div>
-    <div class="col" style="gap:8px">
-      {#each Object.entries(params) as [k, v]}
+    {#if paramsOpen}
+      <div class="col" style="gap:8px;margin-top:10px">
         <label style="font-size:12px">
-          <span class="dim" style="display:block">{k}</span>
-          <input class="input mono" style="width:100%" bind:value={params[k]} />
+          <span class="dim" style="display:block">ini file / ini 文件</span>
+          <div class="row" style="gap:6px">
+            <input class="input mono" style="flex:1" bind:value={iniPath} placeholder="path/to/btcd-runtime.ini" />
+            <button class="btn btn-ghost" onclick={viewIni} style="font-size:12px">View / 查看</button>
+          </div>
         </label>
-      {/each}
-    </div>
+        {#if iniContent}
+          <pre class="mono" style="max-height:160px;overflow:auto;font-size:11px;background:var(--c-border);border-radius:6px;padding:8px;white-space:pre-wrap">{iniContent}</pre>
+        {/if}
+        <div class="col" style="gap:6px">
+          {#each Object.entries(params) as [k, v]}
+            {#if k !== 'iniPath' && k !== 'rpcEndpoint' && k !== 'credFromIni'}
+              <label style="font-size:12px">
+                <span class="dim" style="display:block">{k}</span>
+                <input class="input mono" style="width:100%" bind:value={params[k]} />
+              </label>
+            {/if}
+          {/each}
+        </div>
+        <button class="btn btn-primary" onclick={saveParams} disabled={busy} style="font-size:12px">Save / 保存</button>
+      </div>
+    {/if}
     <p class="dim" style="font-size:11px;margin-top:8px">
       txindex/sugarindex/addcheckpoint changes require a full rebuild (double confirm).
       <br />txindex/sugarindex/addcheckpoint 变更需全量重建（双重确认）。
@@ -204,12 +301,21 @@
   <div class="card" style="border:1px solid var(--c-border);border-radius:10px;padding:14px">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
       <span style="font-weight:600">Logs / 日志</span>
-      <div style="display:flex;gap:6px">
-        <button class="btn btn-ghost" on:click={loadLogs} style="font-size:12px">Refresh / 刷新</button>
-        <button class="btn btn-ghost" on:click={clearLogs} style="font-size:12px">Clear / 清空</button>
+      <div style="display:flex;gap:6px;align-items:center">
+        <select class="select" bind:value={logLevel} style="font-size:12px">
+          <option value="trace">trace</option>
+          <option value="debug">debug</option>
+          <option value="info">info</option>
+          <option value="warn">warn</option>
+          <option value="error">error</option>
+        </select>
+        <button class="btn btn-ghost" onclick={applyLogLevel} style="font-size:12px">Apply / 应用</button>
+        <button class="btn btn-ghost" onclick={toggleLogs} style="font-size:12px">{logsOpen ? 'Hide / 收起' : 'View / 查看'}</button>
       </div>
     </div>
-    <pre class="mono" style="max-height:220px;overflow:auto;font-size:11px;background:var(--c-border);border-radius:6px;padding:8px;white-space:pre-wrap">{logLines.join('\n') || 'No log output / 暂无日志'}</pre>
+    {#if logsOpen}
+      <pre class="mono" style="max-height:220px;overflow:auto;font-size:11px;background:var(--c-border);border-radius:6px;padding:8px;white-space:pre-wrap">{logLines.join('\n') || 'No log output / 暂无日志'}</pre>
+    {/if}
   </div>
 
   <!-- DB params / 数据库参数 -->

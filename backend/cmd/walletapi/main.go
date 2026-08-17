@@ -137,16 +137,29 @@ func (c *client) handleBalance(w http.ResponseWriter, r *http.Request, addr stri
 	}, nil)
 }
 
-// history maps getaddressdeltas -> [{txid,height,satoshis,index}].
-// history 转发 getaddressdeltas -> [{txid,height,satoshis,index}]。
+// history maps getaddressdeltas -> {items,total,offset} with pagination.
+// history 转发 getaddressdeltas -> {items,total,offset}(支持分页)。
 func (c *client) handleHistory(w http.ResponseWriter, r *http.Request, addr string) {
+	limit := 20
+	if q := r.URL.Query().Get("limit"); q != "" {
+		if n, err := strconv.Atoi(q); err == nil && n > 0 && n <= 200 {
+			limit = n
+		}
+	}
+	offset := 0
+	if q := r.URL.Query().Get("offset"); q != "" {
+		if n, err := strconv.Atoi(q); err == nil && n >= 0 {
+			offset = n
+		}
+	}
+
 	raw, rpcErr := c.call("getaddressdeltas", []interface{}{
 		map[string]interface{}{"addresses": []string{addr}},
 	})
 	if rpcErr != nil {
 		// New address with no history -> empty set.
 		if rpcErr.Code == -5 {
-			writeReply(w, []interface{}{}, nil)
+			writeReply(w, map[string]interface{}{"items": []interface{}{}, "total": 0, "offset": 0}, nil)
 			return
 		}
 		writeReply(w, nil, rpcErr)
@@ -162,13 +175,23 @@ func (c *client) handleHistory(w http.ResponseWriter, r *http.Request, addr stri
 		writeReply(w, nil, &rpcError{Code: -32603, Message: err.Error()})
 		return
 	}
-	hist := make([]interface{}, 0, len(results))
-	for _, h := range results {
-		hist = append(hist, map[string]interface{}{
+	total := len(results)
+	if offset > total {
+		offset = total
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	items := make([]interface{}, 0, end-offset)
+	for _, h := range results[offset:end] {
+		items = append(items, map[string]interface{}{
 			"txid": h.Txid, "height": h.Height, "satoshis": h.Satoshis, "index": h.Index,
 		})
 	}
-	writeReply(w, hist, nil)
+	writeReply(w, map[string]interface{}{
+		"items": items, "total": total, "offset": offset,
+	}, nil)
 }
 
 // unspent maps getaddressutxos -> [{txid,index,value,script}].
