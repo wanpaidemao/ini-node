@@ -387,7 +387,9 @@ var MainNetParams = Params{
 			DeploymentEnder: NewMedianTimeDeploymentEnder(
 				time.Time{}, // Never expires
 			),
-			AlwaysActiveHeight: 0,
+			// 1 = segwit active from genesis (aligns umami SegwitHeight=0).
+			// 0 falls back to BIP9 and rejects witness txs (-26), verified.
+			AlwaysActiveHeight: 1,
 		},
 		DeploymentTaproot: {
 			BitNumber: 2,
