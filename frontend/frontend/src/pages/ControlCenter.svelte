@@ -60,6 +60,11 @@
   // Startup params / 启动参数
   let params: Record<string, string> = {}
   let paramsOpen = false    // collapsed by default / 默认折叠
+  // Level-C params require a full rebuild: double confirm (module scope so
+  // the template can show the hint per field).
+  // 级别 C 参数变更需全量重建:双重确认(模块级作用域,供模板按字段显示提示)。
+  const levelC = ['txindex', 'sugarindex', 'addcheckpoint']
+  let dbParamsOpen = false  // DB params collapsed by default / 数据库参数默认折叠
   let iniPath = ''          // current ini file path / 当前 ini 文件路径
   let iniContent = ''       // raw ini text (shown on demand) / ini 原始文本（按需显示）
   async function loadParams() {
@@ -83,7 +88,6 @@
   async function saveParams() {
     // Level-C params require a full rebuild: double confirm.
     // 级别 C 参数变更需全量重建：双重确认。
-    const levelC = ['txindex', 'sugarindex', 'addcheckpoint']
     const dirty = levelC.filter(k => params[k] !== undefined)
     if (dirty.length > 0) {
       const ok = window.confirm(
@@ -135,6 +139,19 @@
   function toggleLogs() {
     logsOpen = !logsOpen
     if (logsOpen) loadLogs()
+  }
+  // Logs modal: View opens a dialog with a clear-logs button / 日志弹窗:
+  // View 打开对话框,包含清空日志按钮。
+  let logsModalOpen = false
+  function openLogs() {
+    logsModalOpen = true
+    loadLogs()
+  }
+  function clearLogs() {
+    logLines = []
+  }
+  function closeLogs() {
+    logsModalOpen = false
   }
 
   // DB params (tuned values, no rebuild) / 数据库参数（调优值，不重建）
@@ -284,6 +301,11 @@
               <label style="font-size:12px">
                 <span class="dim" style="display:block">{k}</span>
                 <input class="input mono" style="width:100%" bind:value={params[k]} />
+                {#if levelC.includes(k)}
+                  <span class="dim" style="display:block;font-size:11px;color:#d97706;margin-top:2px">
+                    Requires a full rebuild (double confirm). / 变更需全量重建（双重确认）。
+                  </span>
+                {/if}
               </label>
             {/if}
           {/each}
@@ -291,10 +313,6 @@
         <button class="btn btn-primary" onclick={saveParams} disabled={busy} style="font-size:12px">Save / 保存</button>
       </div>
     {/if}
-    <p class="dim" style="font-size:11px;margin-top:8px">
-      txindex/sugarindex/addcheckpoint changes require a full rebuild (double confirm).
-      <br />txindex/sugarindex/addcheckpoint 变更需全量重建（双重确认）。
-    </p>
   </div>
 
   <!-- Logs / 日志 -->
@@ -310,28 +328,47 @@
           <option value="error">error</option>
         </select>
         <button class="btn btn-ghost" onclick={applyLogLevel} style="font-size:12px">Apply / 应用</button>
-        <button class="btn btn-ghost" onclick={toggleLogs} style="font-size:12px">{logsOpen ? 'Hide / 收起' : 'View / 查看'}</button>
+        <button class="btn btn-ghost" onclick={openLogs} style="font-size:12px">View / 查看</button>
       </div>
     </div>
-    {#if logsOpen}
-      <pre class="mono" style="max-height:220px;overflow:auto;font-size:11px;background:var(--c-border);border-radius:6px;padding:8px;white-space:pre-wrap">{logLines.join('\n') || 'No log output / 暂无日志'}</pre>
-    {/if}
   </div>
+
+  {#if logsModalOpen}
+    <div
+      style="position:fixed;inset:0;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;z-index:100"
+      onclick={closeLogs}
+    >
+      <div
+        style="background:var(--ink);border:1px solid var(--line);border-radius:10px;padding:14px;max-width:680px;width:90%;max-height:72vh;display:flex;flex-direction:column"
+        onclick={(e) => e.stopPropagation()}
+      >
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <span style="font-weight:600">Logs / 日志</span>
+          <button class="btn btn-ghost" onclick={closeLogs} style="font-size:12px">Close / 关闭</button>
+        </div>
+        <pre class="mono" style="flex:1;min-height:0;overflow:auto;font-size:11px;background:var(--c-border);border-radius:6px;padding:8px;white-space:pre-wrap">{logLines.join('\n') || 'No log output / 暂无日志'}</pre>
+        <div style="display:flex;justify-content:flex-end;gap:6px;margin-top:8px">
+          <button class="btn btn-danger" onclick={clearLogs} style="font-size:12px">Clear logs / 清空日志</button>
+        </div>
+      </div>
+    </div>
+  {/if}
 
   <!-- DB params / 数据库参数 -->
   <div class="card" style="border:1px solid var(--c-border);border-radius:10px;padding:14px">
-    <span style="font-weight:600">DB params / 数据库参数</span>
-    <div class="col" style="gap:6px;margin-top:10px">
-      {#each Object.entries(dbParams) as [k, v]}
-        <div class="row between" style="font-size:12px">
-          <span class="dim">{k}</span>
-          <span class="mono">{v}</span>
-        </div>
-      {/each}
+    <div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer" onclick={() => dbParamsOpen = !dbParamsOpen}>
+      <span style="font-weight:600">DB params / 数据库参数</span>
+      <span class="dim" style="font-size:12px">{dbParamsOpen ? '▾ 收起' : '▸ 展开'}</span>
     </div>
-    <p class="dim" style="font-size:11px;margin-top:8px">
-      Tuned values — changes do NOT rebuild the index (take effect on restart).
-      <br />调优后的当前值——修改不会重建索引（重启后生效）。
-    </p>
+    {#if dbParamsOpen}
+      <div class="col" style="gap:6px;margin-top:10px">
+        {#each Object.entries(dbParams) as [k, v]}
+          <div class="row between" style="font-size:12px">
+            <span class="dim">{k}</span>
+            <span class="mono">{v}</span>
+          </div>
+        {/each}
+      </div>
+    {/if}
   </div>
 </div>

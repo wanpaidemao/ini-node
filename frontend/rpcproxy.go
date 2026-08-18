@@ -52,7 +52,11 @@ func findIniPath() string {
 		candidates = append(candidates, p)
 	}
 	if cwd != "" {
+		// The runtime config was renamed from btcd-runtime.ini to
+		// runtime.ini; accept both for compatibility.
+		// 运行时配置已从 btcd-runtime.ini 改名为 runtime.ini;两者都兼容。
 		candidates = append(candidates,
+			filepath.Join(cwd, "runtime.ini"),
 			filepath.Join(cwd, "btcd-runtime.ini"),
 		)
 	}

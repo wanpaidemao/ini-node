@@ -13,28 +13,34 @@
   import Console from "./pages/Console.svelte";
   import ControlCenter from "./pages/ControlCenter.svelte";
 
-  const sections: { title: string; items: { route: Route; label: string }[] }[] = [
+  // Page kinds: "rpc" pages go through the RPC proxy and can also be
+  // served standalone as a plain frontend; "wails" pages need the desktop
+  // (Wails) backend (node control / local settings / console).
+  // 页面类型:"rpc" 页面经 RPC 代理访问,也可独立作为纯前端;"wails" 页面
+  // 依赖桌面(Wails)后端(节点控制/本地设置/控制台)。
+  type PageKind = "rpc" | "wails";
+  const sections: { title: string; items: { route: Route; label: string; kind: PageKind }[] }[] = [
     {
       title: "nav.section.node",
       items: [
-        { route: "dashboard", label: "nav.dashboard" },
-        { route: "internals", label: "nav.internals" },
-        { route: "control", label: "nav.control" },
+        { route: "dashboard", label: "nav.dashboard", kind: "rpc" },
+        { route: "internals", label: "nav.internals", kind: "rpc" },
+        { route: "control", label: "nav.control", kind: "wails" },
       ],
     },
     {
       title: "nav.section.wallet",
       items: [
-        { route: "wallet", label: "nav.wallet" },
-        { route: "create", label: "create.title" },
-        { route: "send", label: "nav.send" },
+        { route: "wallet", label: "nav.wallet", kind: "rpc" },
+        { route: "create", label: "create.title", kind: "rpc" },
+        { route: "send", label: "nav.send", kind: "rpc" },
       ],
     },
     {
       title: "nav.section.system",
       items: [
-        { route: "settings", label: "nav.settings" },
-        { route: "console", label: "nav.console" },
+        { route: "settings", label: "nav.settings", kind: "wails" },
+        { route: "console", label: "nav.console", kind: "wails" },
       ],
     },
   ];
@@ -236,7 +242,7 @@
       <span class="topbar-title">{t(titles[app.route])}</span>
     </header>
 
-    {#if !app.connected}
+    {#if !app.connected && app.route === "dashboard"}
       <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin:10px 16px;padding:10px 14px;border:1px solid #d97706;border-radius:8px;background:#fef3c7;font-size:13px">
         <span>Node RPC not reachable / 节点 RPC 不可达</span>
         <button class="btn btn-primary" onclick={() => navigate("control")} style="font-size:12px">
@@ -353,13 +359,20 @@
 
   .menu-drop {
     position: absolute;
-    top: calc(100% + 4px);
+    /* No gap between the button and the dropdown: a gap triggers the
+       wrapper's onmouseleave while the pointer travels to the submenu,
+       closing it before it can be reached.  Keep the visual spacing via
+       inner padding instead.
+       按钮与下拉之间不留空隙:空隙会在指针移向子菜单时触发外层
+       onmouseleave 提前关闭子菜单。视觉间距改用内边距实现。*/
+    top: 100%;
     left: 0;
     min-width: 172px;
     display: none;
     flex-direction: column;
     gap: 2px;
     padding: 6px;
+    padding-top: 10px;
     background: var(--ink);
     border: 1px solid var(--line);
     border-radius: var(--r-8);
