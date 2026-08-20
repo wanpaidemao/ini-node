@@ -246,6 +246,22 @@ func (b *BlockChain) HaveBlock(hash *chainhash.Hash) (bool, error) {
 	return exists || b.IsKnownOrphan(hash), nil
 }
 
+// BlockStored reports whether the block's full data is actually present in the
+// database.  Unlike HaveBlock it deliberately ignores in-memory orphan blocks:
+// an orphan's payload lives only in memory and is never written to the DB, so
+// FetchBlockByHash on an orphan hash always fails.  A resume path that treated
+// an orphan as "present" would attempt to reconnect it, hit the missing
+// payload, and falsely conclude that the local data is inconsistent with the
+// header chain (P11: a polluted height row pointing at a recently-fetched
+// orphan triggered a spurious rollback).  Only on-disk data counts here; the
+// orphan itself will be connected by the normal download flow when its parent
+// arrives.
+//
+// This function is safe for concurrent access.
+func (b *BlockChain) BlockStored(hash *chainhash.Hash) (bool, error) {
+	return b.blockExists(hash)
+}
+
 // IsKnownOrphan returns whether the passed hash is currently a known orphan.
 // Keep in mind that only a limited number of orphans are held onto for a
 // limited amount of time, so this function must not be used as an absolute
@@ -1277,7 +1293,7 @@ func (b *BlockChain) connectBestChain(node *blockNode, block *btcutil.Block, fla
 		}
 		return nil
 	}
-	
+
 	// We are extending the main (best) chain with a new block.  This is the
 	// most common case.
 	parentHash := &block.MsgBlock().Header.PrevBlock
@@ -2266,6 +2282,88 @@ func (b *BlockChain) InvalidateBlock(hash *chainhash.Hash) error {
 	}
 
 	return err
+}
+
+// InvalidateHeaderChain marks every header above rollbackHeight as invalid and
+// rebuilds the best-header view rooted at the connected block at
+// rollbackHeight.  It is used when the block download detects that the front
+// block's body is unavailable from every peer for blockUnavailableTimeout:
+// the header chain is then suspected of being fabricated or forked (a real
+// chain's blocks are served by the network), and a fresh header download must
+// restart from the last confirmed connected height instead of continuing to
+// extend the bogus chain.
+//
+// The rollback node is taken from the best-chain view (it is a connected
+// block), which is always materialized.  Because the header tip typically
+// leads the connected chain by far more than the in-memory header window, the
+// rollback height sits below the current best-header view base, so the view
+// is rebuilt from the rollback node rather than rewound with SetTip (which
+// would silently refuse a tip below its base).
+//
+// This function is safe for concurrent access.
+func (b *BlockChain) InvalidateHeaderChain(rollbackHeight int32) error {
+	b.chainLock.Lock()
+	defer b.chainLock.Unlock()
+
+	// The rollback point must be a connected block so the chain we resume
+	// from is confirmed, not another fabricated segment.
+	rollbackNode := b.bestChain.NodeByHeight(rollbackHeight)
+	if rollbackNode == nil {
+		return fmt.Errorf("cannot roll back header chain: no connected "+
+			"block at height %d", rollbackHeight)
+	}
+
+	// Record the old header tip before it is rebuilt, so the stale height
+	// rows above the rollback point can be purged from the DB height index.
+	oldHeaderTip := int32(-1)
+	if tip := b.bestHeader.Tip(); tip != nil {
+		oldHeaderTip = tip.height
+	}
+
+	// Mark every header above the rollback height as invalid by walking the
+	// best-header chain down from its tip.  The walk stops at the rollback
+	// node; headers below it stay untouched.
+	for n := b.bestHeader.Tip(); n != nil && n.height > rollbackHeight; n = n.parent {
+		if n.status.KnownInvalid() {
+			continue
+		}
+		b.index.SetStatusFlags(n, statusInvalidAncestor)
+		b.index.UnsetStatusFlags(n, statusValid)
+	}
+
+	// Rebuild the best-header view rooted at the rollback node so the next
+	// header download starts from the confirmed height.  The parent walk in
+	// setTip fills the view's trailing window from the rollback node's own
+	// (still materialized) ancestor chain; heights below its severed boundary
+	// stay nil, which the download does not consult.
+	b.bestHeader = newChainView(rollbackNode)
+
+	// Purge the stale height→hash rows above the rollback point from the DB
+	// height index.  The header-only nodes above the rollback height were
+	// persisted as part of the polluted chain, and leaving those rows in place
+	// lets the cold-read fallback keep resolving an evicted height back to a
+	// hash of the discarded chain (P8) -- which then passes the receive-side
+	// prev check and freezes the header front.  The fresh chain's headers are
+	// re-written to these heights as they are applied (flushDirtyLocked →
+	// dbPutHeightIndex), so deleting them now is safe.
+	if oldHeaderTip > rollbackHeight {
+		err := b.db.Update(func(dbTx database.Tx) error {
+			for h := rollbackHeight + 1; h <= oldHeaderTip; h++ {
+				if err := dbRemoveHeightIndex(dbTx, h); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("error purging height index rows above "+
+				"rollback height %d: %v", rollbackHeight, err)
+		}
+	}
+
+	// Persist the invalidated statuses so a restart keeps the bogus segment
+	// rejected instead of reapplying it.
+	return b.index.flushToDB(false)
 }
 
 // ReconsiderBlock reconsiders the validity of the block with the given hash.

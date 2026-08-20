@@ -962,6 +962,23 @@ func dbPutHeightIndex(dbTx database.Tx, height int32, hash *chainhash.Hash) erro
 	return heightIndex.Put(serializedHeight[:], hash[:])
 }
 
+// dbRemoveHeightIndex uses an existing database transaction to delete the
+// height to hash mapping for the provided height from the height index bucket.
+// It is the inverse of dbPutHeightIndex and is used when a fabricated or
+// forked header chain is rolled back: the stale height rows above the rollback
+// point must be removed so the DB cold-read fallback can never resolve an
+// evicted height back to a hash of the discarded chain (which would otherwise
+// keep feeding the pollution into header sync after the rollback).  Unlike
+// dbRemoveBlockIndex it only removes the height→hash direction; the hash→height
+// rows for side-chain / orphan hashes are left intact.
+func dbRemoveHeightIndex(dbTx database.Tx, height int32) error {
+	var serializedHeight [4]byte
+	byteOrder.PutUint32(serializedHeight[:], uint32(height))
+	meta := dbTx.Metadata()
+	heightIndex := meta.Bucket(heightIndexBucketName)
+	return heightIndex.Delete(serializedHeight[:])
+}
+
 // dbRemoveBlockIndex uses an existing database transaction remove block index
 // entries from the hash to height and height to hash mappings for the provided
 // values.
@@ -1772,96 +1789,96 @@ func (b *BlockChain) initChainState() error {
 		} else {
 			cursor := blockIndexBucket.Cursor()
 			for ok := cursor.First(); ok; ok = cursor.Next() {
-			header, status, err := deserializeBlockRow(cursor.Value())
-			if err != nil {
-				return err
-			}
+				header, status, err := deserializeBlockRow(cursor.Value())
+				if err != nil {
+					return err
+				}
 
-			// Accumulate the work of every row below the header window
-			// boundary, materialized or not, so the running total is correct
-			// at whichever boundary anchor consumes it.
-			if i < headerBoundary {
-				if runningWorkSum == nil {
-					runningWorkSum = CalcWork(header.Bits)
+				// Accumulate the work of every row below the header window
+				// boundary, materialized or not, so the running total is correct
+				// at whichever boundary anchor consumes it.
+				if i < headerBoundary {
+					if runningWorkSum == nil {
+						runningWorkSum = CalcWork(header.Bits)
+					} else {
+						runningWorkSum.Add(runningWorkSum, CalcWork(header.Bits))
+					}
+				}
+
+				// Materialize this row when it falls within either the connected
+				// chain's window or the header chain's window.
+				//
+				// The connected chain's window extends a full window ahead of the
+				// best chain tip.  After a restart the block-connection frontier
+				// must be able to resolve the parent of every block the downloader
+				// requests next (which always lives within one request window of
+				// the tip) from the in-memory index, since block acceptance
+				// resolves parents only through the in-memory index and never falls
+				// back to the cold-read layer.
+				inChainWindow := i >= chainBoundary &&
+					i <= int32(state.height)+b.index.windowSize
+				inHeaderWindow := i >= headerBoundary
+				if !inChainWindow && !inHeaderWindow {
+					i++
+					continue
+				}
+
+				// Determine the parent block node. Since we iterate block headers
+				// in order of height, if the blocks are mostly linear there is a
+				// very good chance the previous header processed is the parent.
+				var parent *blockNode
+				if lastNode != nil && header.PrevBlock == lastNode.hash {
+					// Since we iterate block headers in order of height, if the
+					// blocks are mostly linear there is a very good chance the
+					// previous header processed is the parent.
+					parent = lastNode
+				} else if parent = b.index.LookupNode(&header.PrevBlock); parent != nil {
+					// The parent was materialized earlier within the window (a
+					// side chain, or a jump between the connected chain window
+					// and the header window).
+				} else if i == 0 {
+					// This is the very first row, which must be genesis.
+					blockHash := header.BlockHash()
+					if !blockHash.IsEqual(b.chainParams.GenesisHash) {
+						return AssertError(fmt.Sprintf("initChainState: Expected "+
+							"first entry in block index to be genesis block, "+
+							"found %s", blockHash))
+					}
 				} else {
-					runningWorkSum.Add(runningWorkSum, CalcWork(header.Bits))
+					// The node at a window boundary.  Its parent lives below the
+					// materialized window; the parent hash is retained on the
+					// node so its header can be reconstructed, and the running
+					// work accumulated above provides its cumulative work.
+					parent = nil
 				}
-			}
 
-			// Materialize this row when it falls within either the connected
-			// chain's window or the header chain's window.
-			//
-			// The connected chain's window extends a full window ahead of the
-			// best chain tip.  After a restart the block-connection frontier
-			// must be able to resolve the parent of every block the downloader
-			// requests next (which always lives within one request window of
-			// the tip) from the in-memory index, since block acceptance
-			// resolves parents only through the in-memory index and never falls
-			// back to the cold-read layer.
-			inChainWindow := i >= chainBoundary &&
-				i <= int32(state.height)+b.index.windowSize
-			inHeaderWindow := i >= headerBoundary
-			if !inChainWindow && !inHeaderWindow {
+				// Initialize the block node for the block, connect it,
+				// and add it to the block index.
+				node := new(blockNode)
+				initBlockNode(node, header, parent)
+				if parent == nil && i > 0 {
+					// Seed the boundary anchor with the cumulative work of the
+					// entire chain up to and including this row, and fix its
+					// height since its parent is not materialized.  The work
+					// sum value already allocated by initBlockNode is reused
+					// rather than replaced so it stays recycled through the
+					// block work pool.
+					node.height = i
+					if runningWorkSum != nil {
+						node.workSum = node.workSum.Add(runningWorkSum, node.workSum)
+					}
+				}
+				node.status = status
+				b.index.addNode(node)
+
+				lastNode = node
 				i++
-				continue
-			}
-
-			// Determine the parent block node. Since we iterate block headers
-			// in order of height, if the blocks are mostly linear there is a
-			// very good chance the previous header processed is the parent.
-			var parent *blockNode
-			if lastNode != nil && header.PrevBlock == lastNode.hash {
-				// Since we iterate block headers in order of height, if the
-				// blocks are mostly linear there is a very good chance the
-				// previous header processed is the parent.
-				parent = lastNode
-			} else if parent = b.index.LookupNode(&header.PrevBlock); parent != nil {
-				// The parent was materialized earlier within the window (a
-				// side chain, or a jump between the connected chain window
-				// and the header window).
-			} else if i == 0 {
-				// This is the very first row, which must be genesis.
-				blockHash := header.BlockHash()
-				if !blockHash.IsEqual(b.chainParams.GenesisHash) {
-					return AssertError(fmt.Sprintf("initChainState: Expected "+
-						"first entry in block index to be genesis block, "+
-						"found %s", blockHash))
-				}
-			} else {
-				// The node at a window boundary.  Its parent lives below the
-				// materialized window; the parent hash is retained on the
-				// node so its header can be reconstructed, and the running
-				// work accumulated above provides its cumulative work.
-				parent = nil
-			}
-
-			// Initialize the block node for the block, connect it,
-			// and add it to the block index.
-			node := new(blockNode)
-			initBlockNode(node, header, parent)
-			if parent == nil && i > 0 {
-				// Seed the boundary anchor with the cumulative work of the
-				// entire chain up to and including this row, and fix its
-				// height since its parent is not materialized.  The work
-				// sum value already allocated by initBlockNode is reused
-				// rather than replaced so it stays recycled through the
-				// block work pool.
-				node.height = i
-				if runningWorkSum != nil {
-					node.workSum = node.workSum.Add(runningWorkSum, node.workSum)
+				if i%500000 == 0 {
+					// Surface load progress (frontend shows it via
+					// /api/index-progress while RPC is still starting).
+					b.writeLoadProgress(i, headerStateHeight)
 				}
 			}
-			node.status = status
-			b.index.addNode(node)
-
-			lastNode = node
-			i++
-			if i%500000 == 0 {
-				// Surface load progress (frontend shows it via
-				// /api/index-progress while RPC is still starting).
-				b.writeLoadProgress(i, headerStateHeight)
-			}
-		}
 		} // end else (full scan fallback) / else 结束（全量扫描回退）
 
 		// Set the best chain view and the best header to the stored best state.

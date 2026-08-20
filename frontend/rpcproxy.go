@@ -357,7 +357,16 @@ func handleNodeStart(opts map[string]string, w http.ResponseWriter, req *http.Re
 	}
 	backendDir := filepath.Dir(ini)
 	btcd := filepath.Join(backendDir, "btcd.exe")
+	// 日志目录优先用 ini 的 logdir 配置（相对路径基于 ini 所在目录），
+	// 否则默认 ini 同目录下的 logs/。前端 handleLogs 读同一个目录。
 	logDir := filepath.Join(backendDir, "logs")
+	if ld := strings.TrimSpace(parseIni(ini)["logdir"]); ld != "" {
+		if filepath.IsAbs(ld) {
+			logDir = ld
+		} else {
+			logDir = filepath.Join(backendDir, ld)
+		}
+	}
 	_ = os.MkdirAll(logDir, 0700)
 	out, _ := os.OpenFile(filepath.Join(logDir, "node.stdout.log"),
 		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
@@ -389,8 +398,27 @@ func handleNodeStop(w http.ResponseWriter, req *http.Request) {
 // handleLogs 返回节点日志尾部(GET ?lines=N)或清空(POST)。
 func handleLogs(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("content-type", "application/json")
-	exeDir, _ := filepath.Abs(filepath.Dir(os.Args[0]))
-	logPath := filepath.Join(exeDir, "..", "backend", "logs", "node.stdout.log")
+	// Resolve the log file through the same ini lookup as handleNodeStart so
+	// the read path always matches where the node's stdout is redirected.
+	// 日志目录优先用 ini 的 logdir 配置（相对路径基于 ini 所在目录），
+	// 否则默认 ini 同目录下的 logs/。与 handleNodeStart 的写入目录保持一致。
+	ini := findIniPath()
+	if ini == "" {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"ok": false, "error": "runtime.ini not found",
+		})
+		return
+	}
+	iniDir := filepath.Dir(ini)
+	logDir := filepath.Join(iniDir, "logs")
+	if ld := strings.TrimSpace(parseIni(ini)["logdir"]); ld != "" {
+		if filepath.IsAbs(ld) {
+			logDir = ld
+		} else {
+			logDir = filepath.Join(iniDir, ld)
+		}
+	}
+	logPath := filepath.Join(logDir, "node.stdout.log")
 	if req.Method == http.MethodPost {
 		_ = os.Truncate(logPath, 0)
 		_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})

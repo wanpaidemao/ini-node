@@ -5,6 +5,7 @@
 package netsync
 
 import (
+	"errors"
 	"fmt"
 	"math/rand"
 	"net"
@@ -52,7 +53,7 @@ const (
 	// before the pool fills.  The bound is generous so each parallel slice
 	// stays multiple times the per-peer in-flight throttle deep ahead of the
 	// tip, letting many peers prefetch simultaneously even on a slow window.
-	maxBlockRequestWindow = 8192
+	maxBlockRequestWindow = 8000
 
 	// maxRequestedTxns is the maximum number of requested transactions
 	// hashes to store in memory.
@@ -112,6 +113,34 @@ const (
 	// but the fastest one, which alone re-claimed the new frontier slices and
 	// reduced the parallel download to a single peer.
 	blockInFlightTarget = 200
+
+	// headerLeadLimit caps how far the applied header tip may lead the
+	// connected best chain before the parallel header download pauses and
+	// lets blocks catch up.  Header processing is far cheaper than block
+	// processing, so without this cap the header tip races ahead of the
+	// blocks indefinitely (observed: ~42k-68k lead).  A lead beyond
+	// maxBlockRequestWindow (8000) serves no purpose -- the block request
+	// frontier never goes further than bestChain+8000 -- while a large lead
+	// pushes the receive-side prev check (HeaderHashByHeight(start-1)) out
+	// of the in-memory header window and into the DB cold-read path, whose
+	// reference frame is where stale height rows (P8/P9) live.  The cap is
+	// enforced at the single getheaders dispatch point (launchHeaderRange,
+	// which both fresh assignments and re-issues go through), so the header
+	// download keeps the lead just below this value: whenever the lead is
+	// below the cap a new range is dispatched immediately to push it back
+	// up, and once it reaches the cap dispatching pauses -- the header tip
+	// is kept ahead of the blocks by design, but never races arbitrarily
+	// far, and the receive-side prev check always stays in-memory.
+	headerLeadLimit = 42000
+
+	// blockUnavailableTimeout is how long the block download may remain stuck
+	// at a single height before the header chain is suspected of being
+	// fabricated or forked and rolled back.  A real chain's blocks are served
+	// by the network; a forged chain's blocks either do not exist on any peer
+	// or do not link to the applied tip, so the download would spin forever.
+	// The window is deliberately much larger than blockSliceStallTimeout so a
+	// merely slow peer is never misjudged.
+	blockUnavailableTimeout = 10 * time.Minute
 )
 
 // zeroHash is the zero value hash (all zeros).  It is defined as a convenience.
@@ -237,6 +266,19 @@ type headerRange struct {
 	headers    []*wire.BlockHeader
 	received   bool
 	assignedAt time.Time
+
+	// C2 front double-confirmation: the front range (the one that decides the
+	// direction of the header chain) is corroborated by a second independent
+	// peer before it is applied, so a misattributed front (fed through a stale
+	// height row, P8) cannot enter the index on a single unanimous response.
+	// firstHash/firstPeer record the first corroborating response; confirmed
+	// is set once a second independent peer agrees (or immediately when fewer
+	// than two peers are present, degrading to a single vote with C1's fast
+	// rollback covering a wrong chain).  Non-front ranges leave confirmed
+	// true and are applied on the single response as before.
+	firstHash *chainhash.Hash
+	firstPeer *peerpkg.Peer
+	confirmed bool
 }
 
 // HeaderRecentRange is a lightweight record of one completed parallel header
@@ -294,6 +336,17 @@ type blockSyncState struct {
 	sliceLen     int32                         // max height span handed to a peer at once
 	lastReissue  time.Time                     // last time a stale slice was reissued
 	lastProgress map[*peerpkg.Peer]time.Time   // last time each peer delivered a block
+
+	// frontMissingSince/frontMissingHeight record the first moment the front
+	// block (the one right above the connected tip) was observed to be
+	// unrequested -- its request was freed by a stall re-issue or a dropped
+	// peer and nobody has claimed it since.  The front-slice guard normally
+	// only lets a recently-delivering peer claim the front; once the front has
+	// been unrequested for a full stall window this marker lets any peer claim
+	// it, breaking the permanent deadlock where no peer qualifies and no block
+	// ever arrives to re-trigger the download.
+	frontMissingSince  time.Time
+	frontMissingHeight int32
 }
 
 // PeerSyncStatus describes one peer's role in an in-progress parallel initial
@@ -444,8 +497,37 @@ type SyncManager struct {
 	// overlap.  Only touched from the blockHandler goroutine.
 	blockSyncStartLead int32
 
+	// blockMissingSince/blockMissingHeight record the block download being
+	// stuck: the height at which the download was last observed to advance and
+	// the time it has been stuck there.  They are reset whenever the front
+	// advances, and are used by the stall handler to detect a fabricated or
+	// forked header chain whose blocks no peer can serve.  The check keys on
+	// the front height not advancing, NOT on the front hash being present in
+	// requestedBlocks: a deadlock can free the front request entirely (all
+	// slices released, no peer delivering), leaving requestedBlocks empty
+	// while the front never advances -- exactly the case that must still be
+	// detected.  Only touched from the blockHandler goroutine.
+	blockMissingSince  time.Time
+	blockMissingHeight int32
+
 	// The following fields are used for the initial block download mode.
 	ibdMode bool
+
+	// suspiciousHeaders remembers the first-header hashes of header ranges
+	// that failed to apply and were rolled back as fabricated or forked, so a
+	// peer that keeps re-serving the same bogus chain is detected immediately.
+	// Bounded to avoid unbounded growth.  Only touched from the blockHandler
+	// goroutine.
+	suspiciousHeaders map[chainhash.Hash]struct{}
+
+	// frontUnreachable counts, per front range start height, how many distinct
+	// peers have returned a response that does not extend the range (the
+	// receive-side prev check failed).  When three distinct peers all fail to
+	// extend the front, the header chain at that height is almost certainly
+	// fabricated or forked -- roll back early instead of waiting for the slow
+	// 10-minute block-side timer (P4).  Only touched from the blockHandler
+	// goroutine.
+	frontUnreachable map[int32]map[string]time.Time
 
 	// lastUtxoFlush is the last time the UTXO cache was asked to flush.
 	// It is used to trigger periodic flushes even while in initial block
@@ -625,18 +707,45 @@ func (sm *SyncManager) headerLocator(height int32) blockchain.BlockLocator {
 
 // launchHeaderRange records a new per-peer header range and issues the
 // getheaders request for it.  It is a low-level helper; the caller is
-// responsible for choosing non-overlapping start/end heights.
-func (sm *SyncManager) launchHeaderRange(peer *peerpkg.Peer, start int32) {
+// responsible for choosing non-overlapping start/end heights.  It returns
+// true when the range was actually dispatched, and false when the header
+// lead cap or the nil headerSync state suppressed the dispatch.
+//
+// The header lead cap is enforced here, at the single point every getheaders
+// request passes through (fresh assignments from assignHeaderRange and
+// re-issues from reissueHeaderRange alike), so no path can push the applied
+// header tip more than headerLeadLimit ahead of the connected best chain.
+// While the lead is below the cap a dispatch goes out immediately to push it
+// back up; once it reaches the cap dispatching pauses so blocks can catch up.
+func (sm *SyncManager) launchHeaderRange(peer *peerpkg.Peer, start int32) bool {
 	hs := sm.headerSync
+	if hs == nil {
+		return false
+	}
+	// Cap the header lead over the connected best chain.  A lead beyond
+	// maxBlockRequestWindow (8000) serves no purpose -- the block request
+	// frontier never goes further than bestChain+8000 -- while a large lead
+	// pushes the receive-side prev check (HeaderHashByHeight(start-1)) out
+	// of the in-memory header window into the DB cold-read path, the
+	// P8/P9 hazard.  Keeping the lead just below headerLeadLimit keeps the
+	// header tip ahead of the blocks by design without racing arbitrarily
+	// far (observed ~42k-68k lead before the cap).
+	_, bestHeaderHeight := sm.chain.BestHeader()
+	if bestHeaderHeight-sm.chain.BestSnapshot().Height > headerLeadLimit {
+		return false
+	}
+
 	rng := &headerRange{
 		start:      start,
 		peer:       peer,
 		assignedAt: time.Now(),
+		confirmed:  true, // non-front ranges apply on the single response
 	}
 	hs.ranges[start] = rng
 	hs.peerRange[peer] = rng
 
 	peer.PushGetHeadersMsg(sm.headerLocator(start-1), &zeroHash)
+	return true
 }
 
 // assignHeaderRange hands the next unassigned, non-overlapping slice of the
@@ -654,6 +763,35 @@ func (sm *SyncManager) assignHeaderRange(peer *peerpkg.Peer) bool {
 	// A peer only ever has a single range in flight.
 	if _, ok := hs.peerRange[peer]; ok {
 		return false
+	}
+
+	// Cap the header lead over the connected best chain (see headerLeadLimit
+	// above).  Once the applied header tip is far enough ahead to keep the
+	// block request frontier (bestChain+8192) fully covered, no further
+	// headers are needed; pausing here prevents the header tip from racing
+	// arbitrarily far ahead, which would push the receive-side prev check
+	// out of the in-memory header window into the DB cold-read path (the
+	// P8/P9 hazard).  The block-side guard in assignBlockSlice refuses new
+	// block slices when the header lead shrinks below the request window, so
+	// the two guards together keep the lead in the band
+	// [maxBlockRequestWindow, headerLeadLimit] while both downloads run.
+	_, bestHeaderHeight := sm.chain.BestHeader()
+	if bestHeaderHeight-sm.chain.BestSnapshot().Height > headerLeadLimit {
+		return false
+	}
+
+	// C2 front double-send: when the front range is already held by another
+	// peer but has not yet been confirmed (its direction decides the header
+	// chain, so a misattributed front is the pollution entry point), hand the
+	// same front range to this idle peer as well.  Two independent peers then
+	// corroborate its first hash before it is applied; a forged or
+	// misattributed front cannot gather the second agreeing vote.  Non-front
+	// ranges are not double-sent (they keep the single-vote fast path).
+	if front := hs.ranges[hs.nextHeight]; front != nil &&
+		!front.received && !front.confirmed && hs.nextHeight <= hs.target {
+		hs.peerRange[peer] = front
+		peer.PushGetHeadersMsg(sm.headerLocator(hs.nextHeight-1), &zeroHash)
+		return true
 	}
 
 	// Fill a front hole first; otherwise extend the frontier.
@@ -681,7 +819,13 @@ func (sm *SyncManager) assignHeaderRange(peer *peerpkg.Peer) bool {
 		return false
 	}
 
-	sm.launchHeaderRange(peer, start)
+	// The dispatch may be suppressed by the header lead cap (enforced inside
+	// launchHeaderRange).  When that happens, do not advance the frontier or
+	// report success -- the header tip is already as far ahead as allowed and
+	// the caller should leave the frontier untouched until blocks catch up.
+	if !sm.launchHeaderRange(peer, start) {
+		return false
+	}
 
 	// Only advance the contiguous frontier for fresh (non hole-filling)
 	// assignments.
@@ -725,6 +869,8 @@ func (sm *SyncManager) reissueHeaderRange(peer *peerpkg.Peer, start int32) {
 		return
 	}
 
+	// The dispatch may be suppressed by the header lead cap (enforced inside
+	// launchHeaderRange); when that happens there is nothing left to do here.
 	sm.launchHeaderRange(peer, start)
 }
 
@@ -1085,6 +1231,60 @@ func (sm *SyncManager) handleStallSample() {
 	if sm.blockSyncState != nil {
 		sm.reissueStaleBlockSlices()
 		sm.reissueStalledBlockPeers()
+
+		// Top up every drained peer even when no block has arrived to
+		// trigger blkDownload.  blkDownload normally runs on block receipt,
+		// so a download that stalled with no in-flight requests (every
+		// slice released, the front request freed, and no peer delivering)
+		// would otherwise sit idle forever: nothing arrives to re-trigger
+		// it.  Running it here lets assignBlockSlice re-issue the freed
+		// front (see its missing-front fallback) and restart the download.
+		sm.blkDownload()
+	}
+
+	// Fast rollback for an unreachable header front: when three distinct
+	// peers have all returned responses that do not extend the front range,
+	// the header chain at that height is almost certainly fabricated or
+	// forked.  Roll back immediately instead of waiting for the slow
+	// 10-minute block-side timer (P4), so a pollution cycle costs ~1-2
+	// minutes instead of 20+.
+	if sm.headerSync != nil {
+		frontStart := sm.headerSync.nextHeight
+		if peers := sm.frontUnreachable[frontStart]; len(peers) >= 3 {
+			log.Warnf("Front header range %d unreachable from %d distinct "+
+				"peers -- fabricated/forked header chain, rolling back early",
+				frontStart, len(peers))
+			delete(sm.frontUnreachable, frontStart)
+			sm.rollbackFabricatedHeaderChain()
+		}
+	}
+
+	// Detect a fabricated or forked header chain: the block download has not
+	// advanced for blockUnavailableTimeout.  A real chain's blocks are served
+	// by the network; a forged chain's blocks either do not exist on any peer
+	// or do not link to the applied tip, so the download would spin forever
+	// (observed: a header index polluted with a real block at the wrong height
+	// froze the block download at 340774 while headers kept advancing).  Roll
+	// the header chain back and resync instead of stalling indefinitely.
+	//
+	// The check keys on the front height not advancing, NOT on the front hash
+	// being present in requestedBlocks: a deadlock can free the front request
+	// entirely (all slices released, no peer delivering), leaving requestedBlocks
+	// empty while the front never advances -- exactly the case that must still
+	// be detected.
+	if sm.blockSyncState != nil {
+		best := sm.chain.BestSnapshot().Height
+		if best != sm.blockMissingHeight {
+			// The front advanced (or this is the first sample); restart the
+			// stuck timer at the current height.
+			sm.blockMissingHeight = best
+			sm.blockMissingSince = time.Now()
+		} else if time.Since(sm.blockMissingSince) > blockUnavailableTimeout {
+			log.Warnf("Block download stuck at height %d for %v -- suspected "+
+				"fabricated/forked header chain, rolling back",
+				best, blockUnavailableTimeout)
+			sm.rollbackFabricatedHeaderChain()
+		}
 	}
 
 	// If we don't have an active sync peer, exit early.
@@ -1709,15 +1909,42 @@ func (sm *SyncManager) assignBlockSlice(peer *peerpkg.Peer) bool {
 	if frontInFlight {
 		_, frontInFlight = sm.requestedBlocks[*frontHash]
 	}
-	if !frontInFlight && bestHeight+1 <= windowEnd {
+	if frontInFlight {
+		// A request for the front block is in flight again, so clear the
+		// missing-front marker; any subsequent gap is measured from scratch.
+		bs.frontMissingSince = time.Time{}
+		bs.frontMissingHeight = 0
+	} else if bestHeight+1 <= windowEnd {
 		// The front slice is the critical one: whoever holds it controls
 		// how fast the tip advances.  A peer that has just been freed for
 		// stalling must not immediately re-claim it, or it would just
 		// freeze the download again; prefer a peer that has recently shown
 		// it can deliver.
+		//
+		// However, if the front block has been unrequested for a full stall
+		// window (its request was freed and no peer has claimed it since),
+		// the "recently delivering" policy has no candidate and the download
+		// deadlocks permanently: blkDownload only runs on block receipt, so
+		// with no slice ever assigned no block ever arrives and nothing ever
+		// re-requests the front.  In that case let any peer claim the front
+		// so the request goes out again and the stall machinery can observe
+		// (and if needed re-issue) it.
+		if bs.frontMissingHeight != bestHeight+1 {
+			bs.frontMissingHeight = bestHeight + 1
+			bs.frontMissingSince = time.Now()
+		}
+		frontStuck := time.Since(bs.frontMissingSince) >= blockSliceStallTimeout
 		if last, ok := bs.lastProgress[peer]; !ok ||
-			time.Since(last) < blockSliceStallTimeout {
+			time.Since(last) < blockSliceStallTimeout || frontStuck {
 			start = bestHeight + 1
+			if frontStuck {
+				// Reset the peer's progress clock so a subsequent stall is
+				// measured from this claim, not from an old delivery.
+				bs.lastProgress[peer] = time.Now()
+				log.Warnf("Block download dispatch: front block %d unrequested "+
+					"for %v -- handing front slice to peer %s (stall fallback)",
+					bestHeight+1, blockSliceStallTimeout, peer.Addr())
+			}
 		} else {
 			return false
 		}
@@ -1941,13 +2168,34 @@ func (sm *SyncManager) reconnectStoredBlocks() {
 			return
 		}
 
-		have, err := sm.chain.HaveBlock(hash)
-		if err != nil || !have {
+		// Only attempt to reconnect blocks whose data is actually on disk.
+		// HaveBlock would also report in-memory orphan blocks as present, but
+		// an orphan's payload is never written to the DB, so ResumeBlockConnect
+		// would fail with "block ... does not exist" and a polluted height row
+		// pointing at a recently-fetched orphan would falsely trigger a
+		// "local data inconsistent" rollback (P11).  Orphans connect through
+		// the normal download flow once their parent arrives.
+		stored, err := sm.chain.BlockStored(hash)
+		if err != nil || !stored {
 			return
 		}
 
 		_, behaviorFlags := sm.checkHeadersList(hash)
 		if _, err := sm.chain.ResumeBlockConnect(hash, behaviorFlags); err != nil {
+			// The locally stored block could not be connected, which means
+			// the on-disk block data is inconsistent with the header chain
+			// (e.g. a previous session downloaded blocks for a fabricated or
+			// forked header chain, or the header index itself was polluted
+			// with a real block at the wrong height).  Silently returning
+			// would leave the download stuck at this height forever: the
+			// stored data is still "have" so it is never re-requested, and
+			// nothing else re-issues it.  Roll the header chain back to the
+			// last confirmed connected height so the bogus segment is
+			// invalidated and the download restarts from there.
+			log.Warnf("Stored block %v (height %d) failed to connect: %v -- "+
+				"local data inconsistent with header chain, rolling back",
+				hash, nextHeight, err)
+			sm.rollbackFabricatedHeaderChain()
 			return
 		}
 	}
@@ -2073,13 +2321,171 @@ func (sm *SyncManager) handleParallelHeadersMsg(peer *peerpkg.Peer,
 	// issued before its range was reassigned, in which case (with the short
 	// stall timeout and aggressive re-issuing) the response is a stale
 	// duplicate that must be ignored rather than attributed to the new range.
-	if expected, err := sm.chain.HeaderHashByHeight(rng.start - 1); err == nil {
-		if !headers[0].PrevBlock.IsEqual(expected) {
-			log.Warnf("Peer %v returned headers that do not extend the "+
-				"range starting at %d -- ignoring stale response",
-				peer.Addr(), rng.start)
+	//
+	// The reference frame for the prev test is the applied header chain.  When
+	// the range begins above the applied tip -- which is the norm during the
+	// parallel download, where the receive frontier can lead the applied
+	// (front-serial) tip by far more than the in-memory header window (up to
+	// ~68k headers observed after a rollback) -- HeaderHashByHeight(start-1)
+	// falls back to the DB height index, whose reference frame may be stale
+	// (P8: rollback does not clear the old height rows) or absent (a legal
+	// leading range that has simply not been applied yet).  In that state the
+	// response cannot be verified against the applied chain, but it is also
+	// NOT a proven misattribution: refusing it would drop legitimate leading
+	// ranges (and re-issuing them would re-hit the same condition), while
+	// accepting it blindly would let a stale-height row pass (P9).  The range
+	// is therefore buffered unverified and applied only when the front
+	// reaches start-1, at which point processReadyHeaderRanges re-verifies
+	// the connection against the clean applied chain (see R4: misattached
+	// ranges are detected there and discarded).
+	_, applied := sm.chain.BestHeader()
+	if rng.start-1 > applied {
+		// The reference frame is not applied yet, so the response cannot be
+		// verified against the applied chain here.  Buffer it unverified and
+		// let the front apply it later -- but record the first corroborating
+		// hash so a misattributed range (a forged/forked segment whose prev
+		// chain is self-consistent, e.g. real 1974053's block 4c83da06
+		// arriving at 1919363, offset by 54690) is detected when a second
+		// independent peer responds: it cannot gather the agreeing second
+		// vote.  With fewer than two peers the range degrades to a single
+		// vote and C1's fast rollback covers a wrong chain.
+		h := headers[0].BlockHash()
+		if rng.firstHash == nil {
+			rng.firstHash = &h
+			rng.firstPeer = peer
+			rng.headers = headers
+			if len(hs.peers) < 2 {
+				rng.confirmed = true
+			}
+			rng.received = true
+			sm.processReadyHeaderRanges()
 			return
 		}
+		if rng.firstPeer == peer {
+			return // same peer duplicate
+		}
+		if h != *rng.firstHash {
+			// Second independent peer disagrees: misattributed range.
+			log.Warnf("Header range at height %d: peer %v disagrees with %v "+
+				"(hash %v vs %v) -- keeping unconfirmed",
+				rng.start, peer.Addr(), rng.firstPeer.Addr(), h, *rng.firstHash)
+			if sm.frontUnreachable == nil {
+				sm.frontUnreachable = make(map[int32]map[string]time.Time)
+			}
+			peers := sm.frontUnreachable[rng.start]
+			if peers == nil {
+				peers = make(map[string]time.Time)
+				sm.frontUnreachable[rng.start] = peers
+			}
+			peers[peer.Addr()] = time.Now()
+			return
+		}
+		rng.headers = headers
+		rng.received = true
+		rng.confirmed = true
+		sm.processReadyHeaderRanges()
+		return
+	}
+
+	// The applied chain resolves start-1 (in-window or via a clean cold
+	// read): the response must actually extend that exact height.  A peer
+	// can legitimately respond to an earlier request it was issued before
+	// its range was reassigned, in which case (with the short stall timeout
+	// and aggressive re-issuing) the response is a stale duplicate that must
+	// be ignored rather than attributed to the new range.  The check MUST
+	// also reject the response when the applied chain's hash at the previous
+	// height cannot be resolved (HeaderHashByHeight error).  The
+	// prev-connection test is the only thing standing between a well-formed
+	// self-consistent chain segment (real PoW, contiguous prev links) and a
+	// misattributed one: a peer serving a chain whose heights are offset from
+	// the real chain (observed: a whole [6760004..6760006] segment accepted at
+	// [6706690..6706692], offset by 53314) passes every other check, so
+	// skipping the prev test when the lookup fails lets the offset segment
+	// into the header index and pollutes the height→hash mapping.
+	expected, err := sm.chain.HeaderHashByHeight(rng.start - 1)
+	if err != nil || !headers[0].PrevBlock.IsEqual(expected) {
+		log.Warnf("Peer %v returned headers that do not extend the "+
+			"range starting at %d (or could not be verified) -- ignoring "+
+			"response", peer.Addr(), rng.start)
+
+		// Record that this peer could not extend the front.  When enough
+		// distinct peers all fail to extend the same front range, the header
+		// chain at that height is almost certainly fabricated or forked; the
+		// stall handler rolls the chain back early instead of waiting for the
+		// slow 10-minute block-side timer (P4).
+		if hs := sm.headerSync; hs != nil && rng.start == hs.nextHeight {
+			if sm.frontUnreachable == nil {
+				sm.frontUnreachable = make(map[int32]map[string]time.Time)
+			}
+			peers := sm.frontUnreachable[rng.start]
+			if peers == nil {
+				peers = make(map[string]time.Time)
+				sm.frontUnreachable[rng.start] = peers
+			}
+			peers[peer.Addr()] = time.Now()
+			// Prune stale entries so the map cannot grow without bound.
+			for addr, t := range peers {
+				if time.Since(t) > 5*time.Minute {
+					delete(peers, addr)
+				}
+			}
+		}
+		return
+	}
+
+	// C2 front double-confirmation: the front range decides the direction of
+	// the header chain, so it is corroborated by a second independent peer
+	// before being applied.  The first response records its first-header
+	// hash; a second independent peer returning the same hash confirms the
+	// range.  A forged or misattributed front (fed through a stale height
+	// row, P8) cannot gather the second agreeing vote.  With fewer than two
+	// peers present the front degrades to a single vote -- C1's fast
+	// rollback then covers a wrong chain.  Non-front ranges keep the
+	// single-vote fast path (confirmed stays true).
+	if rng.start == hs.nextHeight && hs.nextHeight <= hs.target {
+		if rng.firstHash == nil {
+			// First corroborating response.
+			h := headers[0].BlockHash()
+			rng.firstHash = &h
+			rng.firstPeer = peer
+			rng.headers = headers
+			if len(hs.peers) < 2 {
+				// Sparse network: degrade to a single vote.
+				rng.confirmed = true
+			}
+			rng.received = true
+			sm.processReadyHeaderRanges()
+			return
+		}
+		if rng.firstPeer == peer {
+			// The same peer responded again; ignore the duplicate.
+			return
+		}
+		h := headers[0].BlockHash()
+		if h != *rng.firstHash {
+			// Second independent peer disagrees with the first: the front is
+			// likely misattributed.  Record the disagreement (C1: enough
+			// distinct disagreeing peers triggers a fast rollback) and keep
+			// the range unconfirmed.
+			log.Warnf("Front header range at height %d: peer %v disagrees "+
+				"with %v (hash %v vs %v) -- keeping unconfirmed",
+				rng.start, peer.Addr(), rng.firstPeer.Addr(), h, *rng.firstHash)
+			if sm.frontUnreachable == nil {
+				sm.frontUnreachable = make(map[int32]map[string]time.Time)
+			}
+			peers := sm.frontUnreachable[rng.start]
+			if peers == nil {
+				peers = make(map[string]time.Time)
+				sm.frontUnreachable[rng.start] = peers
+			}
+			peers[peer.Addr()] = time.Now()
+			return
+		}
+		rng.headers = headers
+		rng.received = true
+		rng.confirmed = true
+		sm.processReadyHeaderRanges()
+		return
 	}
 
 	rng.headers = headers
@@ -2100,8 +2506,34 @@ func (sm *SyncManager) processReadyHeaderRanges() {
 
 	for {
 		front := hs.ranges[hs.nextHeight]
-		if front == nil || !front.received {
+		// A range is applied only once received AND (for the front, whose
+		// direction decides the header chain) confirmed by a second
+		// independent peer (C2).  Non-front ranges are confirmed by
+		// construction, so this only gates the front's double vote.
+		if front == nil || !front.received || !front.confirmed {
 			break
+		}
+
+		// Strict prev-connection check against the applied chain.  The
+		// range's first header must extend the exact applied height
+		// (front.start-1 is applied by definition here).  A misattributed
+		// range -- e.g. real 1974053's block 4c83da06 arriving at 1919363,
+		// offset by 54690 -- has a self-consistent prev chain that passes
+		// every earlier check, so this final connection test is what catches
+		// it: its prev does not equal the applied chain's hash at start-1.
+		// Discard the range and re-issue it rather than polluting the index.
+		if len(front.headers) > 0 {
+			if expected, err := sm.chain.HeaderHashByHeight(front.start - 1); err != nil ||
+				!front.headers[0].PrevBlock.IsEqual(expected) {
+
+				log.Warnf("Header range at height %d does not extend the "+
+					"applied chain at %d (or could not be verified) -- "+
+					"discarding and re-issuing", front.start, front.start-1)
+				delete(hs.ranges, front.start)
+				delete(hs.peerRange, front.peer)
+				sm.reissueHeaderRange(front.peer, front.start)
+				continue
+			}
 		}
 
 		// Mirror the reference umami behavior (sugarchain PR #122): during
@@ -2117,6 +2549,60 @@ func (sm *SyncManager) processReadyHeaderRanges() {
 			_, err := sm.chain.ProcessBlockHeader(
 				blockHeader, headerFlags, false)
 			if err != nil {
+				// A range whose predecessor header has not been
+				// applied yet cannot be applied: during the parallel
+				// download a re-issue may deliver a later range before
+				// its predecessor, and the predecessor's own range may
+				// still be in flight (observed: peer returned headers
+				// for height 6868747 whose previous block d1d33b74 is
+				// the not-yet-applied header at 6868746).  This is a
+				// transient ordering race, not a peer fault -- the
+				// predecessor will be applied when its own range
+				// arrives.  Leave the range in place and let the next
+				// processReadyHeaderRanges pass retry it; the re-issue
+				// machinery keeps the predecessor moving.  Disconnecting
+				// the peer and aborting the whole header download here
+				// would restart from scratch and hit the same race
+				// forever (observed: repeated connect/disconnect loop).
+				var ruleErr blockchain.RuleError
+				if errors.As(err, &ruleErr) &&
+					ruleErr.ErrorCode == blockchain.ErrPreviousBlockUnknown {
+					log.Warnf("Header range at height %d cannot be "+
+						"applied yet (previous block not known): %v -- "+
+						"waiting for predecessor", front.start, err)
+					return
+				}
+
+				// Any other rule violation (bad difficulty, invalid
+				// header, etc.) means this range does not fit the
+				// applied chain.  Do NOT blame the responding peer:
+				// when the local header index was polluted (P8 stale
+				// height rows feeding misattributed ranges) the peer
+				// carrying the real chain is the one whose response
+				// fails, and disconnecting it accelerates peer loss
+				// (P3).  Record the range's first hash as suspicious,
+				// roll the header chain back so the polluted segment
+				// is discarded, and let the fresh download proceed --
+				// the peer stays connected.
+				if errors.As(err, &ruleErr) {
+					if hash, e2 := sm.chain.HeaderHashByHeight(front.start); e2 == nil {
+						if sm.suspiciousHeaders == nil {
+							sm.suspiciousHeaders = make(map[chainhash.Hash]struct{})
+						}
+						if len(sm.suspiciousHeaders) < 100 {
+							sm.suspiciousHeaders[*hash] = struct{}{}
+						}
+					}
+					log.Warnf("Header range at height %d failed to "+
+						"apply: %v -- rolling back header chain "+
+						"(peer %v stays connected)", front.start, err,
+						front.peer.Addr())
+					sm.rollbackFabricatedHeaderChain()
+					return
+				}
+
+				// A non-rule internal error is a real fault: drop the
+				// peer and restart the header download.
 				log.Warnf("Received block header from peer %v "+
 					"failed header verification -- disconnecting: %v",
 					front.peer.Addr(), err)
@@ -2388,6 +2874,47 @@ func (sm *SyncManager) abortHeaderSync() {
 	}
 }
 
+// rollbackFabricatedHeaderChain rolls the header chain back to the last
+// connected block when the block download has been stuck at one height for
+// blockUnavailableTimeout.  A real chain's blocks are served by the network,
+// so an unservable front block means the header chain is fabricated or forked
+// (observed: a header index polluted with a real block at the wrong height
+// froze the block download while headers kept advancing).  The bogus segment
+// is invalidated, all in-flight header/block state is discarded, and the sync
+// restarts from the confirmed height.
+func (sm *SyncManager) rollbackFabricatedHeaderChain() {
+	// 1. Determine the rollback height: the last connected block (the front
+	// block above it is the one that no peer can serve).
+	best := sm.chain.BestSnapshot()
+	rollbackHeight := best.Height
+
+	// 2. Invalidate every header above the rollback height and rebuild the
+	// best-header view from the confirmed block.
+	if err := sm.chain.InvalidateHeaderChain(rollbackHeight); err != nil {
+		log.Errorf("Failed to roll back fabricated header chain: %v", err)
+		return
+	}
+	log.Warnf("Rolled back fabricated header chain to height %d -- "+
+		"restarting header/block download", rollbackHeight)
+
+	// 3. Tear down all in-flight download state so the next fetchHeaders
+	// starts from a clean slate at the confirmed height.
+	sm.headerSync = nil
+	sm.blockSync = nil
+	sm.blockSyncState = nil
+	sm.blockMissingSince = time.Time{}
+	sm.blockMissingHeight = 0
+	sm.requestedBlocks = make(map[chainhash.Hash]struct{})
+	for _, state := range sm.peerStates {
+		state.requestedBlocks = make(map[chainhash.Hash]struct{})
+	}
+	sm.syncPeer = nil
+	sm.ibdMode = true
+
+	// 4. Restart the sync from the rebuilt best-header tip.
+	sm.startSync()
+}
+
 // reissueStaleHeaderRanges reassigns any in-flight header range that has not
 // completed within headerRangeStallTimeout to a different idle peer so a slow
 // or unresponsive peer cannot stall the parallel header download.
@@ -2558,7 +3085,22 @@ func (sm *SyncManager) reissueFrontRange() {
 	case front == nil:
 		// The front is a hole; hand it out again.
 	case front.received:
-		// Already in hand; it will be applied momentarily.
+		// Already in hand.  It is normally applied momentarily by
+		// processReadyHeaderRanges; but if its first header's prev is not
+		// connected to the applied chain, it is a misattached range that can
+		// never be applied (P10: a stale height row fed by a polluted index
+		// let a range pass the receive-side prev check even though its prev
+		// belongs to the discarded chain).  Leaving it queued would freeze
+		// the header front forever, so detect it here and re-issue it.
+		if !sm.headerRangeAppliable(front) {
+			log.Warnf("Header range at height %d received but not "+
+				"appliable (predecessor not connected) -- re-issuing",
+				front.start)
+			delete(hs.ranges, front.start)
+			delete(hs.peerRange, front.peer)
+			sm.reissueHeaderRange(front.peer, front.start)
+			return
+		}
 		return
 	case time.Since(front.assignedAt) < headerRangeStallTimeout:
 		// Still fresh in flight.
@@ -2602,6 +3144,20 @@ func (sm *SyncManager) reissueFrontRange() {
 	}
 
 	sm.reissueHeaderRange(target, hs.nextHeight)
+}
+
+// headerRangeAppliable reports whether a received front header range can be
+// applied to the header chain: its first header's prev block must already be
+// present in the block index (i.e. connected to the applied chain).  During
+// the parallel download a misattached range can pass the receive-side prev
+// check (a stale height row fed by a polluted index, P8) while its prev
+// actually belongs to a discarded chain -- such a range would never be
+// appliable and would freeze the header front if left queued (P10).
+func (sm *SyncManager) headerRangeAppliable(front *headerRange) bool {
+	if front == nil || len(front.headers) == 0 {
+		return false
+	}
+	return sm.chain.IsValidHeader(&front.headers[0].PrevBlock)
 }
 
 // handleNotFoundMsg handles notfound messages from all peers.
@@ -3307,6 +3863,8 @@ func New(config *Config) (*SyncManager, error) {
 		requestedTxns:      make(map[chainhash.Hash]struct{}),
 		requestedBlocks:    make(map[chainhash.Hash]struct{}),
 		peerStates:         make(map[*peerpkg.Peer]*peerSyncState),
+		suspiciousHeaders:  make(map[chainhash.Hash]struct{}),
+		frontUnreachable:   make(map[int32]map[string]time.Time),
 		progressLogger:     newBlockProgressLogger("Processed", log),
 		msgChan:            make(chan interface{}, config.MaxPeers*3),
 		quit:               make(chan struct{}),
