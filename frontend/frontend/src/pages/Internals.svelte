@@ -250,40 +250,39 @@ onDestroy(() => clearInterval(timer));
     prevRanges = curRanges;
   }
 
-  // ---- Header conveyor: window over the ACTIVE band area ----------------
-  // Each cell is one real slice (sliceLen = 2000 headers), keyed by its
-  // ABSOLUTE start height.  The window is anchored to the peers' current
-  // ranges ([minStart−2000 … maxEnd+2000]) so the completed (received=true)
-  // slices — the dark "finished" progress bars — show their deep color at
-  // their real height position; when a range advances N slices the shared
-  // cells shift N positions left and flip() slides the whole row.
+  // ---- Header conveyor: 2000-height grid window that scrolls -------------
+  // A 10-cell window of real 2000-header slices, right edge anchored to
+  // header_next_assign (the trustworthy allocation pointer).  Cells are keyed
+  // by ABSOLUTE start height, so when next_assign advances N slices the
+  // shared cells shift N positions left and flip() slides the row — a
+  // continuous leftward scroll with real forward motion.  A cell overlapped
+  // by a peer's range shows that peer's color (light in-flight / deep when
+  // received); everything else is dashed todo.  History outside the window is
+  // not shown.
   type HdrCell =
     | { key: string; kind: "done"; title: string; start: number; end: number }
     | { key: string; kind: "inflight"; title: string; peer: string; start: number; end: number; received: boolean }
+    | { key: string; kind: "gap"; title: string; grow: number }
     | { key: string; kind: "todo"; title: string; start: number }
     | { key: string; kind: "empty"; title: string };
 
   const hdrConveyor = $derived.by((): HdrCell[] => {
     if (!dat) return [];
-    const sliceLen = dat.headerTasks.sliceLen || 2000;
-    const peers = dat.headerTasks.hdrPeers;
+    const lanes = dat.headerTasks.hdrLanes;
+    const recent = dat.headerTasks.recent;
     const num = (peer: string) => `#${peerNumOf(peer) ?? "?"}`;
-    if (peers.length === 0) return [];
-    const minStart = Math.min(...peers.map((p) => p.start));
-    const maxEnd = Math.max(...peers.map((p) => p.end));
-    const left = Math.floor(minStart / sliceLen) * sliceLen - sliceLen;
-    const right = Math.ceil(maxEnd / sliceLen) * sliceLen + sliceLen;
+    // One block per task, flexing evenly to FILL the whole track: completed
+    // windows (header_recent_ranges — the node's own completion log, immune
+    // to the slow poll) plus the live assigned ranges.  No gaps: every block
+    // is a real peer slice and the row is always fully covered.
+    const items: { key: string; start: number; end: number; peer: string; received: boolean }[] = [
+      ...recent.map((r) => ({ key: `r${r.peer}:${r.start}`, start: r.start, end: r.end, peer: r.peer, received: true })),
+      ...lanes.map((l) => ({ key: `l${l.peer}:${l.start}`, start: l.start, end: l.end, peer: l.peer, received: l.received })),
+    ].sort((a, b) => a.start - b.start || (a.received === b.received ? 0 : a.received ? -1 : 1));
     const cells: HdrCell[] = [];
-    for (let start = Math.max(0, left); start < right; start += sliceLen) {
-      const end = start + sliceLen;
-      const p = peers.find((x) => x.start < end && x.end > start);
-      if (p && p.received) {
-        cells.push({ key: `h${start}`, kind: "done", title: `${num(p.peer)} ${fmt(start)}→${fmt(end)} · ${t("int.done")}`, start, end });
-      } else if (p) {
-        cells.push({ key: `h${start}`, kind: "inflight", title: `${num(p.peer)} ${fmt(start)}→${fmt(end)} · ${t("int.inflight")}`, peer: p.peer, start, end, received: false });
-      } else {
-        cells.push({ key: `h${start}`, kind: "todo", title: `${t("int.todo")} ${fmt(start)}`, start });
-      }
+    for (const it of items) {
+      const st = it.received ? t("int.done") : t("int.inflight");
+      cells.push({ key: it.key, kind: "inflight", title: `${num(it.peer)} ${fmt(it.start)}→${fmt(it.end)} · ${st}`, peer: it.peer, start: it.start, end: it.end, received: it.received });
     }
     return cells;
   });
@@ -671,7 +670,7 @@ onDestroy(() => clearInterval(timer));
         </div>
         <div class="win-track hdr" role="img" aria-label={t("int.tasks_headers")}>
           <div class="hdr-conveyor">
-            {#each hdrConveyor as c (c.key)}
+            {#each hdrConveyor as c, i (c.key)}
               <span
                 class="hdr-cell {c.kind}"
                 class:got={c.kind === "inflight" && c.received}
@@ -680,7 +679,9 @@ onDestroy(() => clearInterval(timer));
                 style:--pc={c.kind === "inflight" ? `var(--peer${((peerColor.get(c.peer) ?? 0) % 8) + 1})` : undefined}
                 title={c.title}
               >
-                {#if c.kind === "inflight" && !c.received}<span class="hdr-scan" aria-hidden="true"></span>{/if}
+                {#if c.kind === "inflight" && c.received}
+                  <span class="hdr-progress" style:animation-delay={`${i * 0.1}s`}></span>
+                {/if}
               </span>
             {/each}
           </div>
@@ -689,6 +690,9 @@ onDestroy(() => clearInterval(timer));
           <span class="mono mint">▲ {t("int.hdr_tip")} {fmt(dat.headerTip)}</span>
           <span class="mono straw">↦ {t("int.hdr_next_assign")} {fmt(dat.headerTasks.nextAssign)}</span>
           <span class="mono">◆ target {fmt(dat.headerBoundary)}</span>
+          {#if dat.headerTasks.paused}
+            <span class="mono honey" title="header lead cap">⏸ {t("int.hdr_paused")}</span>
+          {/if}
         </div>
         {#if dat.headerTasks.hdrLanes.length > 0}
           <p class="legend mono" aria-hidden="true">▓ {t("int.done")} ░ {t("int.inflight")} · {t("int.todo")}</p>
@@ -701,10 +705,10 @@ onDestroy(() => clearInterval(timer));
                 <div class="lane-bar" aria-hidden="true">
                   {#key `${l.peer}:${l.start}:${l.received}`}
                     <span
-                      class="lane-done hi hdr-lane-fill"
-                      class:done={l.received}
+                      class="lane-done hi lane-fill"
                       style:--pc={`var(--peer${((peerColor.get(l.peer) ?? 0) % 8) + 1})`}
-                      title={`${fmt(l.start)}→${fmt(l.end)} · ${l.received ? t("int.done") : t("int.inflight")} ${l.pct.toFixed(0)}%`}
+                      style:animation-delay={`${(peerNumOf(l.peer) ?? 0) * 0.12}s`}
+                      title={`${fmt(l.start)}→${fmt(l.end)} · ${l.received ? t("int.done") : t("int.inflight")}`}
                     ></span>
                   {/key}
                 </div>
@@ -805,14 +809,14 @@ onDestroy(() => clearInterval(timer));
     margin: 0 auto;
   }
   .int {
-    --peer1: #e34d42;
-    --peer2: #e8873b;
-    --peer3: #ecd034;
-    --peer4: #d4a017;
-    --peer5: #a2acb8;
-    --peer6: #35c3c8;
-    --peer7: #4f86e0;
-    --peer8: #9b6adf;
+    --peer1: #e34d42; /* 红 */
+    --peer2: #e8873b; /* 橙 */
+    --peer3: #ecd034; /* 黄 */
+    --peer4: #3fa34d; /* 绿 */
+    --peer5: #35c3c8; /* 青 */
+    --peer6: #4f86e0; /* 蓝 */
+    --peer7: #9b6adf; /* 紫 */
+    --peer8: #a2acb8; /* 灰 */
     --hdr-pile: #019875;
   }
   .head {
@@ -1006,6 +1010,16 @@ onDestroy(() => clearInterval(timer));
     box-shadow: 0 0 4px rgba(0, 0, 0, 0.35);
     animation: hdr-scan 1.2s ease-in-out infinite alternate;
   }
+  /* Real server-side applied progress inside a header block (scaleX, GPU). */
+  .hdr-progress {
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 100%;
+    transform-origin: left;
+    background: rgba(255, 255, 255, 0.5);
+    border-radius: 5px;
+    animation: lane-fill 0.5s ease-out both;
+  }
   @keyframes hdr-scan {
     from {
       transform: translateX(0);
@@ -1153,17 +1167,13 @@ onDestroy(() => clearInterval(timer));
   .lane-done.hi {
     background: linear-gradient(180deg, var(--pc), color-mix(in srgb, var(--pc) 70%, #000));
   }
-  .lane-done.hi.hdr-lane-fill:not(.done) {
-    transform: scaleX(0.06);
-    min-width: 3px;
-    opacity: 0.55;
-  }
-  .lane-done.hi.hdr-lane-fill.done {
-    background: linear-gradient(180deg, var(--pc), color-mix(in srgb, var(--pc) 55%, #000));
-    animation: hdr-fill 0.5s ease-out both;
+  /* Real-completion feedback: the bar plays a 0→100% fill whenever the
+     peer's range actually advances (keyed remount), never a fake mid-value. */
+  .lane-fill {
+    animation: lane-fill 0.5s ease-out both;
     box-shadow: 0 0 6px color-mix(in srgb, var(--pc) 55%, transparent);
   }
-  @keyframes hdr-fill {
+  @keyframes lane-fill {
     from {
       transform: scaleX(0);
     }
@@ -1387,7 +1397,7 @@ onDestroy(() => clearInterval(timer));
     .lane-done {
       transition-duration: 0.4s !important;
     }
-    .lane-done.hi.hdr-lane-fill.done {
+    .lane-fill {
       animation-duration: 0.5s !important;
     }
   }

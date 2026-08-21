@@ -124,6 +124,7 @@
   "int.todo": "待创建",
   "int.hdr_tip": "头进度",
   "int.hdr_window_start": "窗口",
+  "int.hdr_paused": "暂停（等待区块追平）",
   "int.heap": "Heap {size}",
   "int.heap_objects": "HeapObjects {n}",
   "int.height": "高度",

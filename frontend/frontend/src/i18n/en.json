@@ -124,6 +124,7 @@
   "int.todo": "todo",
   "int.hdr_tip": "headerTip",
   "int.hdr_window_start": "Window",
+  "int.hdr_paused": "paused (waiting for blocks)",
   "int.heap": "Heap {size}",
   "int.heap_objects": "HeapObjects {n:,}",
   "int.height": "Height",

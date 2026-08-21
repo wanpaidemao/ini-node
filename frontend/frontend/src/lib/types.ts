@@ -70,10 +70,11 @@ export interface NodeInternals {
   };
   headerTasks: {
     ranges: { start: number; end: number; state: "done" | "inflight" | "todo" }[];
-    hdrPeers: { peer: string; start: number; end: number; pct: number; received: boolean; assignedAt: number }[];
-    hdrLanes: { peer: string; start: number; end: number; pct: number; received: boolean; assignedAt: number }[];
+    hdrPeers: { peer: string; start: number; end: number; received: boolean; applied: number; assignedAt: number }[];
+    hdrLanes: { peer: string; start: number; end: number; received: boolean; applied: number; assignedAt: number }[];
     recent: { start: number; end: number; peer: string; assignedAt: number }[];
     sliceLen: number;
+    paused: boolean;
     requestedBlocks: number;
     lastReissueAt: number;
     nextAssign: number;

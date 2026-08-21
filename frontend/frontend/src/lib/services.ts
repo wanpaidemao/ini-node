@@ -242,6 +242,7 @@ export const Services = {
         block_next_assign: number;
         block_window: number;
         header_slice_len: number;
+        header_paused: boolean;
         header_recent_ranges: Array<{
           start: number;
           end: number;
@@ -261,6 +262,7 @@ export const Services = {
           header_range_start: number;
           header_range_end: number;
           header_range_received: boolean;
+          header_range_applied: number;
           header_range_assigned_at: number;
           in_flight_blocks: number;
           last_block_at: number;
@@ -412,14 +414,8 @@ export const Services = {
             peer: p.addr,
             start: p.header_range_start,
             end: Math.max(p.header_range_start + 1, p.header_range_start + sliceLen),
-            // The node assigns a whole slice of `sliceLen` at once, so the
-            // range span is always the full slice and carries no progress
-            // information.  Render a real "in flight" state instead: a small
-            // starter bar until the node flips received=true, then 100%.
-            pct: p.header_range_received
-              ? 100
-              : 6,
             received: p.header_range_received,
+            applied: p.header_range_applied ?? 0,
             assignedAt: p.header_range_assigned_at ? p.header_range_assigned_at * 1000 : 0,
           };
         }),
@@ -437,18 +433,14 @@ export const Services = {
               peer: p.addr,
               start: p.header_range_start,
               end: Math.max(p.header_range_start + 1, p.header_range_start + sliceLen),
-              // Same reasoning as hdrPeers: the assigned range span is always
-              // the full slice, so an unreceived slice shows a starter bar
-              // (6%) instead of a misleading 100%.
-              pct: p.header_range_received
-                ? 100
-                : 6,
               received: p.header_range_received,
+              applied: p.header_range_applied ?? 0,
               assignedAt: p.header_range_assigned_at ? p.header_range_assigned_at * 1000 : 0,
             };
           })
           .sort((a, b) => a.peer.localeCompare(b.peer)),
         sliceLen: sync.header_slice_len ?? 0,
+        paused: sync.header_paused ?? false,
         requestedBlocks: Math.max(0, sync.block_target - chainTip),
         lastReissueAt: lastAssignAt > 0 ? lastAssignAt * 1000 : Date.now(),
         nextAssign: sync.header_next_assign ?? 0,

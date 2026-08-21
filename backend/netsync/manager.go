@@ -266,6 +266,11 @@ type headerRange struct {
 	headers    []*wire.BlockHeader
 	received   bool
 	assignedAt time.Time
+	// applied is the height up to which this range's headers have actually
+	// been applied to the chain — real progress tracked server-side as the
+	// batch applies, so the UI can show genuine progress even when a whole
+	// 2000-header slice downloads between two polls.
+	applied int32
 
 	// C2 front double-confirmation: the front range (the one that decides the
 	// direction of the header chain) is corroborated by a second independent
@@ -304,6 +309,13 @@ type headerSyncState struct {
 	peerRange   map[*peerpkg.Peer]*headerRange // single range assigned per peer
 	sliceLen    int32                          // max headers per getheaders batch
 	lastReissue time.Time                      // last time a stale range was reissued
+
+	// leadPaused is true while header assignment is suppressed by the
+	// header-lead cap (the header tip is already far enough ahead of the
+	// block frontier).  Exposed to the UI as header_paused so a stalled
+	// next_assign with received=true leftovers reads as "paused", not as
+	// fresh completions.
+	leadPaused bool
 }
 
 // blockSlice represents the contiguous range of block heights assigned to a
@@ -370,6 +382,7 @@ type PeerSyncStatus struct {
 	HeaderRangeStart      int32 `json:"header_range_start"`
 	HeaderRangeEnd        int32 `json:"header_range_end"`
 	HeaderRangeReceived   bool  `json:"header_range_received"`
+	HeaderRangeApplied    int32 `json:"header_range_applied"`
 	HeaderRangeAssignedAt int64 `json:"header_range_assigned_at"`
 	// In-flight blocks this peer has been asked for but not yet delivered.
 	InFlightBlocks int `json:"in_flight_blocks"`
@@ -410,6 +423,11 @@ type SyncStatus struct {
 	// HeaderRecentRanges lists the most recent completed header download
 	// windows as [start, end) ranges with the peer that fetched each.
 	HeaderRecentRanges []HeaderRecentRange `json:"header_recent_ranges"`
+	// HeaderPaused reports that header assignment is currently suppressed by
+	// the header-lead cap (the header tip is far enough ahead of the block
+	// frontier); the UI shows "paused" instead of reading stale received
+	// ranges as fresh completions.
+	HeaderPaused bool `json:"header_paused"`
 	// Peers lists every connected peer with its sync role and assigned work.
 	Peers []PeerSyncStatus `json:"peers"`
 }
@@ -732,8 +750,10 @@ func (sm *SyncManager) launchHeaderRange(peer *peerpkg.Peer, start int32) bool {
 	// far (observed ~42k-68k lead before the cap).
 	_, bestHeaderHeight := sm.chain.BestHeader()
 	if bestHeaderHeight-sm.chain.BestSnapshot().Height > headerLeadLimit {
+		hs.leadPaused = true
 		return false
 	}
+	hs.leadPaused = false
 
 	rng := &headerRange{
 		start:      start,
@@ -2610,6 +2630,7 @@ func (sm *SyncManager) processReadyHeaderRanges() {
 				sm.abortHeaderSync()
 				return
 			}
+			front.applied++
 			sm.progressLogger.SetLastLogTime(time.Now())
 		}
 
@@ -2657,7 +2678,7 @@ func (sm *SyncManager) recordHeaderWindow(start, end int32, peer *peerpkg.Peer) 
 		Peer:       peer.Addr(),
 		AssignedAt: time.Now(),
 	})
-	const maxRecentHeaderWindows = 8
+	const maxRecentHeaderWindows = 16
 	if len(sm.headerRecent) > maxRecentHeaderWindows {
 		sm.headerRecent = sm.headerRecent[len(sm.headerRecent)-maxRecentHeaderWindows:]
 	}
@@ -3777,6 +3798,7 @@ func (sm *SyncManager) syncStatusSnapshot() *SyncStatus {
 		status.HeaderTarget = hs.target
 		status.HeaderNextAssign = hs.nextAssign
 		status.HeaderSliceLen = hs.sliceLen
+		status.HeaderPaused = hs.leadPaused
 	} else {
 		status.HeaderSliceLen = sm.headerSliceLen
 	}
@@ -3803,6 +3825,7 @@ func (sm *SyncManager) syncStatusSnapshot() *SyncStatus {
 				ps.HeaderRangeStart = hr.start
 				ps.HeaderRangeEnd = hr.start + int32(len(hr.headers))
 				ps.HeaderRangeReceived = hr.received
+				ps.HeaderRangeApplied = hr.applied
 				ps.HeaderRangeAssignedAt = hr.assignedAt.Unix()
 			}
 		}
