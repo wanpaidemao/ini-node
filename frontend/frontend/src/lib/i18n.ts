@@ -139,6 +139,18 @@ export function fmtBytes(n: number): string {
   return `${v.toFixed(v >= 100 ? 0 : v >= 10 ? 1 : 2)}${units[i]}`;
 }
 
+/** connection uptime from a unix-seconds connect time → "2d 5h" / "3h 12m" / "4m". */
+export function fmtUptime(connTimeUnixSec: number): string {
+  if (!connTimeUnixSec) return "—";
+  const secs = Math.max(0, Math.floor(Date.now() / 1000 - connTimeUnixSec));
+  const d = Math.floor(secs / 86400);
+  const h = Math.floor((secs % 86400) / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${Math.max(1, m)}m`;
+}
+
 const dtf = new Map<Lang, Intl.DateTimeFormat>();
 function dtFmt(lang: Lang) {
   if (!dtf.has(lang)) {

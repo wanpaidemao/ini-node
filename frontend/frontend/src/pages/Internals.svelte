@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
-  import { t, fmt, fmtAgo } from "../lib/i18n";
+  import { t, fmt, fmtAgo, fmtBytes, fmtUptime } from "../lib/i18n";
   import { Services } from "../lib/services";
   import type { NodeInternals } from "../lib/types";
 
@@ -17,6 +17,44 @@ let timer: ReturnType<typeof setInterval> | undefined;
     boundary: number;
   }
   const hist = $state<Sample[]>([]);
+  // Traffic sampling for the average rate card: total recv/sent across all
+  // peers, captured once per poll.  Kept short (~2 min) so the average is a
+  // "recent" figure, and updated only when peerStats itself is refreshed
+  // (5-min cadence / manual button), matching the low-frequency design.
+  interface TrafficSample {
+    t: number;
+    recv: number;
+    sent: number;
+  }
+  const traffic = $state<TrafficSample[]>([]);
+  let lastTrafficAt = 0;
+  const trafficWindowMs = 120_000;
+  // Low-frequency snapshot of the per-peer stats consumed by the quality card.
+  // Refreshed only on the 5-minute cadence or the manual refresh button, so
+  // the card does not churn every 2s poll.
+  let peerStatsView = $state<NodeInternals["peerStats"]>([]);
+
+  function pushTraffic(ps: NodeInternals["peerStats"]) {
+    const recv = ps.reduce((m, p) => m + p.bytesRecv, 0);
+    const sent = ps.reduce((m, p) => m + p.bytesSent, 0);
+    const now = Date.now();
+    traffic.push({ t: now, recv, sent });
+    const cutoff = now - trafficWindowMs;
+    while (traffic.length > 0 && traffic[0].t < cutoff) traffic.shift();
+  }
+
+  // Average download/upload rate over the sampled window (KB/s).
+  const avgRate = $derived.by(() => {
+    if (traffic.length < 2) return { down: 0, up: 0 };
+    const a = traffic[0];
+    const b = traffic[traffic.length - 1];
+    const dt = (b.t - a.t) / 1000;
+    if (dt <= 0) return { down: 0, up: 0 };
+    return {
+      down: Math.max(0, (b.recv - a.recv) / dt / 1024),
+      up: Math.max(0, (b.sent - a.sent) / dt / 1024),
+    };
+  });
 
   async function poll() {
     try {
@@ -27,10 +65,26 @@ let timer: ReturnType<typeof setInterval> | undefined;
         const now = Date.now();
         hist.push({ t: now, tip: dat.chainTip, boundary: dat.chainBoundary });
         if (hist.length > 30) hist.shift();
+        // Refresh the peer-quality / traffic cards on the slow cadence (5 min)
+        // or on manual refresh; each poll still carries fresh peerStats but the
+        // UI only consumes it at that pace.
+        if (now - lastTrafficAt >= 300_000) {
+          lastTrafficAt = now;
+          peerStatsView = dat.peerStats;
+          pushTraffic(dat.peerStats);
+        }
       }
     } catch {
       /* keep */
     }
+  }
+
+  // Manual refresh of the traffic / peer-quality cards.
+  function refreshStats() {
+    if (!dat) return;
+    lastTrafficAt = Date.now();
+    peerStatsView = dat.peerStats;
+    pushTraffic(dat.peerStats);
   }
 
   onMount(() => {
@@ -187,6 +241,27 @@ onDestroy(() => clearInterval(timer));
     peers.forEach((p, i) => m.set(p, i % 8));
     return m;
   });
+  // Stable numeric label per peer (#1, #2, ...).  The lanes show the short
+  // number by default; the full IP address is revealed when the details
+  // toggle is on (mirrors umami's node-id listing in its peers table).
+  const peerNum = $derived.by(() => {
+    const m = new Map<string, number>();
+    if (!dat) return m;
+    const peers = [
+      ...new Set([
+        ...dat.headerTasks.hdrLanes.map((l) => l.peer),
+        ...dat.blockTasks.slices.map((s) => s.peer),
+        ...doneBlocks.map((x) => x.peer),
+      ]),
+    ].sort();
+    peers.forEach((p, i) => m.set(p, i + 1));
+    return m;
+  });
+  // Short lane label: "#N" by default, "addr" (or "#N addr") with details.
+  const peerLabel = (addr: string) => {
+    const n = peerNum.get(addr);
+    return detail ? `#${n ?? "?"} ${addr}` : `#${n ?? "?"}`;
+  };
   // Per-IP header slice history. The backend only reports each peer's *current*
   // header range, and a slice can complete between two polls (so `received` is
   // often never seen). We treat any change of a peer's assigned range as one
@@ -447,7 +522,7 @@ onDestroy(() => clearInterval(timer));
         <div class="block-lanes">
           {#each dat.blockTasks.slices as s}
             <div class="lane" style:--pc={`var(--peer${((blockPeerColor.get(s.peer) ?? 0) % 8) + 1})`}>
-              <span class="lane-name mono">{s.peer}{#if s.syncNode}<span class="lane-star" title="sync node"> ★</span>{/if}</span>
+              <span class="lane-name mono">{peerLabel(s.peer)}{#if s.syncNode}<span class="lane-star" title="sync node"> ★</span>{/if}</span>
               <div class="lane-bar" aria-hidden="true">
                 <span class="lane-done hi" style:width={`${s.pct}%`}></span>
                 {#if s.inFlight > 0}<span class="lane-inflight" style:width={`${Math.min(100 - s.pct, 12)}%`} style:left={`${s.pct}%`}></span>{/if}
@@ -528,7 +603,7 @@ onDestroy(() => clearInterval(timer));
           <div class="hdr-lanes">
             {#each dat.headerTasks.hdrLanes as l}
               <div class="lane">
-                <span class="lane-name mono" translate="no">{l.peer}</span>
+                <span class="lane-name mono" translate="no">{peerLabel(l.peer)}</span>
                 <div class="lane-bar" aria-hidden="true">
                   {#key `${l.peer}:${l.start}:${hdrJust(l.peer)}`}
                     <span
@@ -581,6 +656,40 @@ onDestroy(() => clearInterval(timer));
         </dl>
         <div class="mem-bar" aria-hidden="true"><span style:width={`${dat.mem.gap > 0 ? Math.min(100, (dat.mem.window / dat.mem.gap) * 100) : 100}%`}></span></div>
       </div>
+    </div>
+
+    <!-- average traffic / recent download speed (low-frequency refresh) -->
+    <div class="card">
+      <div class="card-head">
+        <span class="h-card">{t("int.traffic")}</span>
+        <button class="chip" onclick={refreshStats}>{t("int.refresh")}</button>
+      </div>
+      <dl class="kv">
+        <div><dt>{t("int.avg_down")}</dt><dd class="mono" translate="no">{avgRate.down.toFixed(1)} KB/s</dd></div>
+        <div><dt>{t("int.avg_up")}</dt><dd class="mono" translate="no">{avgRate.up.toFixed(1)} KB/s</dd></div>
+        <div><dt>{t("int.sample_win")}</dt><dd class="mono" translate="no">{traffic.length} · {Math.min(2, trafficWindowMs / 60_000).toFixed(0)} min</dd></div>
+      </dl>
+    </div>
+
+    <!-- per-peer quality: uptime / transferred bytes / ping (low-frequency) -->
+    <div class="card">
+      <div class="card-head"><span class="h-card">{t("int.peers_quality")}</span></div>
+      {#if peerStatsView.length === 0}
+        <p class="dim" style="font-size:12px">—</p>
+      {:else}
+        <div class="peer-q">
+          {#each peerStatsView as p}
+            <div class="peer-q-row" style:--pc={`var(--peer${((peerNum.get(p.addr) ?? 1) - 1) % 8 + 1})`}>
+              <span class="lane-name mono">{peerLabel(p.addr)}{#if p.syncNode}<span class="lane-star" title="sync node"> ★</span>{/if}</span>
+              <span class="mono" title={t("int.peer_uptime")}>{fmtUptime(p.connTime)}</span>
+              <span class="mono" title={t("int.peer_recv")}>↓{fmtBytes(p.bytesRecv)}</span>
+              <span class="mono" title={t("int.peer_sent")}>↑{fmtBytes(p.bytesSent)}</span>
+              <span class="mono" title={t("int.peer_ping")}>{p.pingMs > 0 ? `${p.pingMs.toFixed(0)} ms` : "—"}</span>
+              <span class="mono dim" title={t("int.peer_height")}>{p.currentHeight > 0 ? fmt(p.currentHeight) : "—"}</span>
+            </div>
+          {/each}
+        </div>
+      {/if}
     </div>
   {/if}
 </section>
@@ -1007,6 +1116,28 @@ onDestroy(() => clearInterval(timer));
     background: var(--straw);
     border-radius: 4px;
     }
+
+  .peer-q {
+    margin: 14px 0 0;
+    display: grid;
+    gap: 6px;
+  }
+  .peer-q-row {
+    display: grid;
+    grid-template-columns: 1.6fr 1fr 1fr 1fr 1fr 1fr;
+    gap: 8px;
+    align-items: center;
+    padding: 6px 8px;
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--peer1, #888) 6%, transparent);
+  }
+  .peer-q-row .lane-name {
+    font-weight: 600;
+  }
+  .peer-q-row .mono {
+    font-size: 12px;
+    text-align: right;
+  }
 
   @media (max-width: 760px) {
     .two {

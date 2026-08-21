@@ -80,6 +80,20 @@ export interface NodeInternals {
   };
   mem: { gap: number; window: number; inflight: number };
   debugLevel: string;
+  // Per-peer connection stats from getpeerinfo, sampled at a low cadence
+  // (5 min / manual refresh) so the quality cards do not churn every 2s poll.
+  peerStats: {
+    id: number;
+    addr: string;
+    bytesRecv: number;
+    bytesSent: number;
+    pingMs: number;
+    connTime: number; // unix seconds
+    startingHeight: number;
+    currentHeight: number;
+    syncNode: boolean;
+    inbound: boolean;
+  }[];
 }
 
 export interface Tx {

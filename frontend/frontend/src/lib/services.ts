@@ -225,7 +225,7 @@ export const Services = {
   },
 
   async getNodeInternals(_detail?: "normal" | "trace"): Promise<NodeInternals> {
-    const [info, sync] = await Promise.all([
+    const [info, sync, peers] = await Promise.all([
       rpc<{
         blocks: number;
         headers: number;
@@ -266,6 +266,23 @@ export const Services = {
           last_block_at: number;
         }>;
       }>("getblocksyncstatus"),
+      // Low-cadence per-peer connection stats for the quality / traffic cards.
+      // Sampled here (every poll) but the UI refreshes them at its own pace
+      // (5 min / manual), so the extra RPC cost is negligible.
+      rpc<
+        Array<{
+          id: number;
+          addr: string;
+          bytessent: number;
+          bytesrecv: number;
+          pingtime: number;
+          conntime: number;
+          startingheight: number;
+          currentheight: number;
+          syncnode: boolean;
+          inbound: boolean;
+        }>
+      >("getpeerinfo"),
     ]);
     const chainTip = info.blocks;
     // The node reports the highest known header tip directly; fall back to the
@@ -403,6 +420,18 @@ export const Services = {
         window: windowSize,
         inflight: inflightTotal,
       },
+      peerStats: (peers ?? []).map((p) => ({
+        id: p.id,
+        addr: p.addr,
+        bytesRecv: p.bytesrecv ?? 0,
+        bytesSent: p.bytessent ?? 0,
+        pingMs: p.pingtime ?? 0,
+        connTime: p.conntime ?? 0,
+        startingHeight: p.startingheight ?? 0,
+        currentHeight: p.currentheight ?? 0,
+        syncNode: p.syncnode ?? false,
+        inbound: p.inbound ?? false,
+      })),
       debugLevel: await Services.getDebugLevel().catch(() => "info"),
     };
   },
