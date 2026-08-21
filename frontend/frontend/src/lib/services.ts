@@ -412,9 +412,13 @@ export const Services = {
             peer: p.addr,
             start: p.header_range_start,
             end: Math.max(p.header_range_start + 1, p.header_range_start + sliceLen),
+            // The node assigns a whole slice of `sliceLen` at once, so the
+            // range span is always the full slice and carries no progress
+            // information.  Render a real "in flight" state instead: a small
+            // starter bar until the node flips received=true, then 100%.
             pct: p.header_range_received
               ? 100
-              : Math.min(100, Math.max(0, ((p.header_range_end - p.header_range_start) / sliceLen) * 100)),
+              : 6,
             received: p.header_range_received,
             assignedAt: p.header_range_assigned_at ? p.header_range_assigned_at * 1000 : 0,
           };
@@ -433,9 +437,12 @@ export const Services = {
               peer: p.addr,
               start: p.header_range_start,
               end: Math.max(p.header_range_start + 1, p.header_range_start + sliceLen),
+              // Same reasoning as hdrPeers: the assigned range span is always
+              // the full slice, so an unreceived slice shows a starter bar
+              // (6%) instead of a misleading 100%.
               pct: p.header_range_received
                 ? 100
-                : Math.min(100, Math.max(0, ((p.header_range_end - p.header_range_start) / sliceLen) * 100)),
+                : 6,
               received: p.header_range_received,
               assignedAt: p.header_range_assigned_at ? p.header_range_assigned_at * 1000 : 0,
             };
@@ -473,6 +480,22 @@ export const Services = {
   async setSyncPeers(_n: number): Promise<number> {
     // blocksyncpeers not implemented on the node yet; keep value client-side.
     return _n;
+  },
+
+  // ping asks the node to broadcast a ping to every connected peer right now.
+  // btcd only pings peers on its own ~2-minute cadence, so a freshly connected
+  // peer reports pingtime=0 until the first cycle; triggering a ping lets the
+  // quality card fill in the latency column on demand.
+  async ping(): Promise<void> {
+    await rpc<unknown>("ping");
+  },
+
+  // Disconnect a peer by address.  btcd has no timed ban (no setban), so a
+  // disconnected peer may reconnect on its own; the internals view keeps a
+  // client-side banned list and re-disconnects such peers on each poll until
+  // the chosen duration elapses.
+  async disconnectNode(addr: string): Promise<void> {
+    await rpc<unknown>("node", "disconnect", addr);
   },
 
   async getDebugLevel(): Promise<string> {
