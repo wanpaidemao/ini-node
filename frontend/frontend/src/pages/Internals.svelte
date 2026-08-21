@@ -582,8 +582,6 @@ onDestroy(() => clearInterval(timer));
         <div class="mem-bar" aria-hidden="true"><span style:width={`${dat.mem.gap > 0 ? Math.min(100, (dat.mem.window / dat.mem.gap) * 100) : 100}%`}></span></div>
       </div>
     </div>
-  {:else}
-    <div class="card"><p>{t("int.not_connected")}</p></div>
   {/if}
 </section>
 

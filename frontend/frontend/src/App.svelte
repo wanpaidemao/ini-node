@@ -238,10 +238,6 @@
   {/if}
 
   <div class="main-col">
-    <header class="topbar">
-      <span class="topbar-title">{t(titles[app.route])}</span>
-    </header>
-
     {#if !app.connected && app.route === "dashboard"}
       <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin:10px 16px;padding:10px 14px;border:1px solid #d97706;border-radius:8px;background:#fef3c7;font-size:13px">
         <span>Node RPC not reachable / 节点 RPC 不可达</span>
@@ -599,27 +595,15 @@
   .main-col {
     grid-row: 1;
     display: grid;
-    grid-template-rows: var(--top-h) minmax(0, 1fr);
+    /* The topbar row was removed with the topbar itself; a single
+       minmax(0,1fr) row keeps the page content filling the full column
+       height (previously it was squeezed into the 48px topbar row). */
+    grid-template-rows: minmax(0, 1fr);
     min-width: 0;
     min-height: 0;
   }
   .shell.nav-top .main-col {
     grid-row: 2;
-  }
-
-  .topbar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 0 16px;
-    border-bottom: 1px solid var(--line);
-    background: var(--ink);
-    z-index: 5;
-  }
-  .topbar-title {
-    font-family: var(--font-display);
-    font-weight: 800;
-    font-size: 15px;
   }
 
   .page {

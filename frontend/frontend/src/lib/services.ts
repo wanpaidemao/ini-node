@@ -27,19 +27,33 @@ interface RpcEnvelope {
   id: number;
 }
 
+// rpcTimeout is how long a single JSON-RPC call may take before it is aborted.
+// During a stalled or wedged RPC server a request can otherwise hang forever,
+// piling up behind every 2s poll and freezing the sync-internals view on stale
+// data.  Aborting treats the request as if it was never sent: the caller's
+// catch ignores it and the next poll simply retries.
+const rpcTimeout = 5000; // ms
+
 async function rpc<T>(method: string, ...params: unknown[]): Promise<T> {
   const id = seq++;
-  const res = await fetch("/rpc/", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "1.0", id, method, params }),
-  });
-  if (!res.ok) {
-    throw new Error(`RPC ${method}: HTTP ${res.status}`);
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), rpcTimeout);
+  try {
+    const res = await fetch("/rpc/", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "1.0", id, method, params }),
+      signal: ctl.signal,
+    });
+    if (!res.ok) {
+      throw new Error(`RPC ${method}: HTTP ${res.status}`);
+    }
+    const env = (await res.json()) as RpcEnvelope;
+    if (env.error) throw new Error(`RPC ${method}: ${env.error.message}`);
+    return env.result as T;
+  } finally {
+    clearTimeout(timer);
   }
-  const env = (await res.json()) as RpcEnvelope;
-  if (env.error) throw new Error(`RPC ${method}: ${env.error.message}`);
-  return env.result as T;
 }
 
 // numbers can arrive as JSON numbers (blocks) or as strings in odd cases

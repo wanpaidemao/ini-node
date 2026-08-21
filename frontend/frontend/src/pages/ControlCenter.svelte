@@ -48,10 +48,10 @@
     busy = false
   }
 
-  async function stopNode() {
+  async function stopNode(force = false) {
     busy = true
     try {
-      await fetch('/api/node-stop')
+      await fetch(force ? '/api/node-stop-force' : '/api/node-stop')
       setTimeout(poll, 3000)
     } catch { /* ignore */ }
     busy = false
@@ -253,7 +253,10 @@
     </div>
     <div style="display:flex;gap:8px">
       <button class="btn btn-primary" onclick={startNode} disabled={busy} style="flex:1">Start / 启动</button>
-      <button class="btn btn-ghost" onclick={stopNode} disabled={busy} style="flex:1">Stop / 停止</button>
+      <button class="btn btn-ghost" onclick={() => stopNode(false)} disabled={busy} style="flex:1"
+        title="Graceful stop via RPC: flushes the DB, no UTXO rebuild on next start / 通过 RPC 优雅停止:会 flush 数据库,下次启动无需重建 UTXO">Graceful stop / 优雅结束节点</button>
+      <button class="btn btn-danger" onclick={() => stopNode(true)} disabled={busy} style="flex:1"
+        title="Force kill: does NOT flush the DB, next start rebuilds UTXO (emergency only) / 强制结束:不 flush 数据库,下次启动重建 UTXO(仅应急)">Force stop / 强制结束节点</button>
     </div>
     {#if startErr}
       <p style="font-size:12px;margin-top:8px;color:#b91c1c">{startErr}</p>

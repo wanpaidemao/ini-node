@@ -385,13 +385,57 @@ func handleNodeStart(opts map[string]string, w http.ResponseWriter, req *http.Re
 	})
 }
 
-// handleNodeStop stops the btcd process (idempotent).
-// handleNodeStop 停止 btcd 进程（幂等）。
+// handleNodeStop gracefully stops the btcd node via its RPC stop command.
+// This lets btcd flush the block index, sync and close the database, and
+// shut down subsystems cleanly, so the next start does not need an unclean-
+// shutdown UTXO reconstruction.  It is idempotent.
+// handleNodeStop 优雅停止 btcd 节点(通过其 RPC stop 命令)。btcd 会 flush
+// 区块索引、同步并关闭数据库、有序关闭各子系统,下次启动无需重建 UTXO。
+// 幂等。
 func handleNodeStop(w http.ResponseWriter, req *http.Request) {
+	w.Header().Set("content-type", "application/json")
+
+	// Locate the runtime ini to resolve the RPC endpoint and credentials.
+	ini := findIniPath()
+	if ini == "" {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"ok": false, "error": "runtime.ini not found",
+		})
+		return
+	}
+	o := parseIni(ini)
+	target := rpcProxyTargetFor(o)
+	payload := []byte(`{"jsonrpc":"1.0","id":"1","method":"stop","params":[]}`)
+	httpReq, err := http.NewRequest(http.MethodPost, "http://"+target.hostname+":"+target.port+"/", bytes.NewReader(payload))
+	if err != nil {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": err.Error()})
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", target.auth)
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		// If the node is already down the RPC is unreachable; treat that as
+		// success (idempotent).
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "stopped": true})
+		return
+	}
+	defer resp.Body.Close()
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "stopped": true})
+}
+
+// handleForceNodeStop force-kills the btcd process.  This is the emergency
+// stop: it does NOT flush the database, so the next start performs an
+// unclean-shutdown repair (Reconstructing UTXO state).  Use handleNodeStop
+// (graceful) first whenever possible.
+// handleForceNodeStop 强制结束 btcd 进程。这是应急停止:不会 flush 数据库,
+// 下次启动会做非正常关闭修复(重建 UTXO)。平时应优先用 handleNodeStop(优雅)。
+func handleForceNodeStop(w http.ResponseWriter, req *http.Request) {
+	w.Header().Set("content-type", "application/json")
 	cmd := exec.Command("powershell", "-NoProfile", "-Command",
 		"Stop-Process -Name btcd -Force -ErrorAction SilentlyContinue")
 	_ = cmd.Run()
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "force": true})
 }
 
 // handleLogs serves the node log tail (GET ?lines=N) and clears it (POST).
@@ -578,6 +622,8 @@ func rpcProxyMiddleware() application.Middleware {
 				handleNodeStart(opts, w, req)
 			case req.URL.Path == "/api/node-stop":
 				handleNodeStop(w, req)
+			case req.URL.Path == "/api/node-stop-force":
+				handleForceNodeStop(w, req)
 			case req.URL.Path == "/api/logs":
 				handleLogs(w, req)
 			case req.URL.Path == "/api/db-params":
