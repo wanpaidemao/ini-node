@@ -361,6 +361,37 @@ export const Services = {
     );
     const inflightTotal = (sync.peers ?? []).reduce((m, p) => m + p.in_flight_blocks, 0);
 
+    // Merge getpeerinfo rows by addr: btcd opens one connection per peer but
+    // can report the same host twice (or three times) with separate ids (one
+    // carrying the sync slice, the others idle).  Deduping keeps the quality
+    // card to one row per host: bytes sum across connections, connTime is the
+    // earliest, ping the most recent non-zero, sync flag ORs together.
+    const peerByAddr = new Map<string, {
+      id: number;
+      addr: string;
+      bytesrecv: number;
+      bytessent: number;
+      pingtime: number;
+      conntime: number;
+      startingheight: number;
+      currentheight: number;
+      syncnode: boolean;
+      inbound: boolean;
+    }>();
+    for (const p of peers ?? []) {
+      const cur = peerByAddr.get(p.addr);
+      if (!cur) {
+        peerByAddr.set(p.addr, { ...p });
+        continue;
+      }
+      cur.bytesrecv += p.bytesrecv ?? 0;
+      cur.bytessent += p.bytessent ?? 0;
+      if (p.pingtime && p.pingtime > 0) cur.pingtime = p.pingtime;
+      if (p.conntime && (cur.conntime === 0 || p.conntime < cur.conntime)) cur.conntime = p.conntime;
+      if ((p.currentheight ?? 0) > (cur.currentheight ?? 0)) cur.currentheight = p.currentheight ?? 0;
+      cur.syncnode = cur.syncnode || p.syncnode;
+    }
+
     return {
       chainTip,
       headerTip,
@@ -420,12 +451,15 @@ export const Services = {
         window: windowSize,
         inflight: inflightTotal,
       },
-      peerStats: (peers ?? []).map((p) => ({
+      peerStats: [...peerByAddr.values()].map((p) => ({
         id: p.id,
         addr: p.addr,
         bytesRecv: p.bytesrecv ?? 0,
         bytesSent: p.bytessent ?? 0,
-        pingMs: p.pingtime ?? 0,
+        // btcd reports pingtime in microseconds (LastPingMicros); convert to
+        // milliseconds for display.  0 means no ping has completed yet (the
+        // peer pings every 2 minutes), shown as "—" in the UI.
+        pingMs: (p.pingtime ?? 0) / 1000,
         connTime: p.conntime ?? 0,
         startingHeight: p.startingheight ?? 0,
         currentHeight: p.currentheight ?? 0,
