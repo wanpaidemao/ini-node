@@ -490,14 +490,14 @@ onDestroy(() => clearInterval(timer));
   // cards — color = (num−1) % 8, same as the quality-card rows.
   const peerColor = $derived.by(() => {
     const m = new Map<string, number>();
-    for (const [addr, n] of peerNumMap) m.set(addr, (n - 1) % 8);
+    for (const [addr, n] of peerNumMap) m.set(addr, (n - 1) % 16);
     return m;
   });
   // Same stable-per-peer color scheme for the block-task slices, shared by the
   // window track bands and the per-IP progress bars so they always match.
   const blockPeerColor = $derived.by(() => {
     const m = new Map<string, number>();
-    for (const [addr, n] of peerNumMap) m.set(addr, (n - 1) % 8);
+    for (const [addr, n] of peerNumMap) m.set(addr, (n - 1) % 16);
     return m;
   });
   // Persistent per-IP number: #1, #2, ...  Assigned once when a peer is first
@@ -639,47 +639,6 @@ onDestroy(() => clearInterval(timer));
   </div>
 
   {#if dat}
-    <!-- per-peer quality (top of page, under the title): numbered by the
-         persistent per-IP slot, sorted by number, always showing the full
-         address so the #N mapping is self-explanatory -->
-    <div class="card">
-      <div class="card-head">
-        <button class="h-card expander" onclick={() => (peerQOpen = !peerQOpen)} aria-expanded={peerQOpen}>
-          <span class="chev" aria-hidden="true">{peerQOpen ? "▾" : "▸"}</span>
-          {t("int.peers_quality")}
-        </button>
-        <span class="head-controls">
-          <button class="chip" onclick={refreshStats}>{t("int.refresh")}</button>
-        </span>
-      </div>
-      {#if peerQOpen}
-        {#if peerStatsView.length === 0}
-          <p class="dim" style="font-size:12px">—</p>
-        {:else}
-          <div class="peer-q">
-            {#each [...peerStatsView].sort((a, b) => (peerNumOf(a.addr) ?? 9999) - (peerNumOf(b.addr) ?? 9999)) as p}
-              <div class="peer-q-row" style:--pc={`var(--peer${((peerNumOf(p.addr) ?? 1) - 1) % 8 + 1})`}>
-                <span class="mono peer-num" title={p.addr}>#{peerNumOf(p.addr) ?? "?"}</span>
-                <span class="mono peer-ip" translate="no" title={p.addr}>{p.addr}{#if p.syncNode}<span class="lane-star" title="sync node"> ★</span>{/if}</span>
-                <span class="mono" title={t("int.peer_uptime")}>{fmtUptime(p.connTime)}</span>
-                <span class="mono" title={t("int.peer_recv")}>↓{fmtBytes(p.bytesRecv)}</span>
-                <span class="mono" title={t("int.peer_sent")}>↑{fmtBytes(p.bytesSent)}</span>
-                <span class="mono" title={t("int.peer_ping")}>{p.pingMs > 0 ? `${p.pingMs.toFixed(0)} ms` : "—"}</span>
-                <span class="mono dim" title={t("int.peer_height")}>{p.currentHeight > 0 ? fmt(p.currentHeight) : "—"}</span>
-                <span class="peer-q-actions">
-                  {#if banLeft(p.addr) > 0}
-                    <span class="chip ban-left" title="disconnect until">⏳ {fmtBan(banLeft(p.addr))}</span>
-                  {:else}
-                    <button class="chip ban" onclick={() => (banTarget = p.addr)}>{t("int.disconnect")}</button>
-                  {/if}
-                </span>
-              </div>
-            {/each}
-          </div>
-        {/if}
-      {/if}
-    </div>
-
     <!-- tasks -->
     <div class="two">
       <div class="card">
@@ -700,7 +659,7 @@ onDestroy(() => clearInterval(timer));
             <span
               class="ws"
               class:accent={s.syncNode}
-              style:--pc={`var(--peer${((blockPeerColor.get(s.peer) ?? 0) % 8) + 1})`}
+              style:--pc={`var(--peer${((blockPeerColor.get(s.peer) ?? 0) % 16) + 1})`}
               style:left={`${s.l}%`}
               style:width={`${s.w}%`}
               title={`#{peerNumOf(s.peer) ?? "?"} ${fmt(s.start)}→${fmt(s.end)}${s.inFlight > 0 ? ` · ${s.inFlight} in-flight` : ""}`}
@@ -731,7 +690,7 @@ onDestroy(() => clearInterval(timer));
         </div>
         <div class="block-lanes">
           {#each dat.blockTasks.slices as s}
-            <div class="lane" style:--pc={`var(--peer${((blockPeerColor.get(s.peer) ?? 0) % 8) + 1})`}>
+            <div class="lane" style:--pc={`var(--peer${((blockPeerColor.get(s.peer) ?? 0) % 16) + 1})`}>
               <span class="lane-name mono" title={`#{peerNumOf(s.peer) ?? "?"} ${s.peer}`}>
                 <span class="ln-num">#{peerNumOf(s.peer) ?? "?"}</span>{#if s.syncNode}<span class="lane-star" title="sync node"> ★</span>{/if}
               </span>
@@ -778,7 +737,7 @@ onDestroy(() => clearInterval(timer));
                 class:got={c.kind === "inflight" && c.received}
                 animate:flip={{ duration: 450 }}
                 transition:fade={{ duration: 250 }}
-                style:--pc={c.kind === "inflight" ? `var(--peer${((peerColor.get(c.peer) ?? 0) % 8) + 1})` : undefined}
+                style:--pc={c.kind === "inflight" ? `var(--peer${((peerColor.get(c.peer) ?? 0) % 16) + 1})` : undefined}
                 title={c.title}
               >
                 {#if c.kind === "inflight" && c.received}
@@ -808,7 +767,7 @@ onDestroy(() => clearInterval(timer));
                   {#key `${l.peer}:${l.start}:${l.received}`}
                     <span
                       class="lane-done hi lane-fill"
-                      style:--pc={`var(--peer${((peerColor.get(l.peer) ?? 0) % 8) + 1})`}
+                      style:--pc={`var(--peer${((peerColor.get(l.peer) ?? 0) % 16) + 1})`}
                       style:animation-delay={`${(peerNumOf(l.peer) ?? 0) * 0.12}s`}
                       title={`${fmt(l.start)}→${fmt(l.end)} · ${l.received ? t("int.done") : t("int.inflight")}`}
                     ></span>
@@ -901,6 +860,47 @@ onDestroy(() => clearInterval(timer));
         </svg>
       </div>
     </div>
+
+    <!-- per-peer quality (bottom of page): numbered by the persistent
+         per-IP slot, sorted by number, always showing the full address so
+         the #N mapping is self-explanatory -->
+    <div class="card">
+      <div class="card-head">
+        <button class="h-card expander" onclick={() => (peerQOpen = !peerQOpen)} aria-expanded={peerQOpen}>
+          <span class="chev" aria-hidden="true">{peerQOpen ? "▾" : "▸"}</span>
+          {t("int.peers_quality")}
+        </button>
+        <span class="head-controls">
+          <button class="chip" onclick={refreshStats}>{t("int.refresh")}</button>
+        </span>
+      </div>
+      {#if peerQOpen}
+        {#if peerStatsView.length === 0}
+          <p class="dim" style="font-size:12px">—</p>
+        {:else}
+          <div class="peer-q">
+            {#each [...peerStatsView].sort((a, b) => (peerNumOf(a.addr) ?? 9999) - (peerNumOf(b.addr) ?? 9999)) as p}
+              <div class="peer-q-row" style:--pc={`var(--peer${((peerNumOf(p.addr) ?? 1) - 1) % 16 + 1})`}>
+                <span class="mono peer-num" title={p.addr}>#{peerNumOf(p.addr) ?? "?"}</span>
+                <span class="mono peer-ip" translate="no" title={p.addr}>{p.addr}{#if p.syncNode}<span class="lane-star" title="sync node"> ★</span>{/if}</span>
+                <span class="mono" title={t("int.peer_uptime")}>{fmtUptime(p.connTime)}</span>
+                <span class="mono" title={t("int.peer_recv")}>↓{fmtBytes(p.bytesRecv)}</span>
+                <span class="mono" title={t("int.peer_sent")}>↑{fmtBytes(p.bytesSent)}</span>
+                <span class="mono" title={t("int.peer_ping")}>{p.pingMs > 0 ? `${p.pingMs.toFixed(0)} ms` : "—"}</span>
+                <span class="mono dim" title={t("int.peer_height")}>{p.currentHeight > 0 ? fmt(p.currentHeight) : "—"}</span>
+                <span class="peer-q-actions">
+                  {#if banLeft(p.addr) > 0}
+                    <span class="chip ban-left" title="disconnect until">⏳ {fmtBan(banLeft(p.addr))}</span>
+                  {:else}
+                    <button class="chip ban" onclick={() => (banTarget = p.addr)}>{t("int.disconnect")}</button>
+                  {/if}
+                </span>
+              </div>
+            {/each}
+          </div>
+        {/if}
+      {/if}
+    </div>
   {/if}
 
   <!-- disconnect confirm dialog -->
@@ -945,6 +945,16 @@ onDestroy(() => clearInterval(timer));
     --peer6: #4f86e0; /* 蓝 */
     --peer7: #9b6adf; /* 紫 */
     --peer8: #a2acb8; /* 灰 */
+    /* second rainbow pass, darkened so peers #9-#16 stay distinguishable
+       from #1-#8 while keeping the same hue family */
+    --peer9: #b0231a;
+    --peer10: #b85f18;
+    --peer11: #b8a013;
+    --peer12: #2b7a38;
+    --peer13: #249296;
+    --peer14: #3561b8;
+    --peer15: #7a46c9;
+    --peer16: #7d8894;
     --hdr-pile: #019875;
   }
   .head {

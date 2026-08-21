@@ -807,8 +807,12 @@ func (sm *SyncManager) assignHeaderRange(peer *peerpkg.Peer) bool {
 	// corroborate its first hash before it is applied; a forged or
 	// misattributed front cannot gather the second agreeing vote.  Non-front
 	// ranges are not double-sent (they keep the single-vote fast path).
+	// The re-send stays active even after the first vote arrived (received)
+	// as long as the front is still unconfirmed: the second vote can only
+	// arrive from a peer that was handed the range, and dropping the re-send
+	// once received would stall the front (and with it the whole download).
 	if front := hs.ranges[hs.nextHeight]; front != nil &&
-		!front.received && !front.confirmed && hs.nextHeight <= hs.target {
+		!front.confirmed && hs.nextHeight <= hs.target {
 		hs.peerRange[peer] = front
 		peer.PushGetHeadersMsg(sm.headerLocator(hs.nextHeight-1), &zeroHash)
 		return true
@@ -2320,8 +2324,15 @@ func (sm *SyncManager) handleParallelHeadersMsg(peer *peerpkg.Peer,
 		return
 	}
 
-	// Ignore duplicate responses for a range that has already been served.
-	if rng.received {
+	// Ignore duplicate responses for a range that has already been served --
+	// EXCEPT the front range still waiting on its C2 second vote.  Once the
+	// first response arrived (received=true) but the range is not yet
+	// confirmed, an independent peer's response is exactly the second vote
+	// the front needs; dropping it here would leave the front unconfirmed
+	// forever (the C2 double-send in assignHeaderRange stops handing the
+	// front out once received, and processReadyHeaderRanges refuses to apply
+	// an unconfirmed front), stalling the whole parallel header download.
+	if rng.received && !(rng.start == hs.nextHeight && !rng.confirmed) {
 		return
 	}
 
