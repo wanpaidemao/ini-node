@@ -20,7 +20,7 @@ function loadRefreshSec(): number {
   } catch {
     /* keep default */
   }
-  return 5;
+  return 1;
 }
 let refreshSec = $state(loadRefreshSec());
 
@@ -58,14 +58,43 @@ function restartTimer() {
   // Refreshed only on the 5-minute cadence or the manual refresh button, so
   // the card does not churn every 2s poll.
   let peerStatsView = $state<NodeInternals["peerStats"]>([]);
+  // Peer quality card body is collapsed by default; click the header to
+  // expand/collapse the per-node rows.
+  let peerQOpen = $state(false);
 
-  function pushTraffic(ps: NodeInternals["peerStats"]) {
+  // Unified sampling stream for the merged 2D chart: one entry per poll with
+  // the INSTANT download (KB/s), upload (KB/s) and forward progress (blocks/s)
+  // rates, computed as deltas against the previous poll.  time-aligned by
+  // construction so the chart can draw all three curves on one x axis.
+  let chartHist = $state<{ t: number; down: number; up: number; fwd: number }[]>([]);
+  let lastChartAt = 0;
+  let lastRecv = 0;
+  let lastSent = 0;
+  let lastFwdH = 0;
+
+  function pushTraffic(ps: NodeInternals["peerStats"], fwdH: number) {
     const recv = ps.reduce((m, p) => m + p.bytesRecv, 0);
     const sent = ps.reduce((m, p) => m + p.bytesSent, 0);
     const now = Date.now();
     traffic.push({ t: now, recv, sent });
     const cutoff = now - trafficWindowMs;
     while (traffic.length > 0 && traffic[0].t < cutoff) traffic.shift();
+    if (lastChartAt > 0) {
+      const dt = (now - lastChartAt) / 1000;
+      if (dt > 0) {
+        chartHist.push({
+          t: now,
+          down: Math.max(0, (recv - lastRecv) / dt / 1024),
+          up: Math.max(0, (sent - lastSent) / dt / 1024),
+          fwd: Math.max(0, (fwdH - lastFwdH) / dt),
+        });
+        while (chartHist.length > 0 && chartHist[0].t < cutoff) chartHist.shift();
+      }
+    }
+    lastChartAt = now;
+    lastRecv = recv;
+    lastSent = sent;
+    lastFwdH = fwdH;
   }
 
   // Average download/upload rate over the sampled window (KB/s).
@@ -78,6 +107,87 @@ function restartTimer() {
     return {
       down: Math.max(0, (b.recv - a.recv) / dt / 1024),
       up: Math.max(0, (b.sent - a.sent) / dt / 1024),
+    };
+  });
+
+  // 2D chart geometry, SPLIT BY UNIT into two plots so heights stay honest:
+  //  - traffic plot: download/upload in KB/s (one unit, SHARED peak so the
+  //    y axis has one scale)
+  //  - forward plot: sync progress in blocks/s (its own unit, own peak)
+  // CHART_X is the left gutter reserved for y-axis tick labels; the SVG
+  // viewBox is (CHART_X + CHART_W) x (CHART_H + 12) with the bottom 12px
+  // reserved for the x-axis time labels.
+  const CHART_X = 28;
+  const CHART_W = 320;
+  const CHART_H = 140;
+  const chartSeries = $derived.by(() => {
+    const hms = (t: number) => {
+      const d = new Date(t);
+      return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
+    };
+    const empty = {
+      paths: { down: "", up: "", fwd: "" },
+      area: "",
+      grid: [35, 70, 105],
+      dots: [] as { cx: number; cy: number; key: string }[],
+      peaks: [] as { key: string; value: number; cx: number; cy: number }[],
+      max: { down: 0, up: 0, fwd: 0 },
+      yTicks: { traffic: [] as { y: number; label: string }[], fwd: [] as { y: number; label: string }[] },
+      xTicks: { t0: "", t1: "" },
+      last: null as { down: number; up: number; fwd: number } | null,
+    };
+    if (chartHist.length < 2) return empty;
+    const t0 = chartHist[0].t;
+    const t1 = chartHist[chartHist.length - 1].t;
+    const span = Math.max(1, t1 - t0);
+    const maxTraffic = Math.max(1, ...chartHist.map((s) => Math.max(s.down, s.up)));
+    const maxFwd = Math.max(1, ...chartHist.map((s) => s.fwd));
+    const x = (s: (typeof chartHist)[number]) =>
+      CHART_X + ((s.t - t0) / span) * CHART_W;
+    const y = (v: number, max: number) =>
+      CHART_H - (Math.min(1, v / max) * (CHART_H - 6) + 3);
+    const line = (key: "down" | "up" | "fwd", max: number) =>
+      chartHist
+        .map((s) => `${x(s).toFixed(1)},${y(s[key], max).toFixed(1)}`)
+        .join(" ");
+    const last = chartHist[chartHist.length - 1];
+    // Highest sample of each curve — the peak marker that carries its value.
+    const peak = (key: "down" | "up" | "fwd", max: number) => {
+      let best = chartHist[0];
+      for (const s of chartHist) if (s[key] > best[key]) best = s;
+      return { key, value: best[key], cx: x(best), cy: y(best[key], max) };
+    };
+    // Y-axis tick labels at the grid rows: invert the y() mapping so each
+    // grid row shows the rate value it represents on this plot's scale.
+    const ticks = (max: number) =>
+      [35, 70, 105].map((gy) => {
+        const v = (max * (CHART_H - 3 - gy)) / (CHART_H - 6);
+        return { y: gy, label: v.toFixed(v >= 100 ? 0 : 1) };
+      });
+    return {
+      paths: {
+        down: line("down", maxTraffic),
+        up: line("up", maxTraffic),
+        fwd: line("fwd", maxFwd),
+      },
+      area: `${chartHist
+        .map((s) => `${x(s).toFixed(1)},${y(s.down, maxTraffic).toFixed(1)}`)
+        .join(" ")} ${CHART_X + CHART_W},${CHART_H} ${x(chartHist[0]).toFixed(1)},${CHART_H}`,
+      grid: [35, 70, 105],
+      dots: [
+        { cx: x(last), cy: y(last.down, maxTraffic), key: "down" },
+        { cx: x(last), cy: y(last.up, maxTraffic), key: "up" },
+        { cx: x(last), cy: y(last.fwd, maxFwd), key: "fwd" },
+      ],
+      peaks: [
+        peak("down", maxTraffic),
+        peak("up", maxTraffic),
+        peak("fwd", maxFwd),
+      ],
+      max: { down: maxTraffic, up: maxTraffic, fwd: maxFwd },
+      yTicks: { traffic: ticks(maxTraffic), fwd: ticks(maxFwd) },
+      xTicks: { t0: hms(t0), t1: hms(t1) },
+      last,
     };
   });
 
@@ -116,7 +226,7 @@ function restartTimer() {
         // download/upload rate card stays live and the sample window fills.
         // The peer-quality table itself refreshes on the slow cadence (5 min)
         // or manual refresh only, so it does not churn every 2s poll.
-        pushTraffic(dat.peerStats);
+        pushTraffic(dat.peerStats, metric === "boundary" ? dat.chainBoundary : dat.chainTip);
         if (now - lastTrafficAt >= 300_000) {
           lastTrafficAt = now;
           peerStatsView = dat.peerStats;
@@ -132,7 +242,7 @@ function restartTimer() {
     if (!dat) return;
     lastTrafficAt = Date.now();
     peerStatsView = dat.peerStats;
-    pushTraffic(dat.peerStats);
+    pushTraffic(dat.peerStats, metric === "boundary" ? dat.chainBoundary : dat.chainTip);
     // Ask the node to ping every peer now, then re-poll after one RTT so the
     // latency column fills in even for freshly connected peers (btcd only
     // pings on its own ~2-minute cadence, leaving new peers at pingtime=0).
@@ -146,7 +256,7 @@ function restartTimer() {
           settleDoneBlocks(d);
           lastTrafficAt = Date.now();
           peerStatsView = d.peerStats;
-          pushTraffic(d.peerStats);
+          pushTraffic(d.peerStats, metric === "boundary" ? d.chainBoundary : d.chainTip);
         }
       } catch {
         /* keep */
@@ -505,19 +615,6 @@ onDestroy(() => clearInterval(timer));
     return h <= 0 ? `${m}m` : `${h}h${m ? ` ${m}m` : ""}`;
   }
 
-  // sparkline bars fed by the real stream (same count/shape as before)
-  const bars = $derived.by(() => {
-    if (hist.length < 2) return Array.from({ length: 26 }, (_, i) => (i % 5 === 0 ? 22 : i % 3 === 0 ? 14 : 8));
-    const key = metric === "boundary" ? ("boundary" as const) : ("tip" as const);
-    const rates: number[] = [];
-    for (let i = 1; i < hist.length; i++) {
-      const dt = (hist[i].t - hist[i - 1].t) / 1000;
-      if (dt > 0) rates.push(Math.max(0, (hist[i][key] - hist[i - 1][key]) / dt));
-    }
-    if (rates.length === 0) return [8];
-    const max = Math.max(...rates, 1);
-    return rates.slice(-26).map((r) => Math.max(2, Math.round((r / max) * 22)));
-  });
 </script>
 
 <section class="int">
@@ -547,34 +644,39 @@ onDestroy(() => clearInterval(timer));
          address so the #N mapping is self-explanatory -->
     <div class="card">
       <div class="card-head">
-        <span class="h-card">{t("int.peers_quality")}</span>
+        <button class="h-card expander" onclick={() => (peerQOpen = !peerQOpen)} aria-expanded={peerQOpen}>
+          <span class="chev" aria-hidden="true">{peerQOpen ? "▾" : "▸"}</span>
+          {t("int.peers_quality")}
+        </button>
         <span class="head-controls">
           <button class="chip" onclick={refreshStats}>{t("int.refresh")}</button>
         </span>
       </div>
-      {#if peerStatsView.length === 0}
-        <p class="dim" style="font-size:12px">—</p>
-      {:else}
-        <div class="peer-q">
-          {#each [...peerStatsView].sort((a, b) => (peerNumOf(a.addr) ?? 9999) - (peerNumOf(b.addr) ?? 9999)) as p}
-            <div class="peer-q-row" style:--pc={`var(--peer${((peerNumOf(p.addr) ?? 1) - 1) % 8 + 1})`}>
-              <span class="mono peer-num" title={p.addr}>#{peerNumOf(p.addr) ?? "?"}</span>
-              <span class="mono peer-ip" translate="no" title={p.addr}>{p.addr}{#if p.syncNode}<span class="lane-star" title="sync node"> ★</span>{/if}</span>
-              <span class="mono" title={t("int.peer_uptime")}>{fmtUptime(p.connTime)}</span>
-              <span class="mono" title={t("int.peer_recv")}>↓{fmtBytes(p.bytesRecv)}</span>
-              <span class="mono" title={t("int.peer_sent")}>↑{fmtBytes(p.bytesSent)}</span>
-              <span class="mono" title={t("int.peer_ping")}>{p.pingMs > 0 ? `${p.pingMs.toFixed(0)} ms` : "—"}</span>
-              <span class="mono dim" title={t("int.peer_height")}>{p.currentHeight > 0 ? fmt(p.currentHeight) : "—"}</span>
-              <span class="peer-q-actions">
-                {#if banLeft(p.addr) > 0}
-                  <span class="chip ban-left" title="disconnect until">⏳ {fmtBan(banLeft(p.addr))}</span>
-                {:else}
-                  <button class="chip ban" onclick={() => (banTarget = p.addr)}>{t("int.disconnect")}</button>
-                {/if}
-              </span>
-            </div>
-          {/each}
-        </div>
+      {#if peerQOpen}
+        {#if peerStatsView.length === 0}
+          <p class="dim" style="font-size:12px">—</p>
+        {:else}
+          <div class="peer-q">
+            {#each [...peerStatsView].sort((a, b) => (peerNumOf(a.addr) ?? 9999) - (peerNumOf(b.addr) ?? 9999)) as p}
+              <div class="peer-q-row" style:--pc={`var(--peer${((peerNumOf(p.addr) ?? 1) - 1) % 8 + 1})`}>
+                <span class="mono peer-num" title={p.addr}>#{peerNumOf(p.addr) ?? "?"}</span>
+                <span class="mono peer-ip" translate="no" title={p.addr}>{p.addr}{#if p.syncNode}<span class="lane-star" title="sync node"> ★</span>{/if}</span>
+                <span class="mono" title={t("int.peer_uptime")}>{fmtUptime(p.connTime)}</span>
+                <span class="mono" title={t("int.peer_recv")}>↓{fmtBytes(p.bytesRecv)}</span>
+                <span class="mono" title={t("int.peer_sent")}>↑{fmtBytes(p.bytesSent)}</span>
+                <span class="mono" title={t("int.peer_ping")}>{p.pingMs > 0 ? `${p.pingMs.toFixed(0)} ms` : "—"}</span>
+                <span class="mono dim" title={t("int.peer_height")}>{p.currentHeight > 0 ? fmt(p.currentHeight) : "—"}</span>
+                <span class="peer-q-actions">
+                  {#if banLeft(p.addr) > 0}
+                    <span class="chip ban-left" title="disconnect until">⏳ {fmtBan(banLeft(p.addr))}</span>
+                  {:else}
+                    <button class="chip ban" onclick={() => (banTarget = p.addr)}>{t("int.disconnect")}</button>
+                  {/if}
+                </span>
+              </div>
+            {/each}
+          </div>
+        {/if}
       {/if}
     </div>
 
@@ -730,8 +832,40 @@ onDestroy(() => clearInterval(timer));
       </div>
     </div>
 
-    <!-- speed + mem -->
+    <!-- network traffic + forward speed (two plots side by side) -->
     <div class="mem-zone">
+      <div class="card">
+        <div class="card-head">
+          <span class="h-card">{t("int.traffic")}</span>
+        </div>
+        <div class="chart-num mono">
+          <span class="lg down">↓ {chartSeries.last ? chartSeries.last.down.toFixed(1) : "0.0"} KB/s</span>
+          <span class="lg up">↑ {chartSeries.last ? chartSeries.last.up.toFixed(1) : "0.0"} KB/s</span>
+          <span class="lg dim">Ø {avgRate.down.toFixed(1)}/{avgRate.up.toFixed(1)} KB/s</span>
+        </div>
+        <svg class="chart-svg" viewBox="0 0 348 152" role="img" aria-label={t("int.traffic")}>
+          {#each chartSeries.yTicks.traffic as tk}
+            <text class="chart-axis" x="26" y={tk.y + 3} text-anchor="end">{tk.label}</text>
+          {/each}
+          {#each chartSeries.grid as gy}
+            <line class="chart-grid" x1="28" y1={gy} x2="348" y2={gy} />
+          {/each}
+          {#if chartSeries.area}
+            <polygon class="chart-area" points={chartSeries.area} />
+            <polyline class="chart-line down" points={chartSeries.paths.down} />
+            <polyline class="chart-line up" points={chartSeries.paths.up} />
+          {/if}
+          {#each chartSeries.dots.filter((d) => d.key !== "fwd") as d}
+            <circle class="chart-dot {d.key}" cx={d.cx} cy={d.cy} r="2.5" />
+          {/each}
+          {#each chartSeries.peaks.filter((p) => p.key !== "fwd") as p}
+            <text class="chart-peak {p.key}" x={p.cx} y={p.cy + 12} text-anchor="middle">{p.value.toFixed(1)}</text>
+          {/each}
+          <text class="chart-axis" x="28" y="148" text-anchor="start">{chartSeries.xTicks.t0}</text>
+          <text class="chart-axis" x="348" y="148" text-anchor="end">{chartSeries.xTicks.t1}</text>
+        </svg>
+      </div>
+
       <div class="card">
         <div class="card-head">
           <span class="h-card">{t("int.window_speed")}</span>
@@ -742,36 +876,30 @@ onDestroy(() => clearInterval(timer));
             </select>
           </span>
         </div>
-        <div class="speed-bars" aria-hidden="true">
-          {#each bars as h}
-            <span class="bar" style:height={`${h}px`}></span>
-          {/each}
+        <div class="chart-num mono">
+          <span class="lg fwd">→ {chartSeries.last ? chartSeries.last.fwd.toFixed(1) : "0.0"} blk/s</span>
+          <span class="lg dim">▲ {t("int.blocks_per_s", { n: fmt(Math.round(rate.v)) })} · {t("int.eta", { eta: etaText(rate.etaMin) })}</span>
         </div>
-        <p class="speed-cap mono">▲ {t("int.blocks_per_s", { n: fmt(Math.round(rate.v)) })} · {t("int.eta", { eta: etaText(rate.etaMin) })}</p>
+        <svg class="chart-svg" viewBox="0 0 348 152" role="img" aria-label={t("int.window_speed")}>
+          {#each chartSeries.yTicks.fwd as tk}
+            <text class="chart-axis" x="26" y={tk.y + 3} text-anchor="end">{tk.label}</text>
+          {/each}
+          {#each chartSeries.grid as gy}
+            <line class="chart-grid" x1="28" y1={gy} x2="348" y2={gy} />
+          {/each}
+          {#if chartSeries.paths.fwd}
+            <polyline class="chart-line fwd" points={chartSeries.paths.fwd} />
+          {/if}
+          {#each chartSeries.dots.filter((d) => d.key === "fwd") as d}
+            <circle class="chart-dot {d.key}" cx={d.cx} cy={d.cy} r="2.5" />
+          {/each}
+          {#each chartSeries.peaks.filter((p) => p.key === "fwd") as p}
+            <text class="chart-peak {p.key}" x={p.cx} y={p.cy + 12} text-anchor="middle">{p.value.toFixed(1)}</text>
+          {/each}
+          <text class="chart-axis" x="28" y="148" text-anchor="start">{chartSeries.xTicks.t0}</text>
+          <text class="chart-axis" x="348" y="148" text-anchor="end">{chartSeries.xTicks.t1}</text>
+        </svg>
       </div>
-
-      <div class="card">
-        <div class="card-head"><span class="h-card">{t("int.memory")}</span></div>
-        <dl class="kv">
-          <div><dt>{t("int.prefetch")}</dt><dd class="mono" translate="no">{fmt(dat.mem.window)} bl</dd></div>
-          <div><dt>{t("int.to_go")}</dt><dd class="mono" translate="no">{fmt(dat.mem.gap)} bl</dd></div>
-          <div><dt>{t("int.inflight")}</dt><dd class="mono" translate="no">{fmt(dat.mem.inflight)} bl</dd></div>
-        </dl>
-        <div class="mem-bar" aria-hidden="true"><span style:width={`${dat.mem.gap > 0 ? Math.min(100, (dat.mem.window / dat.mem.gap) * 100) : 100}%`}></span></div>
-      </div>
-    </div>
-
-    <!-- average traffic / recent download speed (low-frequency refresh) -->
-    <div class="card">
-      <div class="card-head">
-        <span class="h-card">{t("int.traffic")}</span>
-        <button class="chip" onclick={refreshStats}>{t("int.refresh")}</button>
-      </div>
-      <dl class="kv">
-        <div><dt>{t("int.avg_down")}</dt><dd class="mono" translate="no">{avgRate.down.toFixed(1)} KB/s</dd></div>
-        <div><dt>{t("int.avg_up")}</dt><dd class="mono" translate="no">{avgRate.up.toFixed(1)} KB/s</dd></div>
-        <div><dt>{t("int.sample_win")}</dt><dd class="mono" translate="no">{traffic.length} · {Math.min(2, trafficWindowMs / 60_000).toFixed(0)} min</dd></div>
-      </dl>
     </div>
   {/if}
 
@@ -858,6 +986,139 @@ onDestroy(() => clearInterval(timer));
     justify-content: space-between;
     gap: 10px;
     margin-bottom: 12px;
+  }
+  /* Expandable card title (Peer quality): looks like the plain h-card title
+     but is clickable, with a chevron indicating the collapsed state. */
+  .card-head .expander {
+    background: none;
+    border: none;
+    padding: 0;
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    text-align: left;
+  }
+  .card-head .chev {
+    display: inline-block;
+    width: 1em;
+    color: var(--mint);
+    transition: transform 0.2s ease;
+  }
+  /* Network traffic chart: per-sample instant rate bars (down mint / up
+     straw), each bar growing from 0 to its normalized height via scaleY
+     (GPU-only) on remount, with flip sliding older bars left. */
+  /* Merged 2D speed/traffic charts: two plots split by unit (traffic KB/s,
+     forward blocks/s). Width fills the card; height follows the viewBox
+     aspect ratio so the graph stretches edge-to-edge. */
+  .chart-svg {
+    display: block;
+    width: 100%;
+    height: auto;
+  }
+  /* Axis tick labels (y rates / x times): 10px, no stroke halo. */
+  .chart-axis {
+    font-size: 10px;
+    fill: var(--ink-dim);
+    pointer-events: none;
+  }
+  .chart-grid {
+    stroke: rgba(255, 255, 255, 0.08);
+    stroke-width: 1;
+  }
+  .chart-area {
+    fill: color-mix(in srgb, var(--mint) 14%, transparent);
+  }
+  .chart-line {
+    fill: none;
+    stroke-width: 1.6;
+    stroke-linejoin: round;
+    stroke-linecap: round;
+  }
+  .chart-line.down {
+    stroke: var(--mint);
+  }
+  .chart-line.up {
+    stroke: var(--straw);
+  }
+  .chart-line.fwd {
+    stroke: var(--hdr-pile);
+  }
+  .chart-dot {
+    stroke: #0b0f14;
+    stroke-width: 1;
+    transform-box: fill-box;
+    transform-origin: center;
+    animation: dot-pulse 1.2s ease-in-out infinite;
+  }
+  .chart-dot.down {
+    fill: var(--mint);
+  }
+  .chart-dot.up {
+    fill: var(--straw);
+  }
+  .chart-dot.fwd {
+    fill: var(--hdr-pile);
+  }
+  @keyframes dot-pulse {
+    0%,
+    100% {
+      transform: scale(1);
+    }
+    50% {
+      transform: scale(1.6);
+    }
+  }
+  .chart-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin: 4px 0 8px;
+    font-size: 11px;
+  }
+  /* Current-value row shown ABOVE each plot. */
+  .chart-num {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin: 0 0 4px;
+    font-size: 11px;
+  }
+  /* Peak value label below the highest sample of each curve. */
+  .chart-peak {
+    font-size: 11px;
+    pointer-events: none;
+  }
+  .chart-peak.down {
+    fill: var(--mint);
+  }
+  .chart-peak.up {
+    fill: var(--straw);
+  }
+  .chart-peak.fwd {
+    fill: var(--hdr-pile);
+  }
+  .lg {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .lg::before {
+    content: "";
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+  }
+  .lg.down::before {
+    background: var(--mint);
+  }
+  .lg.up::before {
+    background: var(--straw);
+  }
+  .lg.fwd::before {
+    background: var(--hdr-pile);
   }
   .corner select {
     padding: 4px 24px 4px 8px;
@@ -1042,24 +1303,6 @@ onDestroy(() => clearInterval(timer));
   }
   .mint {
     color: var(--mint);
-  }
-
-  .speed-bars {
-    display: flex;
-    align-items: flex-end;
-    gap: 5px;
-    height: 40px;
-  }
-  .bar {
-    flex: 1;
-    background: var(--straw);
-    border-radius: 2px 2px 0 0;
-    opacity: 0.85;
-  }
-  .speed-cap {
-    margin: 10px 0 0;
-    font-size: 12px;
-    color: var(--ink-dim);
   }
 
   .two {
