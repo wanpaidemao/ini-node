@@ -262,6 +262,35 @@ func (b *BlockChain) BlockStored(hash *chainhash.Hash) (bool, error) {
 	return b.blockExists(hash)
 }
 
+// RemoveBlockData deletes the on-disk payload of the block with the given
+// hash (if present) and clears its data-stored index flag, so the download
+// flow re-fetches the block instead of treating it as already have.  This is
+// used to discard a locally stored block whose data is incomplete or corrupt
+// (e.g. a block fetched as plain inventory in a SegWit-activated chain lacks
+// the witness data its inputs require, so it can never be connected) without
+// rolling the whole header chain back.  The header node itself is left
+// untouched; only the block payload and its stored flag are removed.
+//
+// This function is safe for concurrent access.
+func (b *BlockChain) RemoveBlockData(hash *chainhash.Hash) error {
+	err := b.db.Update(func(dbTx database.Tx) error {
+		return dbTx.DeleteBlock(hash)
+	})
+	if err != nil {
+		return err
+	}
+
+	// Clear the data-stored flag on the index node so HaveBlock/BlockStored
+	// report the block as absent even though the header remains known.
+	if node := b.index.LookupNode(hash); node != nil {
+		b.index.UnsetStatusFlags(node, statusDataStored)
+		if writeErr := b.index.flushToDB(false); writeErr != nil {
+			return writeErr
+		}
+	}
+	return nil
+}
+
 // IsKnownOrphan returns whether the passed hash is currently a known orphan.
 // Keep in mind that only a limited number of orphans are held onto for a
 // limited amount of time, so this function must not be used as an absolute

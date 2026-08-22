@@ -68,7 +68,17 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
 	if prevNode == nil {
 		str := fmt.Sprintf("previous block %s is unknown", prevHash)
 		return false, ruleError(ErrPreviousBlockUnknown, str)
-	} else if b.index.NodeStatus(prevNode).KnownInvalid() {
+	} else if !b.bestChain.Contains(prevNode) &&
+		b.index.NodeStatus(prevNode).KnownInvalid() {
+		// A block that is on the best chain cannot be invalid: connecting
+		// it validated all of its data, and InvalidateBlock reorgs a
+		// genuinely invalidated block off the chain.  An invalid flag on
+		// an in-chain ancestor is therefore a stale mark left by a
+		// spurious rollback (a previous session misclassified an
+		// incomplete witness-less block payload as a fabricated chain and
+		// persisted InvalidateHeaderChain statuses).  Ignore it here so
+		// the ancestor's children are not rejected forever; the stale flag
+		// itself is cleared when the block is reconnected.
 		str := fmt.Sprintf("previous block %s is known to be invalid", prevHash)
 		return false, ruleError(ErrInvalidAncestorBlock, str)
 	}
@@ -158,6 +168,20 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
 		return false, err
 	}
 
+	// The block data has now been fully validated and connected, which
+	// proves the header is genuine.  Clear any invalid flag the node is
+	// carrying: it can only have been set by a spurious rollback -- a
+	// previous session misclassified an incomplete (witness-less) block
+	// payload as a fabricated chain, then InvalidateHeaderChain marked the
+	// valid headers above it invalid and persisted that state.  Without
+	// clearing it here, the block's own children are rejected with
+	// "previous block ... is known to be invalid" forever even though the
+	// ancestor has since been connected successfully.
+	b.index.UnsetStatusFlags(newNode, statusInvalidAncestor)
+	if writeErr := b.index.flushToDB(false); writeErr != nil {
+		return false, writeErr
+	}
+
 	// Notify the caller that the new block was accepted into the block
 	// chain.  The caller would typically want to react by relaying the
 	// inventory to other peers.
@@ -235,8 +259,16 @@ func (b *BlockChain) maybeAcceptBlockHeader(header *wire.BlockHeader,
 		return false, ruleError(ErrPreviousBlockUnknown, str)
 	}
 
-	// This header is invalid if its previous node is invalid.
-	if b.index.NodeStatus(prevNode).KnownInvalid() {
+	// This header is invalid if its previous node is invalid.  A node that
+	// is on the best chain cannot be invalid: connecting it validated all of
+	// its data, and InvalidateBlock reorgs a genuinely invalidated block off
+	// the chain.  An invalid flag on an in-chain ancestor is therefore a
+	// stale mark left by a spurious rollback (a previous session
+	// misclassified an incomplete witness-less block payload as a fabricated
+	// chain and persisted InvalidateHeaderChain statuses), so it must not
+	// block the ancestors' children from being re-accepted.
+	if !b.bestChain.Contains(prevNode) &&
+		b.index.NodeStatus(prevNode).KnownInvalid() {
 		str := fmt.Sprintf(
 			"previous block %s is known to be invalid", prevHash)
 		return false, ruleError(ErrInvalidAncestorBlock, str)
@@ -250,11 +282,28 @@ func (b *BlockChain) maybeAcceptBlockHeader(header *wire.BlockHeader,
 	if node != nil {
 		nodeStatus := b.index.NodeStatus(node)
 		if nodeStatus&statusValidateFailed != 0 {
-			str := fmt.Sprintf("block %s is known to be invalid", hash)
-			return false, ruleError(ErrKnownInvalidBlock, str)
+			// A validate-failed flag on a node whose parent is already on
+			// the best chain is a stale mark from a spurious rollback
+			// (previous sessions misclassified an incomplete witness-less
+			// block payload as a fabricated chain).  The header itself is
+			// being re-submitted by the download, so clear the flag and
+			// let it re-validate instead of rejecting forever.
+			if b.bestChain.Contains(prevNode) {
+				b.index.UnsetStatusFlags(node, statusValidateFailed)
+			} else {
+				str := fmt.Sprintf("block %s is known to be invalid", hash)
+				return false, ruleError(ErrKnownInvalidBlock, str)
+			}
 		} else if nodeStatus&statusInvalidAncestor != 0 {
-			str := fmt.Sprintf("block %s has an invalid ancestor", hash)
-			return false, ruleError(ErrInvalidAncestorBlock, str)
+			// Same stale-mark reasoning: an invalid-ancestor flag whose
+			// parent is already connected on the best chain cannot be
+			// real, clear it and re-validate.
+			if b.bestChain.Contains(prevNode) {
+				b.index.UnsetStatusFlags(node, statusInvalidAncestor)
+			} else {
+				str := fmt.Sprintf("block %s has an invalid ancestor", hash)
+				return false, ruleError(ErrInvalidAncestorBlock, str)
+			}
 		}
 
 		// If the node is in the bestHeaders chainview, it's in the main chain.

@@ -2125,7 +2125,20 @@ func (sm *SyncManager) buildBlockRequest(peer *peerpkg.Peer) *wire.MsgGetData {
 			break
 		}
 
-		iv := wire.NewInvVect(wire.InvTypeBlock, hash)
+		// Request full witness data for blocks when the peer supports it.
+		// Sugarchain activates SegWit at genesis (chaincfg DeploymentSegwit
+		// height 0), so the chain contains P2WPKH/P2WSH outputs whose inputs
+		// MUST carry witness data.  A plain InvTypeBlock response omits the
+		// witness field, and the block then fails script validation
+		// ("witness program must have clean stack"), which the resume path
+		// misreads as a fabricated chain and rolls back forever.  The
+		// parallel download must mirror handleInvMsg, which already switches
+		// to InvTypeWitnessBlock for witness-enabled peers.
+		invType := wire.InvTypeBlock
+		if peer.IsWitnessEnabled() {
+			invType = wire.InvTypeWitnessBlock
+		}
+		iv := wire.NewInvVect(invType, hash)
 		haveInv, err := sm.haveInventory(iv)
 		if err != nil {
 			log.Warnf("Unexpected failure when checking for "+
@@ -2148,11 +2161,6 @@ func (sm *SyncManager) buildBlockRequest(peer *peerpkg.Peer) *wire.MsgGetData {
 			sm.requestedBlocks[*hash] = struct{}{}
 			peerState.requestedBlocks[*hash] = struct{}{}
 
-			// Always request plain block inventory.  Sugarchain has no
-			// segregated witness, and its peers do not serve witness-block
-			// inventory types; a getdata populated with InvTypeWitnessBlock is
-			// silently ignored by them even though they advertise the legacy
-			// witness service flag.
 			gdmsg.AddInvVect(iv)
 			numRequested++
 		}
@@ -2206,16 +2214,39 @@ func (sm *SyncManager) reconnectStoredBlocks() {
 
 		_, behaviorFlags := sm.checkHeadersList(hash)
 		if _, err := sm.chain.ResumeBlockConnect(hash, behaviorFlags); err != nil {
-			// The locally stored block could not be connected, which means
-			// the on-disk block data is inconsistent with the header chain
-			// (e.g. a previous session downloaded blocks for a fabricated or
-			// forked header chain, or the header index itself was polluted
-			// with a real block at the wrong height).  Silently returning
-			// would leave the download stuck at this height forever: the
-			// stored data is still "have" so it is never re-requested, and
-			// nothing else re-issues it.  Roll the header chain back to the
-			// last confirmed connected height so the bogus segment is
-			// invalidated and the download restarts from there.
+			// A rule error means the stored block's DATA is invalid, not
+			// the header chain.  The classic case: blocks downloaded with
+			// plain inventory (InvTypeBlock) in a SegWit-activated chain
+			// lack the witness data their P2WPKH/P2WSH inputs require, so
+			// they can never be connected -- the header is valid, only the
+			// payload is incomplete.  Deleting the bad payload lets the
+			// download re-fetch the block with witness data (buildBlockRequest
+			// now requests InvTypeWitnessBlock from witness-enabled peers).
+			// Rolling the header chain back instead would mark valid headers
+			// invalid and restart the download into the same failure,
+			// looping forever (observed: 100+ rollbacks at one height).
+			var ruleErr blockchain.RuleError
+			if errors.As(err, &ruleErr) {
+				log.Warnf("Stored block %v (height %d) failed to connect "+
+					"with a rule error: %v -- deleting incomplete block "+
+					"data and re-downloading", hash, nextHeight, err)
+				if rerr := sm.chain.RemoveBlockData(hash); rerr != nil {
+					log.Warnf("Failed to remove block data for %v: %v",
+						hash, rerr)
+				}
+				return
+			}
+
+			// A non-rule error means the on-disk block data is genuinely
+			// inconsistent with the header chain (e.g. a previous session
+			// downloaded blocks for a fabricated or forked header chain, or
+			// the header index itself was polluted with a real block at the
+			// wrong height).  Silently returning would leave the download
+			// stuck at this height forever: the stored data is still "have"
+			// so it is never re-requested, and nothing else re-issues it.
+			// Roll the header chain back to the last confirmed connected
+			// height so the bogus segment is invalidated and the download
+			// restarts from there.
 			log.Warnf("Stored block %v (height %d) failed to connect: %v -- "+
 				"local data inconsistent with header chain, rolling back",
 				hash, nextHeight, err)

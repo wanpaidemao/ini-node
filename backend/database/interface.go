@@ -239,6 +239,19 @@ type Tx interface {
 	// Other errors are possible depending on the implementation.
 	HasBlock(hash *chainhash.Hash) (bool, error)
 
+	// DeleteBlock removes the block with the given hash from the database
+	// if it exists.  Deleting a block that does not exist does not return
+	// an error.  The block's payload may leave an orphaned region in the
+	// underlying block files; it is simply no longer addressable by hash.
+	//
+	// The interface contract guarantees at least the following errors will
+	// be returned (other implementation-specific errors are possible):
+	//   - ErrTxNotWritable if attempted against a read-only transaction
+	//   - ErrTxClosed if the transaction has already been closed
+	//
+	// Other errors are possible depending on the implementation.
+	DeleteBlock(hash *chainhash.Hash) error
+
 	// HasBlocks returns whether or not the blocks with the provided hashes
 	// exist in the database.
 	//

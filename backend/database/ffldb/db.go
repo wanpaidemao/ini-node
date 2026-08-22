@@ -1230,6 +1230,34 @@ func (tx *transaction) HasBlocks(hashes []chainhash.Hash) ([]bool, error) {
 	return results, nil
 }
 
+// DeleteBlock removes the block with the given hash from the database if it
+// exists.  Deleting a block that does not exist does not return an error.
+// The block's payload may leave an orphaned region in the underlying block
+// files; it is simply no longer addressable by hash.
+//
+// Returns the following errors as required by the interface contract:
+//   - ErrTxNotWritable if attempted against a read-only transaction
+//   - ErrTxClosed if the transaction has already been closed
+//
+// This function is part of the database.Tx interface implementation.
+func (tx *transaction) DeleteBlock(hash *chainhash.Hash) error {
+	// Ensure transaction state is valid.
+	if err := tx.checkClosed(); err != nil {
+		return err
+	}
+
+	// Ensure the transaction is writable.
+	if !tx.writable {
+		str := "delete block requires a writable database transaction"
+		return makeDbErr(database.ErrTxNotWritable, str, nil)
+	}
+
+	// Remove the block's index entry.  The underlying block-file payload
+	// becomes an orphaned region that pruning can reclaim later.
+	tx.blockIdxBucket.Delete(hash[:])
+	return nil
+}
+
 // fetchBlockRow fetches the metadata stored in the block index for the provided
 // hash.  It will return ErrBlockNotFound if there is no entry.
 func (tx *transaction) fetchBlockRow(hash *chainhash.Hash) ([]byte, error) {
