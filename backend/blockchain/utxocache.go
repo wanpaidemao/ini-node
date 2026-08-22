@@ -596,6 +596,88 @@ func (b *BlockChain) FlushUtxoCache(mode FlushMode) error {
 	})
 }
 
+// PurgeUtxosAboveHeight removes every UTXO entry whose block height exceeds the
+// given height from both the in-memory cache and the database, and returns the
+// number of entries removed.  Entries above a connected tip cannot belong to
+// any legitimate chain -- no block at those heights has ever been connected --
+// so they are necessarily residue left behind when a previous session rolled
+// the header chain back without undoing the UTXO state (see
+// InvalidateHeaderChain / rollbackFabricatedHeaderChain).  This residue
+// otherwise makes a re-downloaded block fail its BIP0030 overwrite check
+// forever because the block's own outputs are already present in the UTXO set.
+//
+// This function is safe for concurrent access.
+func (b *BlockChain) PurgeUtxosAboveHeight(height int32) (int, error) {
+	b.chainLock.Lock()
+	defer b.chainLock.Unlock()
+
+	s := b.utxoCache
+	var purged int
+
+	// Track outpoints that have already been purged from the cache so the
+	// database pass below does not count the same logical entry twice (a
+	// cache entry fetched from the DB and its persisted row are the same
+	// outpoint).  Entries that were flushed and re-fetched are unmodified,
+	// so dropping the DB row after the cache drop is still required.
+	seen := make(map[wire.OutPoint]struct{})
+
+	// Purge the in-memory cache first.  Entries are deleted in place so the
+	// loop is safe against concurrent misses; the chain lock serializes all
+	// other cache access in the same way writeCache relies on it.
+	for i := range s.cachedEntries.maps {
+		m := s.cachedEntries.maps[i]
+		for outpoint, entry := range m {
+			if entry == nil || entry.IsSpent() {
+				continue
+			}
+			if entry.BlockHeight() > height {
+				delete(m, outpoint)
+				s.totalEntryMemory -= entry.memoryUsage()
+				seen[outpoint] = struct{}{}
+				purged++
+			}
+		}
+	}
+
+	// Purge the persisted entries from the database.  Cursor.Delete removes
+	// the current pair without invalidating the cursor, so stale rows can be
+	// dropped in a single pass.
+	err := b.db.Update(func(dbTx database.Tx) error {
+		utxoBucket := dbTx.Metadata().Bucket(utxoSetBucketName)
+		cursor := utxoBucket.Cursor()
+		for ok := cursor.First(); ok; ok = cursor.Next() {
+			entry, derr := deserializeUtxoEntry(cursor.Value())
+			if derr != nil {
+				return derr
+			}
+			if entry.BlockHeight() > height {
+				// Decode the outpoint from the cursor key so a row that
+				// was already dropped from the cache is not double-counted.
+				op, derr := deserializeOutpointKey(cursor.Key())
+				if derr != nil {
+					return derr
+				}
+				if derr := cursor.Delete(); derr != nil {
+					return derr
+				}
+				if _, dup := seen[*op]; !dup {
+					purged++
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return purged, err
+	}
+
+	if purged > 0 {
+		log.Warnf("Purged %d stale UTXO entries above height %d", purged, height)
+	}
+
+	return purged, nil
+}
+
 // InitConsistentState checks the consistency status of the utxo state and
 // replays blocks if it lags behind the best state of the blockchain.
 //

@@ -2227,6 +2227,46 @@ func (sm *SyncManager) reconnectStoredBlocks() {
 			// looping forever (observed: 100+ rollbacks at one height).
 			var ruleErr blockchain.RuleError
 			if errors.As(err, &ruleErr) {
+				// A BIP0030 overwrite error means the stored block's own
+				// outputs are already present in the local UTXO set.  This
+				// is not a data problem: the header hash at this height is
+				// fixed, so re-downloading the block can never clear it.
+				// It is stale residue left by a previous session that
+				// rolled the header chain back without undoing the UTXO
+				// state (see PurgeUtxosAboveHeight).  Repair the state
+				// instead of looping on delete-and-redownload forever.
+				if ruleErr.ErrorCode == blockchain.ErrOverwriteTx {
+					tipHeight := sm.chain.BestSnapshot().Height
+					purged, perr := sm.chain.PurgeUtxosAboveHeight(tipHeight)
+					if perr != nil {
+						log.Warnf("Failed to purge stale UTXOs above "+
+							"height %d: %v", tipHeight, perr)
+					} else if purged > 0 {
+						// The residue that made this block's BIP0030 check
+						// fail is gone; retry connecting the same stored
+						// block instead of deleting it.
+						log.Warnf("Purged %d stale UTXO entries above "+
+							"height %d; retrying block %v (height %d)",
+							purged, tipHeight, hash, nextHeight)
+						if _, retryErr := sm.chain.ResumeBlockConnect(
+							hash, behaviorFlags); retryErr == nil {
+							continue
+						} else {
+							log.Warnf("Stored block %v (height %d) still "+
+								"failed to connect after UTXO purge: %v",
+								hash, nextHeight, retryErr)
+							err = retryErr
+							if !errors.As(err, &ruleErr) {
+								sm.rollbackFabricatedHeaderChain()
+								return
+							}
+						}
+					}
+					// purged == 0: no residue above the tip, so the
+					// overwrite is genuine.  Fall through to the standard
+					// delete-and-redownload path below.
+				}
+
 				log.Warnf("Stored block %v (height %d) failed to connect "+
 					"with a rule error: %v -- deleting incomplete block "+
 					"data and re-downloading", hash, nextHeight, err)

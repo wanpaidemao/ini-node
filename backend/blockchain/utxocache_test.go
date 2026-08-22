@@ -961,3 +961,153 @@ func TestInitConsistentState(t *testing.T) {
 			blocks[len(blocks)-1].Height())
 	}
 }
+
+// TestPurgeUtxosAboveHeight verifies that PurgeUtxosAboveHeight removes every
+// UTXO entry whose block height exceeds the given height from both the
+// in-memory cache and the database, while leaving entries at or below the
+// height untouched.  This is the repair path for stale UTXO residue left
+// behind by a rolled-back header chain (BIP0030 ErrOverwriteTx loop).
+func TestPurgeUtxosAboveHeight(t *testing.T) {
+	chain, _, tearDown := utxoCacheTestChain("TestPurgeUtxosAboveHeight")
+	defer tearDown()
+	cache := chain.utxoCache
+
+	// Add UTXOs at heights 5, 10 and 15.  The 15 one is the "stale residue"
+	// above the purge height of 10.
+	outPoints := make([]wire.OutPoint, 3)
+	heights := []int32{5, 10, 15}
+	for i := range outPoints {
+		op := outpointFromInt(i)
+		outPoints[i] = op
+		txOut := wire.TxOut{Value: 10000, PkScript: getValidP2PKHScript()}
+		cache.addTxOut(op, &txOut, true, heights[i])
+	}
+
+	// Flush to the database so both the cache miss path and the persisted
+	// bucket are exercised by the purge.
+	err := chain.db.Update(func(dbTx database.Tx) error {
+		return cache.flush(dbTx, FlushRequired, chain.stateSnapshot)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cache.cachedEntries.length() != 0 {
+		t.Fatalf("expected flushed cache to be empty, got %d entries",
+			cache.cachedEntries.length())
+	}
+	if err := assertNbEntriesOnDisk(chain, 3); err != nil {
+		t.Fatal(err)
+	}
+
+	// Purge everything above height 10: only the height-15 entry must go.
+	purged, err := chain.PurgeUtxosAboveHeight(10)
+	if err != nil {
+		t.Fatalf("unexpected error purging UTXOs: %v", err)
+	}
+	if purged != 1 {
+		t.Fatalf("expected 1 purged entry, got %d", purged)
+	}
+
+	// The height-5 and height-10 entries must survive on disk.
+	if err := assertNbEntriesOnDisk(chain, 2); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := cache.fetchEntries(outPoints[:2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, entry := range entries {
+		if entry == nil || entry.IsSpent() {
+			t.Fatalf("expected entry %v to survive purge", outPoints[i])
+		}
+		if entry.BlockHeight() != heights[i] {
+			t.Fatalf("expected surviving entry at height %d, got %d",
+				heights[i], entry.BlockHeight())
+		}
+	}
+
+	// The purged outpoint must be gone from both the cache and the DB.
+	entry, ok := cache.cachedEntries.get(outPoints[2])
+	if ok && entry != nil && !entry.IsSpent() {
+		t.Fatalf("expected purged entry %v to be gone from the cache",
+			outPoints[2])
+	}
+	var dbEntry *UtxoEntry
+	chain.db.View(func(dbTx database.Tx) error {
+		dbEntry, _ = dbFetchUtxoEntry(dbTx,
+			dbTx.Metadata().Bucket(utxoSetBucketName), outPoints[2])
+		return nil
+	})
+	if dbEntry != nil && !dbEntry.IsSpent() {
+		t.Fatalf("expected purged entry %v to be gone from the database",
+			outPoints[2])
+	}
+
+	// A second purge at the same height must be a no-op.
+	purged, err = chain.PurgeUtxosAboveHeight(10)
+	if err != nil {
+		t.Fatalf("unexpected error on second purge: %v", err)
+	}
+	if purged != 0 {
+		t.Fatalf("expected second purge to remove 0 entries, got %d", purged)
+	}
+
+	// Purge below everything (height 4): both remaining entries must go.
+	purged, err = chain.PurgeUtxosAboveHeight(4)
+	if err != nil {
+		t.Fatalf("unexpected error purging below all heights: %v", err)
+	}
+	if purged != 2 {
+		t.Fatalf("expected 2 purged entries, got %d", purged)
+	}
+	if err := assertNbEntriesOnDisk(chain, 0); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPurgeUtxosAboveHeightCacheOnly verifies that entries which only exist in
+// the in-memory cache (never flushed) are purged by PurgeUtxosAboveHeight as
+// well, without touching the database.
+func TestPurgeUtxosAboveHeightCacheOnly(t *testing.T) {
+	chain, _, tearDown := utxoCacheTestChain("TestPurgeUtxosAboveHeightCacheOnly")
+	defer tearDown()
+	cache := chain.utxoCache
+
+	// Add un-flushed entries at heights 5 and 15.
+	lowOp := outpointFromInt(0)
+	highOp := outpointFromInt(1)
+	txOut := wire.TxOut{Value: 10000, PkScript: getValidP2PKHScript()}
+	if err := cache.addTxOut(lowOp, &txOut, true, 5); err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.addTxOut(highOp, &txOut, true, 15); err != nil {
+		t.Fatal(err)
+	}
+	if cache.cachedEntries.length() != 2 {
+		t.Fatalf("expected 2 cached entries, got %d",
+			cache.cachedEntries.length())
+	}
+
+	purged, err := chain.PurgeUtxosAboveHeight(10)
+	if err != nil {
+		t.Fatalf("unexpected error purging cache-only entries: %v", err)
+	}
+	if purged != 1 {
+		t.Fatalf("expected 1 purged entry, got %d", purged)
+	}
+	if cache.cachedEntries.length() != 1 {
+		t.Fatalf("expected 1 cached entry to remain, got %d",
+			cache.cachedEntries.length())
+	}
+	if _, ok := cache.cachedEntries.get(highOp); ok {
+		t.Fatalf("expected high entry %v to be purged from the cache", highOp)
+	}
+	if _, ok := cache.cachedEntries.get(lowOp); !ok {
+		t.Fatalf("expected low entry %v to remain in the cache", lowOp)
+	}
+
+	// Nothing was persisted, so the DB must still be empty.
+	if err := assertNbEntriesOnDisk(chain, 0); err != nil {
+		t.Fatal(err)
+	}
+}

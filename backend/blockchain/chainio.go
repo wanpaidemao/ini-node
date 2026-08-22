@@ -671,6 +671,29 @@ func recycleOutpointKey(key *[]byte) {
 	outpointKeyPool.Put(key)
 }
 
+// deserializeOutpointKey decodes a database key produced by outpointKey back
+// into the outpoint it represents.  The key layout is the 32-byte tx hash
+// followed by the VLQ-encoded output index.
+func deserializeOutpointKey(key []byte) (*wire.OutPoint, error) {
+	if len(key) < chainhash.HashSize {
+		return nil, AssertError(fmt.Sprintf("invalid outpoint key length %d",
+			len(key)))
+	}
+
+	index, numBytes := deserializeVLQ(key[chainhash.HashSize:])
+	if numBytes == 0 || chainhash.HashSize+numBytes != len(key) {
+		return nil, AssertError(fmt.Sprintf("invalid outpoint key length %d",
+			len(key)))
+	}
+
+	hash, err := chainhash.NewHash(key[:chainhash.HashSize])
+	if err != nil {
+		return nil, err
+	}
+
+	return &wire.OutPoint{Hash: *hash, Index: uint32(index)}, nil
+}
+
 // utxoEntryHeaderCode returns the calculated header code to be used when
 // serializing the provided utxo entry.
 func utxoEntryHeaderCode(entry *UtxoEntry) (uint64, error) {
