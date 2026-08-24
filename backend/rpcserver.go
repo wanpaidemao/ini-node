@@ -4365,6 +4365,11 @@ func parseCmd(request *btcjson.Request) *parsedRPCCmd {
 // createMarshalledReply returns a new marshalled JSON-RPC response given the
 // passed parameters.  It will automatically convert errors that are not of
 // the type *btcjson.RPCError to the appropriate type as needed.
+//
+// Requests that omit the JSON-RPC version field (common among Bitcoin Core
+// compatible clients such as sugarmaker, which sends no "jsonrpc" member)
+// default to JSON-RPC 1.0 instead of failing to marshal the response and
+// returning an empty body that clients cannot parse.
 func createMarshalledReply(rpcVersion btcjson.RPCVersion, id interface{}, result interface{}, replyErr error) ([]byte, error) {
 	var jsonErr *btcjson.RPCError
 	if replyErr != nil {
@@ -4373,6 +4378,12 @@ func createMarshalledReply(rpcVersion btcjson.RPCVersion, id interface{}, result
 		} else {
 			jsonErr = internalRPCError(replyErr.Error(), "")
 		}
+	}
+
+	// Match the behavior of btcjson.NewRequest, which defaults to
+	// JSON-RPC 1.0 when no version is specified.
+	if !rpcVersion.IsValid() {
+		rpcVersion = btcjson.RpcVersion1
 	}
 
 	return btcjson.MarshalResponse(rpcVersion, id, result, jsonErr)

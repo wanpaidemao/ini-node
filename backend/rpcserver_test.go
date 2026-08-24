@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -665,4 +666,27 @@ func TestGetTxSpendingPrevOut(t *testing.T) {
 	results, err = handleGetTxSpendingPrevOut(s, cmd, closeChan)
 	require.NoError(err)
 	require.Equal(expectedResults, results)
+}
+
+// TestCreateMarshalledReplyNoRpcVersion ensures a request that omits the
+// JSON-RPC version field (as sugarmaker does) still yields a valid response
+// instead of failing to marshal and producing an empty body that clients
+// cannot parse.
+func TestCreateMarshalledReplyNoRpcVersion(t *testing.T) {
+	require := require.New(t)
+
+	msg, err := createMarshalledReply("", 0, "ok", nil)
+	require.NoError(err)
+
+	var reply struct {
+		Jsonrpc string `json:"jsonrpc"`
+		Result  string `json:"result"`
+		Error   interface{} `json:"error"`
+		ID      int `json:"id"`
+	}
+	require.NoError(json.Unmarshal(msg, &reply))
+	require.Equal("1.0", reply.Jsonrpc)
+	require.Equal("ok", reply.Result)
+	require.Nil(reply.Error)
+	require.Equal(0, reply.ID)
 }
