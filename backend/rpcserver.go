@@ -648,6 +648,11 @@ func handleDebugLevel(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) 
 			supportedSubsystems()), nil
 	}
 
+	// Special get command to report the current log level.
+	if c.LevelSpec == "get" {
+		return currentLogLevel(), nil
+	}
+
 	err := parseAndSetDebugLevels(c.LevelSpec)
 	if err != nil {
 		return nil, &btcjson.RPCError{

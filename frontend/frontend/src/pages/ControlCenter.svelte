@@ -74,7 +74,23 @@
         const d = await res.json()
         params = d
         iniPath = d.iniPath || ''
+        logRedirect = d.logredirect === '1'
       }
+    } catch { /* ignore */ }
+  }
+  // Redirect node stdout to node.stdout.log (ini logredirect=1).  Off by
+  // default: btcd already writes its own rotated btcd.log, so capturing
+  // stdout is opt-in.  / 是否把节点 stdout 重定向到 node.stdout.log
+  // (ini logredirect=1)。默认关闭:btcd 自身已写轮转 btcd.log,捕获 stdout
+  // 为可选行为。
+  let logRedirect = false
+  async function saveLogRedirect() {
+    try {
+      await fetch('/api/node-config', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ logredirect: logRedirect ? '1' : '0' }),
+      })
     } catch { /* ignore */ }
   }
   async function viewIni() {
@@ -334,6 +350,10 @@
         <button class="btn btn-ghost" onclick={openLogs} style="font-size:12px">View / 查看</button>
       </div>
     </div>
+    <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
+      <input type="checkbox" bind:checked={logRedirect} onchange={saveLogRedirect} />
+      <span>Redirect node stdout to node.stdout.log / 重定向 stdout 到 node.stdout.log</span>
+    </label>
   </div>
 
   {#if logsModalOpen}

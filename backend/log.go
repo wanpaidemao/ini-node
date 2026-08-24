@@ -156,6 +156,23 @@ func setLogLevels(logLevel string) {
 	}
 }
 
+// currentLogLevel returns the current log level of all subsystems as a
+// string.  When every subsystem is set to the same level, that single level
+// is returned; otherwise the level of the main BTCD subsystem is returned as
+// a representative value (frontends consume a single dropdown value).
+func currentLogLevel() string {
+	rep := subsystemLoggers["BTCD"].Level()
+	for id, logger := range subsystemLoggers {
+		if id == "BTCD" {
+			continue
+		}
+		if logger.Level() != rep {
+			return rep.String()
+		}
+	}
+	return rep.String()
+}
+
 // directionString is a helper function that returns a string that represents
 // the direction of a connection (inbound or outbound).
 func directionString(inbound bool) string {

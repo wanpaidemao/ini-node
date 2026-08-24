@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -174,6 +175,38 @@ func handleRPCProxy(o map[string]string, w http.ResponseWriter, req *http.Reques
 	_, _ = io.Copy(w, resp.Body)
 }
 
+// frontendConfigPath returns the path of the frontend-only client config
+// file.  Client-only settings (logredirect, and any future UI flags) live
+// HERE instead of the runtime ini, because the ini doubles as btcd's
+// --configfile and btcd strictly rejects unknown keys (which would make the
+// node exit immediately at startup).
+// frontendConfigPath 返回前端客户端专属配置文件路径。前端专属设置
+// (logredirect 及未来的 UI 开关)统一存这里,不写进 runtime ini——ini 同时
+// 是 btcd 的 --configfile,btcd 严格解析未知键会导致节点启动即退出。
+func frontendConfigPath(iniPath string) string {
+	return filepath.Join(filepath.Dir(iniPath), "frontend.ini")
+}
+
+// readFrontendConfig returns the frontend-only client config key/values.
+// readFrontendConfig 读取前端客户端配置的全部键值。
+func readFrontendConfig(iniPath string) map[string]string {
+	if iniPath == "" {
+		return map[string]string{}
+	}
+	return parseIni(frontendConfigPath(iniPath))
+}
+
+// writeFrontendConfig merges val into the frontend-only client config file,
+// preserving existing keys.  writeFrontendConfig 把 val 合并写入前端客户端
+// 配置文件,保留已有键。
+func writeFrontendConfig(iniPath string, val map[string]string) error {
+	if iniPath == "" {
+		return nil
+	}
+	writeIni(frontendConfigPath(iniPath), val)
+	return nil
+}
+
 func writeIni(iniPath string, val map[string]string) {
 	if iniPath == "" || len(val) == 0 {
 		return
@@ -230,6 +263,18 @@ func handleNodeConfig(iniPath string, o map[string]string, w http.ResponseWriter
 					val[k] = s
 				}
 			}
+			// logredirect is a frontend-only client setting, NOT a btcd
+			// option: keep it in frontend.ini, never in the runtime ini
+			// (which doubles as btcd's --configfile; btcd rejects unknown
+			// keys and the node would refuse to start).  Future client-only
+			// settings should be routed the same way. / logredirect 是前端
+			// 客户端专属设置,不是 btcd 选项:统一写入 frontend.ini,绝不写进
+			// runtime ini(它是 btcd 的 --configfile,未知键会导致节点拒启)。
+			// 以后新增前端专属设置也走同样路由。
+			if lr, ok := val["logredirect"]; ok {
+				_ = writeFrontendConfig(iniPath, map[string]string{"logredirect": lr})
+				delete(val, "logredirect")
+			}
 			if ep, ok := val["rpcendpoint"]; ok && ep != "" {
 				if u, err := url.Parse(ep); err == nil && u.Host != "" {
 					val["rpclisten"] = u.Host
@@ -271,6 +316,15 @@ func handleNodeConfig(iniPath string, o map[string]string, w http.ResponseWriter
 		"iniPath":     iniPath,
 	}
 	for k, v := range o {
+		out[k] = v
+	}
+	// Report the frontend-only client settings (frontend.ini) alongside the
+	// node ini, so the control center can show and edit them.  They are kept
+	// OUT of the runtime ini, which btcd parses strictly as --configfile.
+	// / 把前端客户端专属设置(frontend.ini)与节点 ini 一起返回,供控制中心
+	// 展示和编辑。这些键不存 runtime ini(btcd 会严格解析并拒启)。
+	fe := readFrontendConfig(iniPath)
+	for k, v := range fe {
 		out[k] = v
 	}
 	_ = json.NewEncoder(w).Encode(out)
@@ -357,25 +411,34 @@ func handleNodeStart(opts map[string]string, w http.ResponseWriter, req *http.Re
 	}
 	backendDir := filepath.Dir(ini)
 	btcd := filepath.Join(backendDir, "btcd.exe")
-	// 日志目录优先用 ini 的 logdir 配置（相对路径基于 ini 所在目录），
-	// 否则默认 ini 同目录下的 logs/。前端 handleLogs 读同一个目录。
-	logDir := filepath.Join(backendDir, "logs")
-	if ld := strings.TrimSpace(parseIni(ini)["logdir"]); ld != "" {
-		if filepath.IsAbs(ld) {
-			logDir = ld
-		} else {
-			logDir = filepath.Join(backendDir, ld)
-		}
-	}
-	_ = os.MkdirAll(logDir, 0700)
-	out, _ := os.OpenFile(filepath.Join(logDir, "node.stdout.log"),
-		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
-	errf, _ := os.OpenFile(filepath.Join(logDir, "node.stderr.log"),
-		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	cmd := exec.Command(btcd, "--configfile="+ini)
 	cmd.Dir = filepath.Dir(btcd)
-	cmd.Stdout = out
-	cmd.Stderr = errf
+	// Capture stdout/stderr to node.stdout.log/node.stderr.log only when
+	// logredirect=1 in the ini.  btcd already writes its own rotated
+	// btcd.log, so redirecting is opt-in (avoids an unbounded duplicate
+	// copy of the log).  Default: no redirect → child inherits/attaches to
+	// the parent's handles (Go attaches os.DevNull when Stdout is nil).
+	// 仅当 ini 里 logredirect=1 时才把 stdout/stderr 重定向到
+	// node.stdout.log/node.stderr.log。btcd 自身已写轮转的 btcd.log,
+	// 重定向默认关闭(避免无界重复日志副本);Stdout 为 nil 时 Go 会挂到
+	// os.DevNull。
+	if readFrontendConfig(ini)["logredirect"] == "1" {
+		logDir := filepath.Join(backendDir, "logs")
+		if ld := strings.TrimSpace(parseIni(ini)["logdir"]); ld != "" {
+			if filepath.IsAbs(ld) {
+				logDir = ld
+			} else {
+				logDir = filepath.Join(backendDir, ld)
+			}
+		}
+		_ = os.MkdirAll(logDir, 0700)
+		out, _ := os.OpenFile(filepath.Join(logDir, "node.stdout.log"),
+			os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		errf, _ := os.OpenFile(filepath.Join(logDir, "node.stderr.log"),
+			os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		cmd.Stdout = out
+		cmd.Stderr = errf
+	}
 	if err := cmd.Start(); err != nil {
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": err.Error()})
 		return
@@ -439,7 +502,12 @@ func handleForceNodeStop(w http.ResponseWriter, req *http.Request) {
 }
 
 // handleLogs serves the node log tail (GET ?lines=N) and clears it (POST).
-// handleLogs 返回节点日志尾部(GET ?lines=N)或清空(POST)。
+// It prefers btcd's own rotated log (<datadir>/logs/<net>/btcd.log) so the
+// panel shows live output regardless of whether stdout redirect is enabled;
+// falls back to the legacy node.stdout.log capture file.
+// handleLogs 返回节点日志尾部(GET ?lines=N)或清空(POST)。优先读 btcd 自身
+// 的轮转日志(<datadir>/logs/<net>/btcd.log),这样面板总是显示实时日志,
+// 与是否开启 stdout 重定向无关;找不到时回退旧的 node.stdout.log 捕获文件。
 func handleLogs(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("content-type", "application/json")
 	// Resolve the log file through the same ini lookup as handleNodeStart so
@@ -462,7 +530,22 @@ func handleLogs(w http.ResponseWriter, req *http.Request) {
 			logDir = filepath.Join(iniDir, ld)
 		}
 	}
+	// Prefer btcd's own rotated log.  btcd appends the network name
+	// (sugarmainnet) under <logdir>; glob for it like handleIndexProgress
+	// does for the data dir.  / 优先 btcd 自身轮转日志:网络名目录
+	// (sugarmainnet)挂在 <logdir> 下,用 glob 查找(同 handleIndexProgress)。
 	logPath := filepath.Join(logDir, "node.stdout.log")
+	if matches, err := filepath.Glob(filepath.Join(logDir, "*", "btcd.log")); err == nil && len(matches) > 0 {
+		best := matches[0]
+		var bestMod int64
+		for _, m := range matches {
+			if st, err := os.Stat(m); err == nil && st.ModTime().Unix() > bestMod {
+				best = m
+				bestMod = st.ModTime().Unix()
+			}
+		}
+		logPath = best
+	}
 	if req.Method == http.MethodPost {
 		_ = os.Truncate(logPath, 0)
 		_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
@@ -552,9 +635,13 @@ func handleWalletapiStop(w http.ResponseWriter, req *http.Request) {
 }
 
 // handleLoglevel reads (GET) or sets (POST) the node log level.  POST calls
-// btcd's debuglevel RPC for immediate effect (needs RPC reachable).
+// btcd's debuglevel RPC for immediate effect (needs RPC reachable) and
+// persists the level to the runtime ini so it survives a restart.  GET reads
+// the node's actual live level via debuglevel get, falling back to the ini
+// value when the RPC is unreachable.
 // handleLoglevel 读取(GET)或设置(POST)节点日志等级。POST 调用 btcd 的
-// debuglevel RPC 即时生效(需 RPC 可达)。
+// debuglevel RPC 即时生效(需 RPC 可达)并回写 ini 持久化;GET 优先读节点
+// 实际级别,RPC 不可达时回退 ini 里的 debuglevel。
 func handleLoglevel(o map[string]string, w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("content-type", "application/json")
 	if req.Method == http.MethodPost {
@@ -569,19 +656,35 @@ func handleLoglevel(o map[string]string, w http.ResponseWriter, req *http.Reques
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": err.Error()})
 			return
 		}
+		// Persist so the level survives a node restart. / 回写 ini,重启后仍生效。
+		if iniPath := findIniPath(); iniPath != "" {
+			if err := updateIniKey(iniPath, "debuglevel", body.Level); err != nil {
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": "applied but failed to persist: " + err.Error()})
+				return
+			}
+		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "level": body.Level})
 		return
 	}
-	level := strings.TrimSpace(o["loglevel"])
+	level, err := callDebugLevel(o, "get")
+	if err != nil {
+		level = strings.TrimSpace(o["debuglevel"])
+		if level == "" {
+			level = strings.TrimSpace(o["loglevel"])
+		}
+	}
 	if level == "" {
 		level = "info"
 	}
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "level": level})
 }
 
-// setBtcdLogLevel issues btcd's debuglevel RPC (live, no restart).
-// setBtcdLogLevel 调用 btcd 的 debuglevel RPC（即时生效，无需重启）。
-func setBtcdLogLevel(o map[string]string, level string) error {
+// callDebugLevel issues btcd's debuglevel RPC with the given spec ("get",
+// "show", or a concrete level such as "warn") and returns the decoded result
+// string.  A non-nil error means the RPC was unreachable or returned an error.
+// callDebugLevel 调用 btcd 的 debuglevel RPC(spec 为 get/show/具体级别如
+// warn),返回解码后的结果字符串;RPC 不可达或返回错误时给出 error。
+func callDebugLevel(o map[string]string, spec string) (string, error) {
 	host := strings.TrimSpace(o["rpclisten"])
 	if host == "" {
 		host = "127.0.0.1:8334"
@@ -591,16 +694,69 @@ func setBtcdLogLevel(o map[string]string, level string) error {
 	}
 	payload, _ := json.Marshal(map[string]interface{}{
 		"jsonrpc": "1.0", "id": "loglevel", "method": "debuglevel",
-		"params": []string{level},
+		"params": []string{spec},
 	})
 	r, _ := http.NewRequest(http.MethodPost, "http://"+host+"/", bytes.NewReader(payload))
 	r.SetBasicAuth(o["rpcuser"], o["rpcpass"])
 	resp, err := rpcHTTP.Do(r)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer resp.Body.Close()
-	return nil
+	var out struct {
+		Result interface{} `json:"result"`
+		Error  interface{} `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	if out.Error != nil {
+		return "", fmt.Errorf("debuglevel RPC error: %v", out.Error)
+	}
+	s, _ := out.Result.(string)
+	return s, nil
+}
+
+// setBtcdLogLevel issues btcd's debuglevel RPC (live, no restart).
+// setBtcdLogLevel 调用 btcd 的 debuglevel RPC（即时生效，无需重启）。
+func setBtcdLogLevel(o map[string]string, level string) error {
+	_, err := callDebugLevel(o, level)
+	return err
+}
+
+// updateIniKey sets key=value in the ini file at path, preserving comments,
+// section headers, and other keys.  The key is inserted right after the first
+// section header (or appended at the end if absent) so it belongs to the
+// correct section.  A newline-terminated file is always written.
+// updateIniKey 在 ini 中写入 key=value,保留注释/section/其他键;键不存在时
+// 插到第一个 section 之后(没有 section 则追加到末尾),保证键归属正确。
+func updateIniKey(path, key, value string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(strings.ReplaceAll(string(b), "\r\n", "\n"), "\n")
+	re := regexp.MustCompile(`^\s*` + regexp.QuoteMeta(key) + `\s*=`)
+	updated := false
+	for i, line := range lines {
+		if re.MatchString(line) {
+			lines[i] = key + "=" + value
+			updated = true
+		}
+	}
+	if !updated {
+		insertAt := len(lines)
+		for i, line := range lines {
+			if strings.HasPrefix(strings.TrimSpace(line), "[") {
+				insertAt = i + 1
+				break
+			}
+		}
+		lines = append(lines, "")
+		copy(lines[insertAt+1:], lines[insertAt:])
+		lines[insertAt] = key + "=" + value
+	}
+	return os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0600)
 }
 
 // rpcProxyMiddleware intercepts the RPC proxy and node-config routes that the
