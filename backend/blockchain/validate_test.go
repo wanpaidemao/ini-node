@@ -122,11 +122,28 @@ func TestCheckConnectBlockTemplate(t *testing.T) {
 			"block 4: %v", err)
 	}
 
-	// Block 3a should fail to connect since does not build on chain tip.
+	// Block 3a builds on block 2, which is on the main chain but is not the
+	// current tip.  Since Sugarchain produces a block every ~5 seconds, a
+	// freshly generated template races the network tip; the template must be
+	// accepted as long as its parent is on the main chain.  3a's parent (2)
+	// is on the main chain, so it must now connect successfully.
+	// Block 3a 构建在主链上的 block 2(非当前 tip)。Sugarchain 约 5 秒出块,
+	// 模板生成会与网络 tip 竞速;只要父块在主链上模板就应被接受。3a 的父块
+	// (2) 在主链上,因此现在应当连接成功。
 	err = chain.CheckConnectBlockTemplate(blocks[5])
+	if err != nil {
+		t.Fatalf("CheckConnectBlockTemplate: unexpected error on block 3a "+
+			"(parent on main chain but not tip): %v", err)
+	}
+
+	// A block whose parent is not on the main chain at all must still fail.
+	// 父块完全不在主链上的块仍必须失败。
+	orphanParent := *blocks[4].MsgBlock()
+	orphanParent.Header.PrevBlock = chainhash.Hash{} // unknown parent
+	err = chain.CheckConnectBlockTemplate(btcutil.NewBlock(&orphanParent))
 	if err == nil {
-		t.Fatal("CheckConnectBlockTemplate: Did not received expected error " +
-			"on block 3a")
+		t.Fatal("CheckConnectBlockTemplate: expected error for block with " +
+			"parent not on the main chain")
 	}
 
 	// Block 4 should connect even if proof of work is invalid.

@@ -1388,7 +1388,14 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 
 // CheckConnectBlockTemplate fully validates that connecting the passed block to
 // the main chain does not violate any consensus rules, aside from the proof of
-// work requirement. The block must connect to the current tip of the main chain.
+// work requirement.  The block must build on a block that is on the main
+// chain; it does NOT have to be the current chain tip.  Sugarchain targets a
+// 5-second block interval, so between the moment a template's previous hash is
+// sampled and the moment it is validated here the tip can advance by several
+// blocks.  Requiring the template to connect to the tip would make every
+// template generation race the network and fail spuriously.  The parent is
+// resolved via the block index instead, and the sanity/context/connect checks
+// run against that parent node.
 //
 // This function is safe for concurrent access.
 func (b *BlockChain) CheckConnectBlockTemplate(block *btcutil.Block) error {
@@ -1398,13 +1405,14 @@ func (b *BlockChain) CheckConnectBlockTemplate(block *btcutil.Block) error {
 	// Skip the proof of work check as this is just a block template.
 	flags := BFNoPoWCheck
 
-	// This only checks whether the block can be connected to the tip of the
-	// current chain.
-	tip := b.bestChain.Tip()
+	// The block must build on a block that is part of the main chain (not
+	// necessarily the tip, see comment above).  Resolve the parent through
+	// the block index and make sure it is on the active chain.
 	header := block.MsgBlock().Header
-	if tip.hash != header.PrevBlock {
-		str := fmt.Sprintf("previous block must be the current chain tip %v, "+
-			"instead got %v", tip.hash, header.PrevBlock)
+	prevNode := b.index.LookupNode(&header.PrevBlock)
+	if prevNode == nil || !b.bestChain.Contains(prevNode) {
+		str := fmt.Sprintf("previous block must be on the main chain, "+
+			"instead got %v", header.PrevBlock)
 		return ruleError(ErrPrevBlockNotBest, str)
 	}
 
@@ -1413,7 +1421,7 @@ func (b *BlockChain) CheckConnectBlockTemplate(block *btcutil.Block) error {
 		return err
 	}
 
-	err = b.checkBlockContext(block, tip, flags)
+	err = b.checkBlockContext(block, prevNode, flags)
 	if err != nil {
 		return err
 	}
@@ -1421,8 +1429,8 @@ func (b *BlockChain) CheckConnectBlockTemplate(block *btcutil.Block) error {
 	// Leave the spent txouts entry nil in the state since the information
 	// is not needed and thus extra work can be avoided.
 	view := NewUtxoViewpoint()
-	view.SetBestHash(&tip.hash)
-	newNode := newBlockNode(&header, tip)
+	view.SetBestHash(&prevNode.hash)
+	newNode := newBlockNode(&header, prevNode)
 	return b.checkConnectBlock(newNode, block, view, nil)
 }
 
