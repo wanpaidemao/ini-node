@@ -141,6 +141,21 @@ const (
 	// The window is deliberately much larger than blockSliceStallTimeout so a
 	// merely slow peer is never misjudged.
 	blockUnavailableTimeout = 10 * time.Minute
+
+	// maxFabricatedRollbacks caps how many times the fabricated-header-chain
+	// rollback may target the same height before it is refused.  The rollback
+	// persists invalid-ancestor marks into the block index, so an unbounded
+	// rollback loop (e.g. a watchdog misjudging a merely slow peer, or peers
+	// re-serving a bogus chain that keeps failing to re-apply) escalates from
+	// a stall into permanent index pollution.  Once the cap is hit the
+	// rollback is refused and an error is logged (rate-limited) so the
+	// operator can intervene instead of the node silently chewing its index.
+	maxFabricatedRollbacks = 5
+
+	// rollbackRefusalLogInterval rate-limits the error logged while the
+	// rollback cap is being enforced, so a hot retry loop (the header front
+	// failing to apply on every blockHandler pass) cannot flood the log.
+	rollbackRefusalLogInterval = time.Minute
 )
 
 // zeroHash is the zero value hash (all zeros).  It is defined as a convenience.
@@ -530,6 +545,17 @@ type SyncManager struct {
 
 	// The following fields are used for the initial block download mode.
 	ibdMode bool
+
+	// fabricatedRollbackCount tracks how many times the fabricated-header
+	// chain rollback has targeted fabricatedRollbackHeight in a row, and
+	// lastRollbackRefusalAt rate-limits the refusal error log while the cap
+	// is being enforced.  A different (higher) rollback height resets the
+	// count, since reaching a new height means the download made progress
+	// after the previous rollback.  Only touched from the blockHandler
+	// goroutine.
+	fabricatedRollbackCount int
+	fabricatedRollbackHeight int32
+	lastRollbackRefusalAt    time.Time
 
 	// suspiciousHeaders remembers the first-header hashes of header ranges
 	// that failed to apply and were rolled back as fabricated or forked, so a
@@ -2990,6 +3016,31 @@ func (sm *SyncManager) rollbackFabricatedHeaderChain() {
 	// block above it is the one that no peer can serve).
 	best := sm.chain.BestSnapshot()
 	rollbackHeight := best.Height
+
+	// 1b. Refuse rollback loops: each rollback persists invalid-ancestor
+	// marks into the block index, so repeatedly rolling back to the same
+	// height without progress does not fix anything -- it only deepens the
+	// index pollution and burns CPU.  A rollback to a new (higher) height
+	// proves the previous rollback worked, so it resets the counter.
+	if rollbackHeight == sm.fabricatedRollbackHeight {
+		sm.fabricatedRollbackCount++
+		if sm.fabricatedRollbackCount > maxFabricatedRollbacks {
+			if time.Since(sm.lastRollbackRefusalAt) >=
+				rollbackRefusalLogInterval {
+				sm.lastRollbackRefusalAt = time.Now()
+				log.Errorf("Refusing to roll back fabricated header "+
+					"chain to height %d again (%d rollbacks without "+
+					"progress) -- the rollback is not solving the "+
+					"problem; suspect the block-side watchdog or the "+
+					"served chain itself, and investigate manually",
+					rollbackHeight, sm.fabricatedRollbackCount)
+			}
+			return
+		}
+	} else {
+		sm.fabricatedRollbackHeight = rollbackHeight
+		sm.fabricatedRollbackCount = 1
+	}
 
 	// 2. Invalidate every header above the rollback height and rebuild the
 	// best-header view from the confirmed block.

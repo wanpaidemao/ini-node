@@ -288,7 +288,17 @@ func (b *BlockChain) maybeAcceptBlockHeader(header *wire.BlockHeader,
 			// block payload as a fabricated chain).  The header itself is
 			// being re-submitted by the download, so clear the flag and
 			// let it re-validate instead of rejecting forever.
-			if b.bestChain.Contains(prevNode) {
+			//
+			// The parent being on the best header chain counts too:
+			// rollbackFabricatedHeaderChain marks the whole header
+			// segment above the connected block tip, and during IBD the
+			// header chain leads the block chain by millions of heights,
+			// so replaying that segment only ever walks parents that are
+			// header nodes.  Requiring a connected parent would leave the
+			// chain unable to recover past one header above the tip -- a
+			// single rollback would deadlock the header download forever.
+			if b.bestChain.Contains(prevNode) ||
+				b.bestHeader.Contains(prevNode) {
 				b.index.UnsetStatusFlags(node, statusValidateFailed)
 			} else {
 				str := fmt.Sprintf("block %s is known to be invalid", hash)
@@ -296,9 +306,11 @@ func (b *BlockChain) maybeAcceptBlockHeader(header *wire.BlockHeader,
 			}
 		} else if nodeStatus&statusInvalidAncestor != 0 {
 			// Same stale-mark reasoning: an invalid-ancestor flag whose
-			// parent is already connected on the best chain cannot be
-			// real, clear it and re-validate.
-			if b.bestChain.Contains(prevNode) {
+			// parent is already connected on the best chain (or is part
+			// of the best header chain being replayed after a rollback)
+			// cannot be real, clear it and re-validate.
+			if b.bestChain.Contains(prevNode) ||
+				b.bestHeader.Contains(prevNode) {
 				b.index.UnsetStatusFlags(node, statusInvalidAncestor)
 			} else {
 				str := fmt.Sprintf("block %s has an invalid ancestor", hash)
