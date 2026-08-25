@@ -2247,7 +2247,23 @@ func openDB(dbPath string, network wire.BitcoinNet, create bool) (database.DB, e
 	}
 	ldb, err := leveldb.OpenFile(metadataDbPath, &opts)
 	if err != nil {
-		return nil, convertErr(err.Error(), err)
+		// If the metadata database is corrupted (e.g. the node was killed
+		// mid-write, leaving a torn WAL or manifest), try to recover it
+		// automatically before giving up.  RecoverFile rebuilds the
+		// manifest and replays whatever is salvageable, which avoids a
+		// full resync for the common crash-corruption case.
+		// 若 metadata 数据库损坏(如节点被强杀, WAL/manifest 未写完),
+		// 先自动尝试 RecoverFile 重建, 避免常见崩溃损坏时被迫重新同步。
+		if ldberrors.IsCorrupted(err) {
+			log.Warnf("Metadata database corrupted (%v); attempting automatic recovery...", err)
+			ldb, err = leveldb.RecoverFile(metadataDbPath, &opts)
+			if err != nil {
+				return nil, convertErr(err.Error(), err)
+			}
+			log.Warnf("Metadata database recovered via leveldb.RecoverFile")
+		} else {
+			return nil, convertErr(err.Error(), err)
+		}
 	}
 
 	// Create the block store which includes scanning the existing flat

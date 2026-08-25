@@ -5,7 +5,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -20,6 +22,8 @@ import (
 	"github.com/btcsuite/btcd/database"
 	"github.com/btcsuite/btcd/limits"
 	"github.com/btcsuite/btcd/ossec"
+	"github.com/syndtr/goleveldb/leveldb"
+	ldberrors "github.com/syndtr/goleveldb/leveldb/errors"
 )
 
 const (
@@ -266,10 +270,39 @@ func btcdMain(serverChan chan<- *server) error {
 	server, err := newServer(cfg.Listeners, cfg.AgentBlacklist,
 		cfg.AgentWhitelist, db, activeNetParams.Params, interrupt)
 	if err != nil {
-		// TODO: this logging could do with some beautifying.
-		btcdLog.Errorf("Unable to start server on %v: %v",
-			cfg.Listeners, err)
-		return err
+		// If the failure looks like database corruption (e.g. the node
+		// was killed mid-write, leaving a torn WAL/manifest), attempt to
+		// recover the metadata LevelDB and retry startup once before
+		// giving up.
+		// 若启动失败疑似数据库损坏(如节点被强杀, WAL/manifest 未写完),
+		// 先自动恢复 metadata LevelDB 并重试启动一次, 避免被迫重新同步。
+		if isCorruptionError(err) {
+			btcdLog.Errorf("Startup failed with database corruption error: %v; "+
+				"attempting automatic recovery...", err)
+			db.Close()
+			if rerr := recoverMetadataDB(); rerr != nil {
+				btcdLog.Errorf("Automatic metadata recovery failed: %v", rerr)
+				btcdLog.Errorf("Unable to start server on %v: %v",
+					cfg.Listeners, err)
+				return err
+			}
+			db, err = loadBlockDB()
+			if err != nil {
+				return err
+			}
+			server, err = newServer(cfg.Listeners, cfg.AgentBlacklist,
+				cfg.AgentWhitelist, db, activeNetParams.Params, interrupt)
+			if err != nil {
+				btcdLog.Errorf("Unable to start server on %v: %v",
+					cfg.Listeners, err)
+				return err
+			}
+		} else {
+			// TODO: this logging could do with some beautifying.
+			btcdLog.Errorf("Unable to start server on %v: %v",
+				cfg.Listeners, err)
+			return err
+		}
 	}
 	defer func() {
 		btcdLog.Infof("Gracefully shutting down the server...")
@@ -359,6 +392,44 @@ func warnMultipleDBs() {
 			"additional database is located at %v", selectedDbPath,
 			duplicateDbPaths)
 	}
+}
+
+// isCorruptionError returns true when the given error indicates database
+// corruption, e.g. a torn WAL or manifest left behind by a killed node.
+// 判断错误是否为数据库损坏特征(如强杀后 WAL/manifest 未写完)。
+func isCorruptionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Explicit database corruption error (checksum failure, etc).
+	var dbErr database.Error
+	if errors.As(err, &dbErr) && dbErr.ErrorCode == database.ErrCorruption {
+		return true
+	}
+	// LevelDB corruption error.
+	if ldberrors.IsCorrupted(err) {
+		return true
+	}
+	// A raw EOF while reading the block index is the classic symptom of a
+	// torn read after a crash.
+	return errors.Is(err, io.EOF)
+}
+
+// recoverMetadataDB attempts to repair the metadata LevelDB (block index)
+// using goleveldb's RecoverFile, which rebuilds the manifest and recovers as
+// much data as possible.  It is only invoked when startup failed with a
+// corruption error, as a last resort before forcing a full resync.
+// 用 goleveldb.RecoverFile 重建损坏的 metadata LevelDB(block index)。
+func recoverMetadataDB() error {
+	dbPath := blockDbPath(cfg.DbType)
+	metadataDbPath := filepath.Join(dbPath, "metadata")
+	btcdLog.Infof("Attempting automatic recovery of metadata database at %q", metadataDbPath)
+	ldb, err := leveldb.RecoverFile(metadataDbPath, nil)
+	if err != nil {
+		return err
+	}
+	btcdLog.Infof("Metadata database recovered successfully")
+	return ldb.Close()
 }
 
 // loadBlockDB loads (or creates when needed) the block database taking into

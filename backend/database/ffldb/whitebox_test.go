@@ -703,3 +703,78 @@ func TestFailureScenarios(t *testing.T) {
 	// Test various corruption scenarios.
 	testCorruption(tc)
 }
+
+// TestRecoverCorruptedMetadataDB ensures that a metadata LevelDB with a torn
+// manifest (e.g. left behind by a killed node) is automatically recovered on
+// open instead of failing.  This mirrors the openDB auto-recover path wired
+// for crash-recovery.
+// 验证 metadata LevelDB 的 manifest 被损坏(如节点被强杀)后, openDB 会自动
+// RecoverFile 恢复而不是启动失败。
+func TestRecoverCorruptedMetadataDB(t *testing.T) {
+	t.Parallel()
+
+	dbPath := filepath.Join(t.TempDir(), "ffldb-recover")
+	_ = os.RemoveAll(dbPath)
+
+	// Create a fresh database and store a value so we can verify it
+	// survives the recovery.
+	idb, err := openDB(dbPath, blockDataNet, true)
+	if err != nil {
+		t.Fatalf("openDB (create): %v", err)
+	}
+	err = idb.Update(func(tx database.Tx) error {
+		meta := tx.Metadata()
+		b, err := meta.CreateBucket([]byte("recover-test"))
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte("k"), []byte("v"))
+	})
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	idb.Close()
+
+	// Simulate a torn manifest by deleting all MANIFEST-* files inside the
+	// metadata database.  leveldb.OpenFile will then fail with a
+	// corruption error and openDB must transparently recover via
+	// leveldb.RecoverFile.
+	metadataPath := filepath.Join(dbPath, metadataDbName)
+	manifests, err := filepath.Glob(filepath.Join(metadataPath, "MANIFEST-*"))
+	if err != nil {
+		t.Fatalf("glob MANIFEST-*: %v", err)
+	}
+	if len(manifests) == 0 {
+		t.Fatalf("no MANIFEST-* files found under %s", metadataPath)
+	}
+	for _, m := range manifests {
+		if err := os.Remove(m); err != nil {
+			t.Fatalf("remove manifest %s: %v", m, err)
+		}
+	}
+
+	// Reopening must automatically recover instead of returning an error.
+	idb, err = openDB(dbPath, blockDataNet, false)
+	if err != nil {
+		t.Fatalf("openDB after manifest corruption should auto-recover, "+
+			"got error: %v", err)
+	}
+	defer idb.Close()
+	defer os.RemoveAll(dbPath)
+
+	// The previously stored value must still be readable after recovery.
+	err = idb.View(func(tx database.Tx) error {
+		meta := tx.Metadata()
+		b := meta.Bucket([]byte("recover-test"))
+		if b == nil {
+			return fmt.Errorf("bucket recover-test missing after recovery")
+		}
+		if got := b.Get([]byte("k")); string(got) != "v" {
+			return fmt.Errorf("got value %q, want %q", got, "v")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("View after recovery: %v", err)
+	}
+}
