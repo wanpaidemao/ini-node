@@ -1334,6 +1334,69 @@ func (sm *SyncManager) handleStallSample() {
 		}
 	}
 
+	// Detect a best-chain tip that is not the main-chain block at its own
+	// height.  A locally-mined block that no peer's chain contains can be
+	// persisted as the best-chain tip (and best-tip snapshot): after a
+	// restart the connected chain then diverges from the header chain at
+	// that height, and every main-chain block above it arrives as an orphan
+	// forever -- the block download stalls at the divergent tip while
+	// headers keep advancing (observed: best-chain tip a23e7e62 vs
+	// main-chain 44060189 b345517e, 2838 orphans, 0.00 bl/s).  The DB
+	// height index still points at the real main-chain hash, so compare the
+	// tip against it and roll back immediately instead of waiting for the
+	// 10-minute P4 timer.
+	// 检测 best chain tip 不是其自身高度上的主链块。本地挖出、无对等点主链
+	// 包含的块可能被持久化为 best-chain tip(及 best-tip 快照):重启后连接链
+	// 在该高度与 header 链分叉,其上所有主链块永远以孤儿到达——block 下载在
+	// 分歧 tip 处卡死而 header 持续前进(实测:best-chain tip a23e7e62 vs
+	// 主链 44060189 b345517e,2838 个孤儿,0.00 bl/s)。DB 高度索引仍指向真实
+	// 主链 hash,因此把 tip 与它比较,不一致立即回滚,而不是等 10 分钟 P4。
+	if sm.headerSync != nil {
+		bestTip := sm.chain.BestSnapshot()
+		if dbHash, err := sm.chain.MainChainHashByHeight(bestTip.Height); err == nil &&
+			!dbHash.IsEqual(&bestTip.Hash) {
+			log.Warnf("Best chain tip %v (height %d) is not the main-chain "+
+				"block %v -- fabricated/forked tip persisted, rolling back "+
+				"early", bestTip.Hash, bestTip.Height, dbHash)
+			sm.rollbackFabricatedHeaderChain()
+		}
+	}
+
+	// Second divergence detector, for the case where the DB height index was
+	// itself rebuilt from the polluted chain (so the check above sees equal
+	// hashes and cannot fire): compare the best-chain tip height against the
+	// height advertised by the sync peer.  The peer's advertised height comes
+	// from the network and cannot be polluted by a local fork, so when the
+	// local tip sits far below it AND the block download has not advanced for
+	// a short while, the local tip is almost certainly not on the real main
+	// chain -- roll back early instead of waiting for the 10-minute P4 timer.
+	// 第二重分叉检测,针对 DB 高度索引本身被污染链重建的情况(上面按 hash 的
+	// 检测会因两值相等而无法触发):把 best chain tip 高度与同步对等点通告的
+	// 高度比较。对等点通告高度来自网络,不可能被本地分叉污染,因此当本地 tip
+	// 远低于它、且 block 下载短暂停滞时,本地 tip 几乎肯定不在真实主链上——
+	// 提前回滚,而不是等 10 分钟 P4。
+	if sm.headerSync != nil && sm.syncPeer != nil {
+		bestTip := sm.chain.BestSnapshot()
+		peerHeight := sm.syncPeer.LastBlock()
+		if peerHeight < sm.syncPeer.StartingHeight() {
+			peerHeight = sm.syncPeer.StartingHeight()
+		}
+		// Only fire once the download has demonstrably stalled (the front
+		// height has not moved for over a minute), so a normal catch-up that
+		// is merely behind the peer is not mistaken for a fork.
+		// 仅当下载确实停滞(front 高度超过一分钟未推进)才触发,避免把正常
+		// 追赶(只是落后于对等点)误判为分叉。
+		stalled := bestTip.Height == sm.blockMissingHeight &&
+			time.Since(sm.blockMissingSince) > time.Minute
+		if peerHeight > bestTip.Height && stalled {
+			log.Warnf("Best chain tip (height %d) is %d blocks behind the "+
+				"sync peer (height %d) with the download stalled -- "+
+				"fabricated/forked tip suspected, rolling back early",
+				bestTip.Height, peerHeight-bestTip.Height, peerHeight)
+			sm.rollbackFabricatedHeaderChain()
+		}
+	}
+
 	// Detect a fabricated or forked header chain: the block download has not
 	// advanced for blockUnavailableTimeout.  A real chain's blocks are served
 	// by the network; a forged chain's blocks either do not exist on any peer
