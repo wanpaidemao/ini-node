@@ -66,10 +66,16 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
 	prevHash := &block.MsgBlock().Header.PrevBlock
 	prevNode := b.index.LookupNode(prevHash)
 	if prevNode == nil {
+		// TEMP DEBUG: parent not in memory index -> block becomes orphan.
+		log.Warnf("TEMP-DBG orphan-or-unknown-parent hash=%s prev=%s "+
+			"(parent not in memory index)", block.Hash(), prevHash)
 		str := fmt.Sprintf("previous block %s is unknown", prevHash)
 		return false, ruleError(ErrPreviousBlockUnknown, str)
 	} else if !b.bestChain.Contains(prevNode) &&
 		b.index.NodeStatus(prevNode).KnownInvalid() {
+		// TEMP DEBUG: stale invalid-ancestor flag (spurious rollback).
+		log.Warnf("TEMP-DBG invalid-ancestor hash=%s prev=%s height=%d",
+			block.Hash(), prevHash, prevNode.height)
 		// A block that is on the best chain cannot be invalid: connecting
 		// it validated all of its data, and InvalidateBlock reorgs a
 		// genuinely invalidated block off the chain.  An invalid flag on

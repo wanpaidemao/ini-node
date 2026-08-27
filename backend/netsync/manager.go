@@ -557,6 +557,15 @@ type SyncManager struct {
 	fabricatedRollbackHeight int32
 	lastRollbackRefusalAt    time.Time
 
+	// fabricatedRollbackDepth is how many extra blocks below the best tip the
+	// rollback has dug.  When the best chain tip itself is a locally-mined
+	// block that no peer's main chain contains (or the fork runs deeper than
+	// one block), a rollback to best.Height-1 fails to extend again and the
+	// front keeps failing: each repeated rollback at the same height deepens
+	// the cut by one more block until the download resumes from a height the
+	// network actually shares.  Only touched from the blockHandler goroutine.
+	fabricatedRollbackDepth int32
+
 	// suspiciousHeaders remembers the first-header hashes of header ranges
 	// that failed to apply and were rolled back as fabricated or forked, so a
 	// peer that keeps re-serving the same bogus chain is detected immediately.
@@ -566,7 +575,7 @@ type SyncManager struct {
 
 	// frontUnreachable counts, per front range start height, how many distinct
 	// peers have returned a response that does not extend the range (the
-	// receive-side prev check failed).  When three distinct peers all fail to
+	// receive-side prev check failed).  When two distinct peers both fail to
 	// extend the front, the header chain at that height is almost certainly
 	// fabricated or forked -- roll back early instead of waiting for the slow
 	// 10-minute block-side timer (P4).  Only touched from the blockHandler
@@ -1292,15 +1301,31 @@ func (sm *SyncManager) handleStallSample() {
 		sm.blkDownload()
 	}
 
-	// Fast rollback for an unreachable header front: when three distinct
-	// peers have all returned responses that do not extend the front range,
+	// Fast rollback for an unreachable header front: when two distinct
+	// peers have both returned responses that do not extend the front range,
 	// the header chain at that height is almost certainly fabricated or
 	// forked.  Roll back immediately instead of waiting for the slow
 	// 10-minute block-side timer (P4), so a pollution cycle costs ~1-2
 	// minutes instead of 20+.
 	if sm.headerSync != nil {
 		frontStart := sm.headerSync.nextHeight
-		if peers := sm.frontUnreachable[frontStart]; len(peers) >= 3 {
+		// A peer that returns headers failing the prev-connection test at the
+		// front is a strong signal the local chain has forked below the front
+		// (e.g. a locally-mined block persisted as best-chain tip that no
+		// peer's main chain contains).  Every honest peer's header at
+		// frontStart links to the real main chain, which differs from the
+		// local fork.  Requiring at least two distinct do-not-extend votes
+		// filters the single lagging/forked peer false positive that a lone
+		// divergent peer would otherwise trigger; a sparse network that can
+		// never reach two votes still falls back to the P4 block-side timer,
+		// so the rollback cannot be skipped forever.
+		// 对等点返回的 header 在 front 处未通过 prev 连接校验,是本地链在
+		// front 之下已分叉的强信号(如本地挖出并持久化成 best-chain tip、
+		// 但对等点主链上没有的块)。诚实对等点在 frontStart 的 header 都
+		// 连向真实主链,与本地分叉不同。要求至少两个不同对等点的
+		// do-not-extend 票,过滤单个滞后/分叉对等点造成的误报;始终凑不齐
+		// 两票的稀疏网络仍会回退到 P4 块侧定时器,回滚不可能被永久跳过。
+		if peers := sm.frontUnreachable[frontStart]; len(peers) >= 2 {
 			log.Warnf("Front header range %d unreachable from %d distinct "+
 				"peers -- fabricated/forked header chain, rolling back early",
 				frontStart, len(peers))
@@ -2657,6 +2682,30 @@ func (sm *SyncManager) processReadyHeaderRanges() {
 				log.Warnf("Header range at height %d does not extend the "+
 					"applied chain at %d (or could not be verified) -- "+
 					"discarding and re-issuing", front.start, front.start-1)
+				// Record that this peer could not extend the front, exactly
+				// as handleParallelHeadersMsg does, so a front that keeps
+				// failing here (e.g. the local best chain has diverged from
+				// the peers' real main chain and the applied height maps to
+				// the wrong hash) accumulates enough votes to trigger the
+				// early rollback in handleStallSample.  Without this the
+				// range is discarded and re-issued forever and the header
+				// download deadlocks.
+				if front.start == hs.nextHeight {
+					if sm.frontUnreachable == nil {
+						sm.frontUnreachable = make(map[int32]map[string]time.Time)
+					}
+					peers := sm.frontUnreachable[front.start]
+					if peers == nil {
+						peers = make(map[string]time.Time)
+						sm.frontUnreachable[front.start] = peers
+					}
+					peers[front.peer.Addr()] = time.Now()
+					for addr, t := range peers {
+						if time.Since(t) > 5*time.Minute {
+							delete(peers, addr)
+						}
+					}
+				}
 				delete(hs.ranges, front.start)
 				delete(hs.peerRange, front.peer)
 				sm.reissueHeaderRange(front.peer, front.start)
@@ -3012,17 +3061,61 @@ func (sm *SyncManager) abortHeaderSync() {
 // is invalidated, all in-flight header/block state is discarded, and the sync
 // restarts from the confirmed height.
 func (sm *SyncManager) rollbackFabricatedHeaderChain() {
-	// 1. Determine the rollback height: the last connected block (the front
-	// block above it is the one that no peer can serve).
+	// 1. Determine the rollback height.  The best chain tip itself can be the
+	// bogus block (a locally-mined block persisted as best-chain tip that no
+	// peer's main chain contains): rolling back to best.Height would keep that
+	// block as the confirmed root and the header front would fail to extend it
+	// again.  Roll back one block below the tip so the offending tip (and any
+	// headers above it) is invalidated and the download resumes from the last
+	// block the network actually shares.  When the fork runs deeper than one
+	// block, the repeated rollbacks at the same height deepen the cut by one
+	// more block each time (fabricatedRollbackDepth) until the front can
+	// extend again.
+	// 1. 确定回滚高度。best chain tip 本身可能就是伪造块(本地挖出并持久化成
+	// best-chain tip、但对等点主链上没有的块):回滚到 best.Height 会把这个块
+	// 保留为确认根,header front 又会因为无法扩展它而再次失败。回滚到 tip 之
+	// 下一块,让有问题的 tip(及其上的 header)失效,从网络真正共享的最后一个
+	// 块继续下载。当分叉深于一块时,同一高度的重复回滚会每次加深一刀
+	// (fabricatedRollbackDepth),直到 front 能再次扩展。
 	best := sm.chain.BestSnapshot()
-	rollbackHeight := best.Height
-
-	// 1b. Refuse rollback loops: each rollback persists invalid-ancestor
-	// marks into the block index, so repeatedly rolling back to the same
-	// height without progress does not fix anything -- it only deepens the
-	// index pollution and burns CPU.  A rollback to a new (higher) height
-	// proves the previous rollback worked, so it resets the counter.
-	if rollbackHeight == sm.fabricatedRollbackHeight {
+	// The rollback target without any accumulated depth: one block below the
+	// tip, so the offending tip itself is invalidated.  The progress check
+	// below uses this un-cut target, so a tip that advanced past the last
+	// rollback point resets the deepening even when depth > 0, instead of
+	// requiring the tip to first advance `depth` extra blocks.
+	// 不含累积深度的回滚目标:tip 下一块,让有问题的 tip 本身失效。下面的
+	// 进展判定用这个未加深的 target,因此只要 tip 越过上次回滚点就重置
+	// 加深——即使 depth > 0 也立即重置,而不是要求 tip 先额外前进 depth 块。
+	target := best.Height - 1
+	if target < 0 {
+		target = 0
+	}
+	rollbackHeight := target - sm.fabricatedRollbackDepth
+	if rollbackHeight < 0 {
+		rollbackHeight = 0
+	}
+	// The tip advanced past the last rollback point: the previous rollback
+	// worked and the download made progress, so any deepening accumulated
+	// during the stall no longer applies.  Reset it or the next stall would
+	// cut far deeper than needed.
+	// tip 已前进超过上次回滚点:上次回滚生效、下载取得进展,卡死期间累积的
+	// 加深不再适用。重置它,否则下次卡死会切得过深。
+	if target > sm.fabricatedRollbackHeight {
+		sm.fabricatedRollbackDepth = 0
+		sm.fabricatedRollbackCount = 0
+		rollbackHeight = target
+	} else {
+		// No progress since the last rollback: the same (or a deeper)
+		// height is being targeted again.  Deepen the cut by one block so a
+		// locally-mined tip that no peer shares (or a deeper fork) is
+		// eventually cut through, but refuse after maxFabricatedRollbacks
+		// consecutive attempts so a pathological cut that can never reach a
+		// shared height cannot chew the index forever.  The counter is NOT
+		// reset here: the refusal must be able to fire.
+		// 距上次回滚无进展:再次命中同一(或更深)高度。把切口加深一块,让
+		// 本地挖出、无对等点共享的 tip(或更深的分叉)最终被切穿,但连续
+		// maxFabricatedRollbacks 次无进展后拒绝,防止永远切不到共享高度的
+		// 病态切口永久啃咬索引。此处**不**重置计数:熔断必须能触发。
 		sm.fabricatedRollbackCount++
 		if sm.fabricatedRollbackCount > maxFabricatedRollbacks {
 			if time.Since(sm.lastRollbackRefusalAt) >=
@@ -3033,14 +3126,25 @@ func (sm *SyncManager) rollbackFabricatedHeaderChain() {
 					"progress) -- the rollback is not solving the "+
 					"problem; suspect the block-side watchdog or the "+
 					"served chain itself, and investigate manually",
-					rollbackHeight, sm.fabricatedRollbackCount)
+					target, sm.fabricatedRollbackCount)
 			}
+			// Leave the chain state untouched and let the stall
+			// handler keep the node operational; an operator can
+			// intervene instead of the node silently chewing its
+			// index.
+			// 保持链状态不变,由卡死处理器维持节点运行;由操作员
+			// 介入,而不是节点默默啃咬索引。
 			return
 		}
-	} else {
-		sm.fabricatedRollbackHeight = rollbackHeight
-		sm.fabricatedRollbackCount = 1
+		sm.fabricatedRollbackDepth++
+		rollbackHeight = target - sm.fabricatedRollbackDepth
+		if rollbackHeight < 0 {
+			rollbackHeight = 0
+		}
+		log.Warnf("Deepening fabricated-header rollback to height %d "+
+			"(depth %d)", rollbackHeight, sm.fabricatedRollbackDepth)
 	}
+	sm.fabricatedRollbackHeight = rollbackHeight
 
 	// 2. Invalidate every header above the rollback height and rebuild the
 	// best-header view from the confirmed block.
@@ -3648,6 +3752,8 @@ out:
 			case processBlockMsg:
 				_, isOrphan, err := sm.chain.ProcessBlock(
 					msg.block, msg.flags)
+				// TEMP DEBUG: trace block processing outcome / 临时调试
+				log.Warnf("TEMP-DBG ProcessBlock hash=%s orphan=%v err=%v", msg.block.Hash(), isOrphan, err)
 				if err != nil {
 					msg.reply <- processBlockResponse{
 						isOrphan: false,
@@ -3702,6 +3808,11 @@ func (sm *SyncManager) handleBlockchainNotification(notification *blockchain.Not
 	case blockchain.NTBlockAccepted:
 		// Don't relay if we are not current. Other peers that are
 		// current should already know about it.
+		// TEMP DEBUG: log the relay gate decision / 临时调试:记录 relay 门控决策
+		block, _ := notification.Data.(*btcutil.Block)
+		if block != nil {
+			log.Warnf("TEMP-DBG NTBlockAccepted hash=%s current=%v (relay gate)", block.Hash(), sm.current())
+		}
 		if !sm.current() {
 			return
 		}
@@ -3714,6 +3825,7 @@ func (sm *SyncManager) handleBlockchainNotification(notification *blockchain.Not
 
 		// Generate the inventory vector and relay it.
 		iv := wire.NewInvVect(wire.InvTypeBlock, block.Hash())
+		log.Warnf("TEMP-DBG relaying block inv %s", block.Hash())
 		sm.peerNotifier.RelayInventory(iv, block.MsgBlock().Header)
 
 	// A block has been connected to the main block chain.

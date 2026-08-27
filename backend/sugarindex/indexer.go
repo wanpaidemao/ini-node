@@ -2,6 +2,7 @@ package sugarindex
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -161,13 +162,13 @@ func (m *Manager) Init(chain *blockchain.BlockChain,
 
 	// Rebuild batching: accumulate up to rebuildBatchBlocks blocks into one
 	// leveldb batch before writing, cutting the number of write transactions
-	// (and fsyncs) ~100x during the initial catch-up.  The tip is stored with
-	// each flush so an interrupted rebuild resumes from the last flushed
-	// height instead of redoing the whole chain.
+	// ~1000x during the initial catch-up.  The tip is stored with each flush
+	// so an interrupted rebuild resumes from the last flushed height instead
+	// of redoing the whole chain.
 	// 批量重建:每 rebuildBatchBlocks 块合并为一次 leveldb 写入,将初始追赶
-	// 期间的写事务(及 fsync)次数降低约 100 倍;每次落盘同时记录尖点,中断后
-	// 从上次落盘高度继续,无需整链重来。
-	const rebuildBatchBlocks = 100
+	// 期间的写事务次数降低约 1000 倍;每次落盘同时记录尖点,中断后从上次落盘
+	// 高度继续,无需整链重来。
+	const rebuildBatchBlocks = 1024
 
 	log.Infof("Sugar index catching up from height %d to %d",
 		tipHeight+1, bestHeight)
@@ -175,9 +176,15 @@ func (m *Manager) Init(chain *blockchain.BlockChain,
 	// Parallel read-ahead.  BlockByHeight + FetchSpendJournal are the rebuild
 	// bottleneck (random reads from the main DB), so run several workers to
 	// fetch blocks/spent-journals ahead of the writer, then merge results in
-	// height order so the write side stays strictly sequential.
+	// height order so the write side stays strictly sequential.  The worker
+	// count is deliberately modest: with bulk linear block reads the disk is
+	// the bottleneck (observed 450-670% disk time on NVMe), and more
+	// concurrent readers only deepen the queue and starve other processes;
+	// 4 workers still saturate the disk with the batched reads.
 	// 并行预读:主库随机读(BlockByHeight+FetchSpendJournal)是重建瓶颈,用多个
-	// worker 提前读取,再按高度顺序合并,写入保持串行。
+	// worker 提前读取,再按高度顺序合并,写入保持串行。worker 数量刻意保守:
+	// 使用批量线性读后磁盘成为瓶颈(NVMe 上实测 450-670% 磁盘时间),更多并发
+	// 读者只会加深队列并饿死其他进程;4 个 worker 配合批量读已能打满磁盘。
 	const rebuildReadWorkers = 4
 
 	type fetchResult struct {
@@ -202,7 +209,21 @@ func (m *Manager) Init(chain *blockchain.BlockChain,
 			// them in height order, so out-of-order emission is fine.
 			// 批量读 spend journal:每 fetchBatchBlocks 块一次数据库视图读取,
 			// 摊薄每块读事务开销;结果仍按块发出,由消费端按高度顺序合并。
-			const fetchBatchBlocks = 128
+			//
+			// The block reads themselves are also batched: a worker collects
+			// fetchBatchBlocks heights and fetches them in one
+			// BlocksByHeights call, so the underlying ffldb FetchBlocks sorts
+			// the block-file accesses by filenum:offset and reads them
+			// linearly instead of issuing one random access per block (the
+			// 44M-block catch-up is read-bound).  Heights that fail (block
+			// not downloaded yet, or not on the main chain) are emitted as
+			// error results and skipped by the consumer.
+			// 块读取本身也批量:worker 收集 fetchBatchBlocks 个高度后用一次
+			// BlocksByHeights 调用获取,底层 ffldb FetchBlocks 会按
+			// filenum:offset 对块文件访问排序并线性读取,而不是每块一次随机
+			// 访问(4400 万块的追赶受读限制)。失败的高度(块尚未下载、或不在
+			// 主链)以错误结果发出,由消费端跳过。
+			const fetchBatchBlocks = 1024
 			var blocks []*btcutil.Block
 			var blockHeights []int32
 
@@ -227,22 +248,45 @@ func (m *Manager) Init(chain *blockchain.BlockChain,
 				return nil
 			}
 
+			// Fetch one batch of heights in bulk, then flush the collected
+			// blocks' spend journals.  Called once the pending height batch
+			// reaches fetchBatchBlocks and once more for the tail.
+			// 批量获取一批高度,然后冲刷已收集块的 spend journal。待处理高度
+			// 达到 fetchBatchBlocks 时调用一次,尾部再调用一次。
+			batchHeights := make([]int32, 0, fetchBatchBlocks)
+			fetchBatch := func() error {
+				if len(batchHeights) == 0 {
+					return nil
+				}
+				blks, errs := chain.BlocksByHeights(batchHeights)
+				for i, h := range batchHeights {
+					if errs[i] != nil {
+						results <- fetchResult{height: h, err: errs[i]}
+						continue
+					}
+					blocks = append(blocks, blks[i])
+					blockHeights = append(blockHeights, h)
+				}
+				batchHeights = batchHeights[:0]
+				if len(blocks) >= fetchBatchBlocks {
+					return flush()
+				}
+				return nil
+			}
+
 			for height := range heights {
 				if interruptRequested(interrupt) {
 					return
 				}
-				block, err := chain.BlockByHeight(height)
-				if err != nil {
-					results <- fetchResult{height: height, err: err}
-					continue
-				}
-				blocks = append(blocks, block)
-				blockHeights = append(blockHeights, height)
-				if len(blocks) >= fetchBatchBlocks {
-					if err := flush(); err != nil {
+				batchHeights = append(batchHeights, height)
+				if len(batchHeights) >= fetchBatchBlocks {
+					if err := fetchBatch(); err != nil {
 						return
 					}
 				}
+			}
+			if err := fetchBatch(); err != nil {
+				return
 			}
 			_ = flush()
 		}()
@@ -270,9 +314,18 @@ func (m *Manager) Init(chain *blockchain.BlockChain,
 	next := tipHeight + 1
 	pending := make(map[int32]fetchResult)
 	for r := range results {
-		if r.err != nil {
-			return r.err
-		}
+		// A failed height is parked in pending like any other so the
+		// strictly-in-order consumer below can decide what to do with it;
+		// skipping it here would wedge `next` forever (pending[next] never
+		// arrives).  ErrBlockNotFound -- a height whose block data has not
+		// been downloaded yet (header-only during the initial catch-up) --
+		// is skipped: the block arrives via the block download and is then
+		// indexed by ConnectBlock.  Any other error aborts the rebuild.
+		// 失败的高度与其他结果一样放入 pending,由下面严格按顺序的消费循环
+		// 决定如何处理;在此跳过会让 `next` 永远卡住(pending[next] 永不出现)。
+		// ErrBlockNotFound——block 数据尚未下载的高度(初始追赶期间的
+		// header-only 高度)——跳过:block 会随块下载到达,再由 ConnectBlock
+		// 补索引。其他错误中止重建。
 		pending[r.height] = r
 
 		// Consume strictly in height order.
@@ -280,6 +333,38 @@ func (m *Manager) Init(chain *blockchain.BlockChain,
 			cur, ok := pending[next]
 			if !ok {
 				break
+			}
+			if cur.err != nil {
+				var dbErr database.Error
+				if errors.As(cur.err, &dbErr) &&
+					dbErr.ErrorCode == database.ErrBlockNotFound {
+					// Block data not on disk yet: skip this height and keep
+					// rebuilding; ConnectBlock indexes it when the block
+					// arrives.  Missing the block must not abort startup.
+					// block 数据尚未落盘:跳过该高度继续重建;block 到达时由
+					// ConnectBlock 补索引。缺块不能中止启动。
+					log.Debugf("Sugar index: skipping height %d (block %v "+
+						"not on disk yet)", next, cur.err)
+					delete(pending, next)
+					next++
+					continue
+				}
+				if blockchain.IsNotInMainChainErr(cur.err) {
+					// The height is not on the main chain (no block at that
+					// height exists yet -- it may sit above the connected tip
+					// or on a discarded fork).  Same treatment: skip it and
+					// let ConnectBlock index the block when it lands on the
+					// main chain.
+					// 该高度不在主链上(该高度还没有块——可能在已连接 tip
+					// 之上,或在被丢弃的分叉上)。同样处理:跳过,等块落在主链
+					// 上时由 ConnectBlock 补索引。
+					log.Debugf("Sugar index: skipping height %d (not on "+
+						"main chain: %v)", next, cur.err)
+					delete(pending, next)
+					next++
+					continue
+				}
+				return cur.err
 			}
 			if err := m.connectBlockBatch(cur.block, cur.stxos, batch); err != nil {
 				return err

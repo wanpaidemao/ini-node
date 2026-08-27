@@ -7,6 +7,7 @@ package blockchain
 
 import (
 	"container/list"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -1314,6 +1315,15 @@ func (b *BlockChain) connectBestChain(node *blockNode, block *btcutil.Block, fla
 	// be resolved (or even recognized) without the materialized ancestors,
 	// so it is rejected rather than risk a walk off the end of the window.
 	verifyForkInWindow := func() error {
+		// First, try to repair any severed parent links from the cold
+		// index so the fork can be resolved even below the in-memory
+		// window boundary.  This mirrors umami (Bitcoin Core), which keeps
+		// the full block index in memory and can always reorganize.  The
+		// repair walks the ancestor chain from the candidate node back
+		// through the whole window, re-linking evicted parents from disk.
+		if b.headerWindow > 0 {
+			b.repairAncestorChain(node, b.headerWindow)
+		}
 		fork := b.bestChain.FindFork(node)
 		if fork == nil || (b.headerWindow > 0 && fork.height < reorgWindowBoundary()) {
 			return ruleError(ErrForkTooOld, fmt.Sprintf(
@@ -2360,12 +2370,115 @@ func (b *BlockChain) InvalidateHeaderChain(rollbackHeight int32) error {
 		b.index.UnsetStatusFlags(n, statusValid)
 	}
 
+	// Compute the cumulative txn count for the rolled-back tip before the
+	// best-header view is rebuilt: subtract the txns of every rolled-back
+	// block from the old snapshot, whose TotalTxns still covers the
+	// fabricated tip.  The walk follows the CONNECTED best chain (not the
+	// best-header chain): a header-only node (no block data in the DB)
+	// contributes nothing, and a block whose header sits on the best-header
+	// chain but was never connected (e.g. its prev never matched -- the
+	// fabricated-chain scenario) is NOT in the snapshot's TotalTxns, so
+	// subtracting it would wrap the unsigned total to a huge value.  Only
+	// blocks that are actually part of the connected chain have their txns
+	// counted in the snapshot, so walking bestChain keeps the subtraction
+	// exact.
+	// 在重建 best-header 视图之前,先计算回退后 tip 的累计交易数:从旧快照
+	// 减去每个被回退块的交易数——旧快照的 TotalTxns 仍覆盖伪造 tip。walk
+	// 跟随**已连接的 best chain**(而非 best-header 链):仅有 header、DB 中
+	// 没有块数据的节点不贡献任何交易数;而 header 在 best-header 链上但
+	// 从未连接的块(如 prev 不匹配——正是伪造链场景)不在快照 TotalTxns 中,
+	// 减去它会令无符号总数回绕成巨大值。只有真正属于连接链的块的交易数才
+	// 被计入快照,因此沿 bestChain walk 可保证减法精确。
+	rollbackTotalTxns := uint64(0)
+	rollbackBlockSize := uint64(0)
+	rollbackBlockWeight := uint64(0)
+	rollbackNumTxns := uint64(0)
+	err := b.db.View(func(dbTx database.Tx) error {
+		b.stateLock.RLock()
+		rollbackTotalTxns = b.stateSnapshot.TotalTxns
+		b.stateLock.RUnlock()
+		for n := b.bestChain.Tip(); n != nil && n.height > rollbackHeight; n = n.parent {
+			blockBytes, err := dbTx.FetchBlock(&n.hash)
+			if err != nil {
+				// Only a missing block is a normal header-only node that
+				// contributes nothing; any other failure (corruption, I/O)
+				// must abort the rollback loudly instead of silently
+				// persisting a wrong TotalTxns.
+				// 只有块缺失(header-only 节点)是正常情况、不贡献交易数;
+				// 其他任何失败(损坏、I/O)都必须大声中止回滚,而不是静默
+				// 持久化错误的 TotalTxns。
+				var dbErr database.Error
+				if errors.As(err, &dbErr) &&
+					dbErr.ErrorCode == database.ErrBlockNotFound {
+					continue
+				}
+				return err
+			}
+			block, err := DBBlockFromBytes(blockBytes, n.hash)
+			if err != nil {
+				return err
+			}
+			rollbackTotalTxns -= uint64(len(block.MsgBlock().Transactions))
+		}
+		// Re-derive the rolled-back tip block's own size/weight/txn metrics.
+		blockBytes, err := dbTx.FetchBlock(&rollbackNode.hash)
+		if err != nil {
+			return err
+		}
+		block, err := DBBlockFromBytes(blockBytes, rollbackNode.hash)
+		if err != nil {
+			return err
+		}
+		serializedBlock, err := block.Bytes()
+		if err != nil {
+			return err
+		}
+		rollbackBlockSize = uint64(len(serializedBlock))
+		rollbackBlockWeight = uint64(GetBlockWeight(block))
+		rollbackNumTxns = uint64(len(block.MsgBlock().Transactions))
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("error rebuilding best state after header "+
+			"rollback to height %d: %v", rollbackHeight, err)
+	}
+
 	// Rebuild the best-header view rooted at the rollback node so the next
 	// header download starts from the confirmed height.  The parent walk in
 	// setTip fills the view's trailing window from the rollback node's own
 	// (still materialized) ancestor chain; heights below its severed boundary
 	// stay nil, which the download does not consult.
 	b.bestHeader = newChainView(rollbackNode)
+
+	// Roll the connected block chain back to the same node.  The header
+	// download and the block download share the best-chain tip as the block
+	// frontier's confirmed root; leaving the fabricated tip in bestChain
+	// (e.g. a locally-mined block that no peer's main chain contains) makes
+	// every real block above it arrive as an orphan whose prev never matches
+	// the fabricated hash, so blocks stop syncing while headers advance
+	// (observed: an orphan flood at the fork tip and a block download frozen
+	// at height 44060190).  Rolling bestChain back lets the re-issued
+	// download reconnect the real chain from the shared height.
+	// 把已连接的 block 链也回退到同一节点。header 下载与 block 下载共享
+	// best-chain tip 作为 block 前沿的确认根;若把伪造 tip 留在 bestChain
+	// (如本地挖出、对等点主链上没有的块),其上的每个真实块到达时都因
+	// prev 不匹配而成为孤儿,区块停止同步而区块头仍在前进(已观察到:分叉
+	// tip 处孤儿洪流、block 下载冻结在高度 44060190)。回退 bestChain 后,
+	// 重新派发的下载能从共享高度重连真实链。
+	b.bestChain.SetTip(rollbackNode)
+
+	// Rebuild the best-block state snapshot for the rolled-back tip.  The
+	// old snapshot still describes the fabricated tip; without this,
+	// BestSnapshot would keep reporting the fabricated height/hash, and the
+	// restarted download would compute its front block from it.
+	// 为回退后的 tip 重建 best-block 状态快照。旧快照仍描述伪造 tip;
+	// 若不重建,BestSnapshot 会继续报告伪造的高度/hash,重启的下载也会
+	// 据此计算其 front block。
+	b.stateLock.Lock()
+	b.stateSnapshot = newBestState(rollbackNode, rollbackBlockSize,
+		rollbackBlockWeight, rollbackNumTxns, rollbackTotalTxns,
+		CalcPastMedianTime(rollbackNode))
+	b.stateLock.Unlock()
 
 	// Purge the stale height→hash rows above the rollback point from the DB
 	// height index.  The header-only nodes above the rollback height were
@@ -2375,19 +2488,39 @@ func (b *BlockChain) InvalidateHeaderChain(rollbackHeight int32) error {
 	// prev check and freezes the header front.  The fresh chain's headers are
 	// re-written to these heights as they are applied (flushDirtyLocked →
 	// dbPutHeightIndex), so deleting them now is safe.
-	if oldHeaderTip > rollbackHeight {
-		err := b.db.Update(func(dbTx database.Tx) error {
+	//
+	// In the same transaction, persist the rolled-back best chain state and
+	// best-tip snapshot.  The in-memory rollback above (bestHeader, bestChain,
+	// stateSnapshot) is lost on restart; without persisting the rolled-back
+	// state the DB still names the fabricated tip (e.g. a23e7e62 at 44060189),
+	// the startup snapshot check fails against it, and the next boot re-runs
+	// the full block-index scan only to land back on the fabricated tip
+	// (observed: repeated "Persisted best-tip snapshot (height 44060189)" full
+	// rebuilds and a permanently stuck fork).  Writing the rollback node now
+	// makes a restart resume from the height the network actually shares.
+	// 在同一个事务中,把回退后的 best chain state 与 best-tip snapshot 持久化。
+	// 上面的内存回退(bestHeader、bestChain、stateSnapshot)在重启后丢失;
+	// 若不持久化回退后的状态,DB 仍指向伪造 tip(如高度 44060189 的
+	// a23e7e62),启动时的 snapshot 校验会失败,下次启动重跑全量 block index
+	// 扫描后仍会落回伪造 tip(已观察到:反复出现 "Persisted best-tip
+	// snapshot (height 44060189)" 的全量重建,分叉永久卡死)。现在写入回滚
+	// 节点,重启即可从网络真正共享的高度恢复。
+	if err := b.db.Update(func(dbTx database.Tx) error {
+		if oldHeaderTip > rollbackHeight {
 			for h := rollbackHeight + 1; h <= oldHeaderTip; h++ {
 				if err := dbRemoveHeightIndex(dbTx, h); err != nil {
 					return err
 				}
 			}
-			return nil
-		})
-		if err != nil {
-			return fmt.Errorf("error purging height index rows above "+
-				"rollback height %d: %v", rollbackHeight, err)
 		}
+		if err := dbPutBestState(dbTx, b.stateSnapshot, rollbackNode.workSum); err != nil {
+			return err
+		}
+		return dbPutBestTipSnapshot(dbTx, &rollbackNode.hash,
+			rollbackNode.height, rollbackNode.workSum)
+	}); err != nil {
+		return fmt.Errorf("error persisting rolled-back chain state after "+
+			"header rollback to height %d: %v", rollbackHeight, err)
 	}
 
 	// Persist the invalidated statuses so a restart keeps the bogus segment

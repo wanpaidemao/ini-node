@@ -3752,7 +3752,11 @@ func handleSubmitBlock(s *rpcServer, cmd interface{}, closeChan <-chan struct{})
 
 	// Process this block using the same rules as blocks coming from other
 	// nodes.  This will in turn relay it to the network like normal.
-	_, err = s.cfg.SyncMgr.SubmitBlock(block, blockchain.BFNone)
+	// TEMP DEBUG: trace submitblock lifecycle / 临时调试:追踪 submitblock 生命周期
+	hdr := block.MsgBlock().Header
+	rpcsLog.Warnf("TEMP-DBG submitblock received hash=%s prev=%s time=%d bits=%08x", block.Hash(), hdr.PrevBlock, hdr.Timestamp.Unix(), hdr.Bits)
+	isOrphan, err := s.cfg.SyncMgr.SubmitBlock(block, blockchain.BFNone)
+	rpcsLog.Warnf("TEMP-DBG submitblock processed hash=%s orphan=%v err=%v", block.Hash(), isOrphan, err)
 	if err != nil {
 		return fmt.Sprintf("rejected: %s", err.Error()), nil
 	}

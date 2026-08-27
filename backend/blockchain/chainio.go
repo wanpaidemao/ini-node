@@ -108,6 +108,19 @@ func isNotInMainChainErr(err error) bool {
 	return ok
 }
 
+// IsNotInMainChainErr reports whether the given error is an
+// errNotInMainChain error, i.e. a block hash or height that is not on the
+// main chain was requested.  Exported so indexers (e.g. sugarindex) can
+// tolerate missing heights during a from-scratch rebuild instead of
+// aborting startup: the block simply has not been downloaded yet and will
+// be indexed by ConnectBlock when it arrives.
+// IsNotInMainChainErr 报告给定错误是否为 errNotInMainChain 错误,即请求了
+// 不在主链上的块 hash 或高度。导出给索引器(如 sugarindex)在从零重建时
+// 容忍缺失高度而不中止启动:该块只是尚未下载,到达时由 ConnectBlock 补索引。
+func IsNotInMainChainErr(err error) bool {
+	return isNotInMainChainErr(err)
+}
+
 // errDeserialize signifies that a problem was encountered when deserializing
 // data.
 type errDeserialize string
@@ -1814,13 +1827,43 @@ func (b *BlockChain) initChainState() error {
 			for ok := cursor.First(); ok; ok = cursor.Next() {
 				header, status, err := deserializeBlockRow(cursor.Value())
 				if err != nil {
-					return err
+					// A single torn row (e.g. a crash mid-write) must not
+					// abort the whole startup.  Log the row's key (height +
+					// hash) and skip it; the block will be re-downloaded and
+					// re-indexed by the sync machinery.
+					// 单条撕裂行(如强杀时写了一半)不应中止整个启动。记录该行
+					// 的 key(高度+hash)并跳过;缺失块由同步机制重新下载索引。
+					key := cursor.Key()
+					keyHeight := int32(-1)
+					var keyHash chainhash.Hash
+					if len(key) >= chainhash.HashSize+4 {
+						keyHeight = int32(binary.BigEndian.Uint32(key[0:4]))
+						copy(keyHash[:], key[4:chainhash.HashSize+4])
+					}
+					log.Warnf("Skipping corrupt block index row "+
+						"(height=%d hash=%s): %v", keyHeight, keyHash, err)
+					i++
+					continue
+				}
+
+				// The row counter i is NOT the block height: the block index
+				// can be missing rows (a torn write dropped the tail), so i
+				// stays far below the window boundary while the real heights
+				// are above it.  Parse the true height from the key and use
+				// it for every height-based decision below.
+				// 行计数 i 不是真实高度:block index 可能缺行(撕裂写丢了尾部),
+				// 导致 i 远低于窗口边界而真实高度在其之上。从 key 解析真实
+				// 高度,下面所有基于高度的判断都用它。
+				rowKey := cursor.Key()
+				rowHeight := int32(-1)
+				if len(rowKey) >= chainhash.HashSize+4 {
+					rowHeight = int32(binary.BigEndian.Uint32(rowKey[0:4]))
 				}
 
 				// Accumulate the work of every row below the header window
 				// boundary, materialized or not, so the running total is correct
 				// at whichever boundary anchor consumes it.
-				if i < headerBoundary {
+				if rowHeight < headerBoundary {
 					if runningWorkSum == nil {
 						runningWorkSum = CalcWork(header.Bits)
 					} else {
@@ -1838,9 +1881,9 @@ func (b *BlockChain) initChainState() error {
 				// the tip) from the in-memory index, since block acceptance
 				// resolves parents only through the in-memory index and never falls
 				// back to the cold-read layer.
-				inChainWindow := i >= chainBoundary &&
-					i <= int32(state.height)+b.index.windowSize
-				inHeaderWindow := i >= headerBoundary
+				inChainWindow := rowHeight >= chainBoundary &&
+					rowHeight <= int32(state.height)+b.index.windowSize
+				inHeaderWindow := rowHeight >= headerBoundary
 				if !inChainWindow && !inHeaderWindow {
 					i++
 					continue
@@ -1859,7 +1902,7 @@ func (b *BlockChain) initChainState() error {
 					// The parent was materialized earlier within the window (a
 					// side chain, or a jump between the connected chain window
 					// and the header window).
-				} else if i == 0 {
+				} else if rowHeight == 0 {
 					// This is the very first row, which must be genesis.
 					blockHash := header.BlockHash()
 					if !blockHash.IsEqual(b.chainParams.GenesisHash) {
@@ -1879,14 +1922,14 @@ func (b *BlockChain) initChainState() error {
 				// and add it to the block index.
 				node := new(blockNode)
 				initBlockNode(node, header, parent)
-				if parent == nil && i > 0 {
+				if parent == nil && rowHeight > 0 {
 					// Seed the boundary anchor with the cumulative work of the
 					// entire chain up to and including this row, and fix its
 					// height since its parent is not materialized.  The work
 					// sum value already allocated by initBlockNode is reused
 					// rather than replaced so it stays recycled through the
 					// block work pool.
-					node.height = i
+					node.height = rowHeight
 					if runningWorkSum != nil {
 						node.workSum = node.workSum.Add(runningWorkSum, node.workSum)
 					}
@@ -1907,8 +1950,37 @@ func (b *BlockChain) initChainState() error {
 		// Set the best chain view and the best header to the stored best state.
 		tip := b.index.LookupNode(&state.hash)
 		if tip == nil {
-			return AssertError(fmt.Sprintf("initChainState: cannot find "+
-				"chain tip %s in block index", state.hash))
+			// TEMP-DBG: dump the load context so we can see why no node was
+			// materialized / why lastNode is nil.
+			log.Warnf("TEMP-DBG tip-missing state.hash=%s state.height=%d "+
+				"useSnapshot=%v lastNodeNil=%v i=%d chainBoundary=%d "+
+				"headerBoundary=%d headerTipHeight=%d",
+				state.hash, state.height, useSnapshot, lastNode == nil, i,
+				chainBoundary, headerBoundary, headerTipHeight)
+			// The stored chain tip row is missing from the block index (e.g.
+			// it was the corrupt row skipped above, or a torn write dropped
+			// it).  Rather than aborting startup, fall back to the highest
+			// node the scan actually materialized (lastNode) and let the
+			// sync machinery re-download and reconnect the missing tail.
+			// Do NOT walk the height index height-by-height here: with a
+			// 44M-block chain that is tens of millions of random LevelDB
+			// reads and stalls startup for hours.
+			// 存储的主链 tip 行在 block index 中缺失(如正是上面跳过的损坏行,
+			// 或撕裂写把它弄丢了)。不要中止启动,直接回退到扫描实际物化的
+			// 最高节点(lastNode),缺失的尾部由同步机制重新下载连接。
+			// 切勿在此逐高度遍历高度索引:44M 块链上那是数千万次随机读,
+			// 会让启动卡死数小时。
+			if lastNode != nil {
+				tip = lastNode
+				log.Warnf("Chain tip %s (height %d) missing from block "+
+					"index; falling back to last materialized node %s "+
+					"(height %d)", state.hash, state.height,
+					lastNode.hash, lastNode.height)
+			}
+			if tip == nil {
+				return AssertError(fmt.Sprintf("initChainState: cannot find "+
+					"chain tip %s in block index", state.hash))
+			}
 		}
 		b.bestChain.SetTip(tip)
 
@@ -2185,6 +2257,101 @@ func blockIndexKey(blockHash *chainhash.Hash, blockHeight uint32) []byte {
 	binary.BigEndian.PutUint32(indexKey[0:4], blockHeight)
 	copy(indexKey[4:chainhash.HashSize+4], blockHash[:])
 	return indexKey
+}
+
+// BlocksByHeights returns the blocks at the given main-chain heights in a
+// single database transaction, so the underlying ffldb FetchBlocks can sort
+// the block-file accesses by filenum:offset and read them linearly instead
+// of issuing one random access per block.  This is used by the sugar index
+// rebuild to cut the 44M-block catch-up from per-block random reads to bulk
+// linear reads.
+//
+// Heights that have no main-chain block are returned as nil entries (with a
+// matching error in errs), so callers can skip them without aborting the
+// whole batch -- e.g. the sugar index rebuild tolerates heights whose block
+// has not been downloaded yet.  The returned slices are parallel to heights.
+//
+// This function is safe for concurrent access.
+// BlocksByHeights 在单个数据库事务中返回给定主链高度的块,使底层 ffldb
+// FetchBlocks 能按 filenum:offset 对块文件访问排序、线性读取,而不是每块
+// 一次随机访问。sugar index 重建用它把 4400 万块的追赶从逐块随机读变成
+// 批量线性读。
+//
+// 没有主链块的高度返回 nil 条目(对应错误在 errs),调用方可跳过而不中止
+// 整批——如 sugar index 重建容忍尚未下载块的高度。返回切片与 heights 平行。
+//
+// 该函数可并发安全调用。
+func (b *BlockChain) BlocksByHeights(heights []int32) ([]*btcutil.Block, []error) {
+	b.chainLock.RLock()
+	defer b.chainLock.RUnlock()
+
+	blocks := make([]*btcutil.Block, len(heights))
+	errs := make([]error, len(heights))
+
+	// First resolve every height to its main-chain hash; heights without a
+	// block (errNotInMainChain) are recorded and skipped.  The hash lookups
+	// are cheap height-index reads; the expensive part (the block bytes) is
+	// done in bulk below.
+	// 先把每个高度解析为主链 hash;没有块的高度(errNotInMainChain)记录后
+	// 跳过。hash 查询是廉价的高度索引读;昂贵部分(块字节)在下面批量完成。
+	hashes := make([]chainhash.Hash, 0, len(heights))
+	indexes := make([]int, 0, len(heights))
+	err := b.db.View(func(dbTx database.Tx) error {
+		for i, h := range heights {
+			hash, herr := dbFetchHashByHeight(dbTx, h)
+			if herr != nil {
+				// Leave the entry nil so the caller skips it.
+				// 保留 nil 条目,由调用方跳过。
+				errs[i] = herr
+				continue
+			}
+			hashes = append(hashes, *hash)
+			indexes = append(indexes, i)
+		}
+		if len(hashes) == 0 {
+			return nil
+		}
+		rawBlocks, ferr := dbTx.FetchBlocks(hashes)
+		if ferr != nil {
+			// A bulk read failed -- almost certainly a missing block
+			// somewhere in the batch.  Fall back to per-block reads so the
+			// missing heights are reported individually and the present
+			// blocks are still returned.
+			// 批量读失败——几乎肯定是批中某处缺块。回退到逐块读,让缺失
+			// 高度被单独报告,存在的块仍被返回。
+			for j := range hashes {
+				raw, pErr := dbTx.FetchBlock(&hashes[j])
+				if pErr != nil {
+					errs[indexes[j]] = pErr
+					continue
+				}
+				block, dErr := DBBlockFromBytes(raw, hashes[j])
+				if dErr != nil {
+					return dErr
+				}
+				block.SetHeight(heights[indexes[j]])
+				blocks[indexes[j]] = block
+			}
+			return nil
+		}
+		for j, raw := range rawBlocks {
+			block, dErr := DBBlockFromBytes(raw, hashes[j])
+			if dErr != nil {
+				return dErr
+			}
+			block.SetHeight(heights[indexes[j]])
+			blocks[indexes[j]] = block
+		}
+		return nil
+	})
+	if err != nil {
+		for i := range errs {
+			if errs[i] == nil {
+				errs[i] = err
+			}
+		}
+	}
+	return blocks, errs
 }
 
 // BlockByHeight returns the block at the given height in the main chain.

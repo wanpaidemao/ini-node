@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -42,6 +43,7 @@ import (
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/decred/dcrd/lru"
+	"github.com/syndtr/goleveldb/leveldb"
 )
 
 const (
@@ -3040,7 +3042,27 @@ func setupRPCListeners() ([]net.Listener, error) {
 // connections from peers.
 func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 	db database.DB, chainParams *chaincfg.Params,
-	interrupt <-chan struct{}) (*server, error) {
+	interrupt <-chan struct{}) (retServer *server, retErr error) {
+
+	// sugarIndex tracks the sugar index handle so the error-path defer below
+	// can close it even when the function returns (nil, err) -- every failure
+	// path returns a nil server, so checking retServer would never fire.
+	// The sugar index LevelDB is opened partway through construction (below).
+	// If any later step fails, the open handle would leak and hold the index
+	// directory lock; the automatic metadata-recovery retry in btcd.go would
+	// then fail to reopen it with "being used by another process" and the node
+	// would crash on every startup.  Close it on the error path only -- a
+	// successful return hands ownership to the server, whose Stop() closes it.
+	// sugar index 的 LevelDB 在构造中途打开;若后续步骤失败,泄漏的句柄会占住
+	// index 目录锁,导致 btcd.go 的 metadata 自动恢复重试时 "being used by
+	// another process" 而每次启动即闪退。仅在出错返回时关闭;成功返回时由
+	// server.Stop() 负责关闭。
+	var sugarIndex *sugarindex.Manager
+	defer func() {
+		if retErr != nil && sugarIndex != nil {
+			_ = sugarIndex.Close()
+		}
+	}()
 
 	services := defaultServices
 	if cfg.NoPeerBloomFilters {
@@ -3148,12 +3170,50 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 	// deliberately replaces btcd's native indexes when enabled (they are not
 	// byte-compatible with umami and would only waste CPU/memory/disk).
 	if cfg.SugarIndex {
+		indexPath := filepath.Join(cfg.DataDir, "index")
 		var siErr error
-		s.sugarIndex, siErr = sugarindex.NewManager(
-			filepath.Join(cfg.DataDir, "index"))
+		s.sugarIndex, siErr = sugarindex.NewManager(indexPath)
+		if siErr != nil && isCorruptionError(siErr) {
+			// The sugar index LevelDB is corrupted (e.g. a torn write after a
+			// killed node).  The metadata auto-recovery in btcd.go only covers
+			// the block-index metadata DB, so a corrupted index file would
+			// crash every startup forever ("Unable to start server ... bad
+			// magic number").  Recover it here the same way: rebuild the
+			// manifest with goleveldb.RecoverFile; if that also fails, back up
+			// the whole directory aside and recreate the index from scratch
+			// (Init rebuilds it incrementally from the chain).
+			// sugar index LevelDB 损坏(如强杀后的撕裂写)。btcd.go 的 metadata
+			// 自动恢复只覆盖 block-index 的 metadata DB,损坏的 index 文件会让
+			// 每次启动永远闪退("Unable to start server ... bad magic
+			// number")。在此同样方式恢复:用 goleveldb.RecoverFile 重建
+			// manifest;若仍失败,把整个目录备份到一边,从零重建 index
+			// (Init 会从链上增量重建)。
+			srvrLog.Warnf("Sugar index open failed with corruption (%v); "+
+				"attempting automatic recovery", siErr)
+			if ldb, rerr := leveldb.RecoverFile(indexPath, nil); rerr == nil {
+				srvrLog.Infof("Sugar index database recovered successfully")
+				_ = ldb.Close()
+				s.sugarIndex, siErr = sugarindex.NewManager(indexPath)
+			} else {
+				srvrLog.Warnf("Sugar index recovery failed (%v); backing "+
+					"up corrupted index and rebuilding from scratch", rerr)
+				backupPath := fmt.Sprintf("%s.corrupt", indexPath)
+				if berr := os.RemoveAll(backupPath); berr != nil {
+					return nil, berr
+				}
+				if berr := os.Rename(indexPath, backupPath); berr != nil {
+					return nil, berr
+				}
+				s.sugarIndex, siErr = sugarindex.NewManager(indexPath)
+			}
+		}
 		if siErr != nil {
 			return nil, siErr
 		}
+		// Mirror the handle into the local variable so the error-path defer
+		// above can close it if a later construction step fails.
+		// 把句柄镜像到局部变量,后续构造失败时上面的 defer 才能关闭它。
+		sugarIndex = s.sugarIndex
 		sugarindex.UseLogger(indxLog)
 		indexManager = s.sugarIndex
 	}
@@ -3170,21 +3230,63 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 	}
 
 	// Create a new block chain instance with the appropriate configuration.
+	// If the sugar index LevelDB is corrupted, IndexManager.Init fails with a
+	// corruption error while wiping/rebuilding the index; back the corrupted
+	// directory up and retry once with a fresh index (Init rebuilds it from
+	// the chain).  Without this every startup crashes forever.
+	// 创建区块链实例。若 sugar index LevelDB 损坏,IndexManager.Init 在
+	// wipe/rebuild 阶段会以 corruption 错误失败;把损坏目录备份后换全新
+	// index 重试一次(Init 会从链上重建)。否则每次启动都会永远闪退。
 	var err error
-	s.chain, err = blockchain.New(&blockchain.Config{
-		DB:               s.db,
-		Interrupt:        interrupt,
-		ChainParams:      s.chainParams,
-		Checkpoints:      checkpoints,
-		TimeSource:       s.timeSource,
-		SigCache:         s.sigCache,
-		IndexManager:     indexManager,
-		HashCache:        s.hashCache,
-		Prune:            cfg.Prune * 1024 * 1024,
-		UtxoCacheMaxSize: uint64(cfg.UtxoCacheMaxSizeMiB) * 1024 * 1024,
-		SugarIndexDir:    filepath.Join(cfg.DataDir, "index"),
-		HeaderWindow:     cfg.HeaderWindow,
-	})
+	newChain := func() error {
+		var cerr error
+		s.chain, cerr = blockchain.New(&blockchain.Config{
+			DB:               s.db,
+			Interrupt:        interrupt,
+			ChainParams:      s.chainParams,
+			Checkpoints:      checkpoints,
+			TimeSource:       s.timeSource,
+			SigCache:         s.sigCache,
+			IndexManager:     indexManager,
+			HashCache:        s.hashCache,
+			Prune:            cfg.Prune * 1024 * 1024,
+			UtxoCacheMaxSize: uint64(cfg.UtxoCacheMaxSizeMiB) * 1024 * 1024,
+			SugarIndexDir:    filepath.Join(cfg.DataDir, "index"),
+			HeaderWindow:     cfg.HeaderWindow,
+		})
+		return cerr
+	}
+	err = newChain()
+	if err != nil && cfg.SugarIndex && isCorruptionError(err) {
+		// Close the sugar index handle opened earlier, back the corrupted
+		// directory up, and recreate it from scratch before retrying.
+		// 先关闭前面打开的 sugar index 句柄,备份损坏目录,从零重建后再重试。
+		srvrLog.Warnf("Chain init failed with corruption (%v); backing up "+
+			"corrupted sugar index and retrying with a fresh one", err)
+		if s.sugarIndex != nil {
+			_ = s.sugarIndex.Close()
+			s.sugarIndex = nil
+			sugarIndex = nil
+		}
+		indexPath := filepath.Join(cfg.DataDir, "index")
+		backupPath := indexPath + ".corrupt"
+		if berr := os.RemoveAll(backupPath); berr != nil {
+			return nil, berr
+		}
+		if berr := os.Rename(indexPath, backupPath); berr != nil {
+			return nil, berr
+		}
+		var siErr error
+		s.sugarIndex, siErr = sugarindex.NewManager(indexPath)
+		if siErr != nil {
+			return nil, siErr
+		}
+		sugarIndex = s.sugarIndex
+		indexManager = s.sugarIndex
+		if err = newChain(); err != nil {
+			return nil, err
+		}
+	}
 	if err != nil {
 		return nil, err
 	}

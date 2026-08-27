@@ -393,6 +393,9 @@ func checkProofOfWork(header *wire.BlockHeader, powLimit *big.Int, flags Behavio
 		hash := pow.BlockPoWHash(header)
 		hashNum := HashToBig(&hash)
 		if hashNum.Cmp(target) > 0 {
+			// TEMP DEBUG: log high-hash (PoW failed) with the target.
+			log.Warnf("TEMP-DBG high-hash hash=%s bits=%08x target=%064x",
+				header.BlockHash(), header.Bits, target)
 			str := fmt.Sprintf("block hash of %064x is higher than "+
 				"expected max of %064x", hashNum, target)
 			return ruleError(ErrHighHash, str)
@@ -519,6 +522,10 @@ func CheckBlockHeaderSanity(header *wire.BlockHeader, powLimit *big.Int,
 	maxTimestamp := timeSource.AdjustedTime().Add(time.Second *
 		MaxTimeOffsetSeconds)
 	if header.Timestamp.After(maxTimestamp) {
+		// TEMP DEBUG: log time-too-new with the actual vs allowed window.
+		log.Warnf("TEMP-DBG time-too-new hash=%s ts=%v max=%v offset=%d",
+			header.BlockHash(), header.Timestamp, maxTimestamp,
+			MaxTimeOffsetSeconds)
 		str := fmt.Sprintf("block timestamp of %v is too far in the "+
 			"future", header.Timestamp)
 		return ruleError(ErrTimeTooNew, str)
@@ -764,6 +771,13 @@ func CheckBlockHeaderContext(header *wire.BlockHeader, prevNode HeaderCtx,
 		}
 		blockDifficulty := header.Bits
 		if blockDifficulty != expectedDifficulty {
+			// TEMP DEBUG: log the exact difficulty mismatch (bad-diffbits)
+			// with the block hash, height and both values so we can tell
+			// whether this is the severed-parent-chain false rejection.
+			log.Warnf("TEMP-DBG bad-diffbits hash=%s height=%d bits=%08x "+
+				"expected=%08x prevHeight=%d",
+				header.BlockHash(), blockHeight, blockDifficulty,
+				expectedDifficulty, prevNode.Height())
 			str := "block difficulty of %d is not the expected value of %d"
 			str = fmt.Sprintf(str, blockDifficulty, expectedDifficulty)
 			return ruleError(ErrUnexpectedDifficulty, str)
@@ -946,6 +960,9 @@ func (b *BlockChain) checkBlockContext(block *btcutil.Block, prevNode *blockNode
 			// addition, various other checks against the
 			// coinbase's witness stack.
 			if err := ValidateWitnessCommitment(block); err != nil {
+				// TEMP DEBUG: log witness commitment failure.
+				log.Warnf("TEMP-DBG witness-commitment-fail hash=%s "+
+					"height=%d err=%v", block.Hash(), blockHeight, err)
 				return err
 			}
 

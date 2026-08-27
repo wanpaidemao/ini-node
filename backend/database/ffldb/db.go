@@ -1395,14 +1395,49 @@ func (tx *transaction) FetchBlocks(hashes []chainhash.Hash) ([][]byte, error) {
 	// callers will not typically be calling this function with invalid
 	// values, so optimize for the common case.
 
-	// Load the blocks.
+	// In order to improve efficiency of loading the bulk data, first grab
+	// the block location for all of the requested block hashes and sort
+	// the reads by filenum:offset so that all reads are grouped by file
+	// and linear within each file.  This can result in quite a significant
+	// performance increase depending on how spread out the requested hashes
+	// are by reducing the number of file open/closes and random accesses
+	// needed (same optimization as FetchBlockRegions).  The fetchList is
+	// intentionally allocated with a cap because some of the blocks might be
+	// pending to be written on commit and hence there is no need to fetch
+	// those from disk.
 	blocks := make([][]byte, len(hashes))
+	fetchList := make([]bulkFetchData, 0, len(hashes))
 	for i := range hashes {
-		var err error
-		blocks[i], err = tx.FetchBlock(&hashes[i])
+		// When the block is pending to be written on commit grab the
+		// bytes from there.
+		if tx.pendingBlocks != nil {
+			if idx, exists := tx.pendingBlocks[hashes[i]]; exists {
+				blocks[i] = tx.pendingBlockData[idx].bytes
+				continue
+			}
+		}
+
+		// Lookup the location of the block in the files from the block
+		// index.
+		blockRow, err := tx.fetchBlockRow(&hashes[i])
 		if err != nil {
 			return nil, err
 		}
+		location := deserializeBlockLoc(blockRow)
+		fetchList = append(fetchList, bulkFetchData{&location, i})
+	}
+	sort.Sort(bulkFetchDataSorter(fetchList))
+
+	// Read all of the blocks in the fetch list and set the results.
+	for i := range fetchList {
+		fetchData := &fetchList[i]
+		ri := fetchData.replyIndex
+		blockBytes, err := tx.db.store.readBlock(&hashes[ri],
+			*fetchData.blockLocation)
+		if err != nil {
+			return nil, err
+		}
+		blocks[ri] = blockBytes
 	}
 
 	return blocks, nil

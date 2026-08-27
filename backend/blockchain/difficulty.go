@@ -216,6 +216,43 @@ func calcNextRequiredDifficulty(lastNode HeaderCtx, newBlockTime time.Time,
 
 	// Check we have enough blocks (if not, use PoW limit)
 	if pindexFirst == nil {
+		// The walk ran off the end of the in-memory ancestor chain before
+		// collecting the full averaging window.  This can happen when a
+		// window eviction severed a parent link that the shallow
+		// repairDifficultyChain pass above did not reach.  Try once more
+		// with a deep repair that re-links the entire ancestor chain from
+		// the cold index; only fall back to the PowLimit if the parent
+		// chain genuinely cannot be resolved (e.g. a block below genesis).
+		if bc, ok := c.(*BlockChain); ok {
+			if bn, ok := lastNode.(*blockNode); ok {
+				bc.repairAncestorChain(bn, SugarPowAveragingWindow+medianTimeBlocks)
+				// Re-walk the window after the deep repair, reusing the
+				// outer bnTot/pindexFirst so the shared calculation below
+				// runs with the repaired chain.
+				bnTot.SetInt64(0)
+				pindexFirst = lastNode
+				for i := 0; pindexFirst != nil && i < SugarPowAveragingWindow; i++ {
+					bnTmp := CompactToBig(pindexFirst.Bits())
+					bnTot.Add(&bnTot, bnTmp)
+					pindexFirst = pindexFirst.Parent()
+				}
+			}
+		}
+	}
+	if pindexFirst == nil {
+		// TEMP DEBUG: this is the suspected root-cause path (severed
+		// parent chain -> difficulty walk stops early -> PowLimitBits).
+		// Log the height of the last node and how many steps we walked.
+		var lastH int32 = -1
+		var lastB uint32
+		if bn, ok := lastNode.(*blockNode); ok {
+			lastH = bn.height
+			lastB = bn.bits
+		}
+		log.Warnf("TEMP-DBG calcNextRequiredDifficulty walk stopped early: "+
+			"lastNode height=%d bits=%08x -> returning PowLimitBits=%08x "+
+			"(window=%d)", lastH, lastB,
+			c.ChainParams().PowLimitBits, SugarPowAveragingWindow)
 		return c.ChainParams().PowLimitBits, nil
 	}
 
