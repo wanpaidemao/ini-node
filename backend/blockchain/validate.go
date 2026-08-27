@@ -22,9 +22,21 @@ import (
 
 const (
 	// MaxTimeOffsetSeconds is the maximum number of seconds a block time
-	// is allowed to be ahead of the current time.  This is currently 2
-	// hours.
-	MaxTimeOffsetSeconds = 2 * 60 * 60
+	// is allowed to be ahead of the current time.
+	//
+	// Sugarchain: 60 seconds (= 2 hours / 120), NOT Bitcoin's 2 hours.
+	// umami's MAX_FUTURE_BLOCK_TIME is `2 * 60 * 60 / 120` because
+	// Sugarchain mines 120x faster than Bitcoin (5s vs 600s), so the
+	// future-time window is scaled down by the same factor.  The Bitcoin
+	// default (7200s) made this node accept blocks up to 2h in the future
+	// that the network (60s) rejects, so locally mined blocks with a
+	// timestamp more than 60s ahead could never join the main chain.
+	// Sugarchain:未来时间上限 60 秒(= 2 小时 / 120),不是比特币的 2 小时。
+	// umami 的 MAX_FUTURE_BLOCK_TIME 是 `2 * 60 * 60 / 120`,因为 Sugarchain
+	// 出块比比特币快 120 倍(5s vs 600s),未来时间窗口按相同比例缩放。比特币
+	// 默认值(7200s)会让本节点接受超前最多 2 小时的块,而网络只接受 60 秒,
+	// 导致本地挖出、时间戳超前超过 60 秒的块永远无法上链。
+	MaxTimeOffsetSeconds = 2 * 60 * 60 / 120 // = 60 seconds, aligns umami
 
 	// MinCoinbaseScriptLen is the minimum length a coinbase script can be.
 	MinCoinbaseScriptLen = 2
@@ -42,7 +54,18 @@ const (
 
 	// baseSubsidy is the starting subsidy amount for mined blocks.  This
 	// value is halved every SubsidyHalvingInterval blocks.
-	baseSubsidy = 50 * btcutil.SatoshiPerBitcoin
+	//
+	// Sugarchain: 42.94967296 SUGAR (= 2^32 satoshis), NOT Bitcoin's 50.
+	// umami's GetBlockSubsidy starts from 42.94967296 * COIN; using the
+	// Bitcoin default here overpaid every coinbase (e.g. 6.25 vs the
+	// network-correct 5.36870912 at height 44M) and the network rejected
+	// every mined block.  Stored as the exact integer 2^32 to avoid any
+	// float rounding.
+	// Sugarchain:初始奖励 42.94967296 SUGAR(= 2^32 聪),不是比特币的 50。
+	// umami 的 GetBlockSubsidy 从 42.94967296 * COIN 开始;此处若沿用比特币
+	// 默认值会让每个 coinbase 超发(如 44M 高度 6.25 vs 网络正确的
+	// 5.36870912),网络会拒绝所有挖出的块。用精确整数 2^32 存储,避免浮点误差。
+	baseSubsidy = 4294967296 // 42.94967296 SUGAR = 2^32 satoshis
 
 	// coinbaseHeightAllocSize is the amount of bytes that the
 	// ScriptBuilder will allocate when validating the coinbase height.
@@ -1430,6 +1453,29 @@ func (b *BlockChain) CheckConnectBlockTemplate(block *btcutil.Block) error {
 	if prevNode == nil || !b.bestChain.Contains(prevNode) {
 		str := fmt.Sprintf("previous block must be on the main chain, "+
 			"instead got %v", header.PrevBlock)
+		return ruleError(ErrPrevBlockNotBest, str)
+	}
+
+	// P1-2: the previous block must ALSO be the block the (network-projected)
+	// header chain has at that height.  A locally-mined block that no peer's
+	// chain contains can occupy the best chain (and pass the check above),
+	// so a template built on it would mine a block that can never join the
+	// real main chain.  The header chain follows the network and cannot be
+	// polluted by a local fork; if it already has a different block at the
+	// parent's height, refuse the template.  When the header chain has no
+	// node at that height yet (e.g. the parent sits above the current header
+	// tip), keep the relaxed semantics and let the connection decide.
+	// P1-2:前驱块还必须与(网络投影的)header 链在该高度的块一致。本地挖出、
+	// 无对等点主链包含的块可能占据 best chain(并通过上面的检查),基于它的
+	// 模板挖出的块永远无法加入真实主链。header 链跟随网络、不可能被本地
+	// 分叉污染;若它在父块高度已有不同的块,拒绝该模板。当 header 链在该
+	// 高度还没有节点时(如父块高于当前 header tip),保留放宽语义,交给连接
+	// 逻辑决定。
+	if headerNode := b.bestHeader.NodeByHeight(prevNode.height); headerNode != nil &&
+		!headerNode.hash.IsEqual(&prevNode.hash) {
+		str := fmt.Sprintf("previous block %v is not the network main-chain "+
+			"block %v at height %d", prevNode.hash, headerNode.hash,
+			prevNode.height)
 		return ruleError(ErrPrevBlockNotBest, str)
 	}
 

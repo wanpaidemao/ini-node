@@ -453,10 +453,22 @@ func newBlock(chain *BlockChain, prev *btcutil.Block,
 	}
 
 	// Use a timestamp that is one second after the previous block unless
-	// this is the first block in which case the current time is used.
+	// this is the first block in which case a time in the past is used.
+	// The first block must NOT use time.Now(): Sugarchain's
+	// MaxTimeOffsetSeconds is 60s (umami's MAX_FUTURE_BLOCK_TIME = 2h/120),
+	// and long test chains (e.g. addBlocks(101,...)) advance one second per
+	// block, so a now-based first block would put later blocks more than
+	// 60s into the future and get them rejected.  Starting 300s in the past
+	// keeps every generated block within the window while preserving the
+	// strictly increasing timestamps the median-time rule requires.
+	// 第一块时间戳不能直接用 time.Now():Sugarchain 的 MaxTimeOffsetSeconds
+	// 是 60 秒(umami 的 MAX_FUTURE_BLOCK_TIME = 2h/120),而长测试链(如
+	// addBlocks(101,...))每块时间戳 +1 秒,基于 now 的首块会让后续块超前
+	// 超过 60 秒而被拒绝。从过去 300 秒起步可让所有生成的块都落在窗口内,
+	// 同时保持中位时间规则要求的严格递增时间戳。
 	var ts time.Time
 	if blockHeight == 1 {
-		ts = time.Unix(time.Now().Unix(), 0)
+		ts = time.Unix(time.Now().Unix()-300, 0)
 	} else {
 		ts = prev.MsgBlock().Header.Timestamp.Add(time.Second)
 	}

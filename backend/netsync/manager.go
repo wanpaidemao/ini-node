@@ -1397,6 +1397,32 @@ func (sm *SyncManager) handleStallSample() {
 		}
 	}
 
+	// Third divergence detector (P1-1): the header chain is the network's
+	// projection and cannot be polluted by a local fork, so compare the
+	// best-chain tip against the header chain at the same height.  When the
+	// header chain has advanced past the tip AND the tip is a different
+	// block than the header chain has at that height, the local tip is a
+	// fabricated/forked block occupying the best chain (observed: a23e7e62
+	// vs header-chain b345517e at 44060189).  Roll back to the fork point
+	// immediately -- this is the most direct "network wins" signal, stronger
+	// than the peer-height heuristic because it compares hashes, not just
+	// heights.  It complements the DB height-index check (which can be
+	// polluted) and fires even when no peer has been selected yet.
+	// 第三重分叉检测(P1-1):header 链是网络的投影,不可能被本地分叉污染,因此
+	// 把 best chain tip 与 header 链同高度块比较。当 header 链已越过 tip、且
+	// 该高度上 tip 与 header 链块不同,本地 tip 就是占据 best chain 的伪造/
+	// 分叉块(实测:44060189 处 a23e7e62 vs header 链 b345517e)。立即回滚到
+	// 分叉点——这是最直接的"网络胜出"信号,比 peer 高度启发式更强(比较
+	// hash 而非仅高度)。它补充 DB 高度索引检测(可能被污染),且即使尚未选中
+	// 对等点也能触发。
+	if sm.headerSync != nil && sm.chain.HeaderChainDiverged() {
+		forkHeight := sm.chain.BestChainHeaderForkHeight()
+		log.Warnf("Best chain tip diverges from the header chain at height "+
+			"%d (fork at %d) -- fabricated/forked tip, rolling back early",
+			sm.chain.BestSnapshot().Height, forkHeight)
+		sm.rollbackFabricatedHeaderChain()
+	}
+
 	// Detect a fabricated or forked header chain: the block download has not
 	// advanced for blockUnavailableTimeout.  A real chain's blocks are served
 	// by the network; a forged chain's blocks either do not exist on any peer

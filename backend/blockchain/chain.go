@@ -1570,6 +1570,50 @@ func (b *BlockChain) BestChainHeaderForkHeight() int32 {
 	return fork.height
 }
 
+// HeaderChainDiverged reports whether the best-chain tip is not the same
+// block as the best-header chain at the same height.  A locally-mined block
+// that no peer's chain contains can be persisted as the best-chain tip: after
+// a restart the connected chain then diverges from the (network-projected)
+// header chain at that height, and every main-chain block above it arrives as
+// an orphan forever while headers keep advancing (observed: best-chain tip
+// a23e7e62 vs header/main-chain 44060189 b345517e, 2838 orphans).  The header
+// chain follows the network and cannot be polluted by a local fork, so a
+// mismatch is a strong signal to roll the best chain back to the fork point.
+//
+// This function is safe for concurrent access.
+// HeaderChainDiverged 报告 best chain tip 是否与其同高度上的 best header 链
+// 块不一致。本地挖出、无对等点主链包含的块可能被持久化为 best-chain tip:
+// 重启后连接链在该高度与(网络投影的)header 链分叉,其上所有主链块永远以
+// 孤儿到达而 header 持续前进(实测:best-chain tip a23e7e62 vs
+// header/主链 44060189 b345517e,2838 个孤儿)。header 链跟随网络、不可能被
+// 本地分叉污染,因此不一致是回滚 best chain 到分叉点的强信号。
+func (b *BlockChain) HeaderChainDiverged() bool {
+	b.chainLock.RLock()
+	defer b.chainLock.RUnlock()
+
+	bestTip := b.bestChain.Tip()
+	if bestTip == nil {
+		return false
+	}
+	headerTip := b.bestHeader.Tip()
+	if headerTip == nil {
+		return false
+	}
+	// The header chain is not ahead of the best chain: nothing to diverge
+	// against (the local tip may legitimately be at or above the header tip
+	// during normal operation before headers advance).
+	// header 链没有领先 best chain:无从比较(正常运行时本地 tip 可能暂时
+	// 不低于 header tip,直到 header 推进)。
+	if headerTip.height <= bestTip.height {
+		return false
+	}
+	headerNode := b.bestHeader.NodeByHeight(bestTip.height)
+	if headerNode == nil {
+		return false
+	}
+	return !headerNode.hash.IsEqual(&bestTip.hash)
+}
+
 // TipStatus is the status of a chain tip.
 type TipStatus byte
 
