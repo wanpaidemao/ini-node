@@ -5,6 +5,7 @@
 package blockchain
 
 import (
+	"fmt"
 	"math/big"
 	"time"
 
@@ -303,4 +304,37 @@ func (b *BlockChain) CalcNextRequiredDifficulty(timestamp time.Time) (uint32, er
 	difficulty, err := calcNextRequiredDifficulty(b.bestChain.Tip(), timestamp, b)
 	b.chainLock.Unlock()
 	return difficulty, err
+}
+
+// CalcNextRequiredDifficultyForPrev calculates the required difficulty for a
+// block that builds on the given previous-block hash, based on the difficulty
+// retarget rules.  Unlike CalcNextRequiredDifficulty -- which resolves the
+// difficulty from the CURRENT best-chain tip and can therefore race with the
+// 5-second Sugarchain block interval -- this resolves the difficulty from the
+// exact parent block the template builds on, so the template's Bits and the
+// CheckBlockHeaderContext expectation are computed from the same node (the
+// same approach as umami's GetNextWorkRequired(pindexPrev)).  This eliminates
+// the ErrUnexpectedDifficulty template-generation failures ("block difficulty
+// of X is not the expected value of Y", e.g. 520166409 vs 520166382 when the
+// tip advanced one block between snapshot and computation).
+//
+// This function is safe for concurrent access.
+// CalcNextRequiredDifficultyForPrev 基于给定前驱块 hash 计算其后一块的期望
+// 难度。与 CalcNextRequiredDifficulty(按当前 best chain tip 计算)不同——
+// 后者会与 Sugarchain 5 秒出块节奏产生竞态——本方法从模板所构建的确切父块
+// 解析难度,使模板 Bits 与 CheckBlockHeaderContext 期望值由同一节点算出
+// (即 umami GetNextWorkRequired(pindexPrev) 的做法)。消除模板生成时的
+// ErrUnexpectedDifficulty 失败("block difficulty of X is not the expected
+// value of Y",如 tip 在快照与计算之间前进一块时的 520166409 vs 520166382)。
+func (b *BlockChain) CalcNextRequiredDifficultyForPrev(
+	prevHash *chainhash.Hash, timestamp time.Time) (uint32, error) {
+
+	b.chainLock.Lock()
+	defer b.chainLock.Unlock()
+
+	prevNode := b.index.LookupNode(prevHash)
+	if prevNode == nil {
+		return 0, fmt.Errorf("previous block %v not found", prevHash)
+	}
+	return calcNextRequiredDifficulty(prevNode, timestamp, b)
 }

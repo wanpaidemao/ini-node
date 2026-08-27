@@ -812,7 +812,24 @@ mempoolLoop:
 	// is potentially adjusted to ensure it comes after the median time of
 	// the last several blocks per the chain consensus rules.
 	ts := medianAdjustedTime(best, g.timeSource)
-	reqDifficulty, err := g.chain.CalcNextRequiredDifficulty(ts)
+	// Resolve the difficulty from the exact parent block this template
+	// builds on (best.Hash) rather than from the CURRENT best-chain tip.
+	// Sugarchain mines a block every 5 seconds, so between BestSnapshot()
+	// above and this call the sync goroutine can advance the tip by one
+	// block; CalcNextRequiredDifficulty() would then return the difficulty
+	// for the NEW tip while the template's prev is the OLD one, and
+	// CheckConnectBlockTemplate would reject the template with
+	// ErrUnexpectedDifficulty ("block difficulty of X is not the expected
+	// value of Y").  Using the prev-based variant (same approach as umami's
+	// GetNextWorkRequired(pindexPrev)) keeps Bits and validation in sync.
+	// 从本模板所构建的确切父块(best.Hash)解析难度,而不是按当前 best chain
+	// tip。Sugarchain 每 5 秒出块,上面 BestSnapshot() 与本次调用之间同步
+	// goroutine 可能把 tip 推进一块;CalcNextRequiredDifficulty() 会返回
+	// 新 tip 的难度,而模板 prev 是旧 tip,导致 CheckConnectBlockTemplate 以
+	// ErrUnexpectedDifficulty 拒绝模板。改用基于 prev 的变体(与 umami
+	// GetNextWorkRequired(pindexPrev) 一致)使 Bits 与验证同源。
+	reqDifficulty, err := g.chain.CalcNextRequiredDifficultyForPrev(
+		&best.Hash, ts)
 	if err != nil {
 		return nil, err
 	}
