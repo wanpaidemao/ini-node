@@ -122,7 +122,8 @@ go test ./blockchain/ -run TestXxx   # 定向测试
 | `--addpeer=<addr>` | 启动时额外连接一个对等节点 |
 | `--nodnsseed` | 禁用 DNS 种子发现 |
 | `--externalip=<ip>` | 向对等节点宣告的外部地址 |
-| `--maxpeers=<n>` | 最大对等节点数（默认 125） |
+| `--maxpeers=<n>` | 最大对等节点数（默认 32） |
+| `--maxpeersperip=<n>` | 单个 IP 最多入站连接数（默认 8，白名单豁免） |
 | `--whitelist=<net>` | 不封禁的 IP/网段（如 192.168.1.0/24） |
 
 ### 数据 / 日志

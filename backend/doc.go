@@ -79,7 +79,9 @@ Application Options:
 	    --maxorphantx=          Max number of orphan transactions to keep in
 	                            memory (default: 100)
 	    --maxpeers=             Max number of inbound and outbound peers
-	                            (default: 125)
+	                            (default: 32)
+	    --maxpeersperip=        Max number of inbound peers from a single IP
+	                            address (default: 8)
 	    --miningaddr=           Add the specified payment address to the list of
 	                            addresses to use for generated blocks -- At least
 	                            one address is required if the generate option is

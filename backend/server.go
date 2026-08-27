@@ -1942,7 +1942,25 @@ func (s *server) handleAddPeerMsg(state *peerState, sp *serverPeer) bool {
 		delete(state.banned, host)
 	}
 
-	// TODO: Check for max peers from a single IP.
+	// Limit the number of inbound peers from a single IP address so one host
+	// cannot exhaust the peer budget.  Whitelisted peers are exempt.
+	if sp.Inbound() && !sp.isWhitelisted && cfg.MaxPeersPerIP > 0 {
+		ip := peerIP(sp)
+		if ip != "" {
+			perIPCount := 0
+			state.forAllPeers(func(ep *serverPeer) {
+				if ep.Connected() && peerIP(ep) == ip {
+					perIPCount++
+				}
+			})
+			if perIPCount >= cfg.MaxPeersPerIP {
+				srvrLog.Infof("Max peers per IP reached [%d] for %s - "+
+					"disconnecting peer %s", cfg.MaxPeersPerIP, ip, sp)
+				sp.Disconnect()
+				return false
+			}
+		}
+	}
 
 	// Limit max number of total peers.
 	if state.Count() >= cfg.MaxPeers {

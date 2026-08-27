@@ -43,7 +43,8 @@ const (
 	defaultLogLevel              = "info"
 	defaultLogDirname            = "logs"
 	defaultLogFilename           = "btcd.log"
-	defaultMaxPeers              = 125
+	defaultMaxPeers              = 32
+	defaultMaxPeersPerIP         = 8
 	defaultBanDuration           = time.Hour * 24
 	defaultBanThreshold          = 100
 	defaultConnectTimeout        = time.Second * 30
@@ -106,6 +107,15 @@ func validateMaxPeers(maxPeers int) error {
 	return nil
 }
 
+// validateMaxPeersPerIP ensures btcd has a positive per-IP inbound peer budget.
+func validateMaxPeersPerIP(maxPeersPerIP int) error {
+	if maxPeersPerIP <= 0 {
+		return fmt.Errorf("maxpeersperip must be greater than zero: %d", maxPeersPerIP)
+	}
+
+	return nil
+}
+
 // config defines the configuration options for btcd.
 //
 // See loadConfig for details on the configuration load process.
@@ -141,6 +151,7 @@ type config struct {
 	LogDir               string        `long:"logdir" description:"Directory to log output."`
 	MaxOrphanTxs         int           `long:"maxorphantx" description:"Max number of orphan transactions to keep in memory"`
 	MaxPeers             int           `long:"maxpeers" description:"Max number of inbound and outbound peers. Must be greater than zero. Outbound slots for the configured peer mode are reserved before inbound capacity is calculated"`
+	MaxPeersPerIP        int           `long:"maxpeersperip" description:"Max number of inbound peers allowed from a single IP address. Must be greater than zero. Whitelisted peers are exempt."`
 	MiningAddrs          []string      `long:"miningaddr" description:"Add the specified payment address to the list of addresses to use for generated blocks -- At least one address is required if the generate option is set"`
 	MinRelayTxFee        float64       `long:"minrelaytxfee" description:"The minimum transaction fee in BTC/kB to be considered a non-zero fee."`
 	DisableBanning       bool          `long:"nobanning" description:"Disable banning of misbehaving peers"`
@@ -434,6 +445,7 @@ func loadConfig() (*config, []string, error) {
 		ConfigFile:           defaultConfigFile,
 		DebugLevel:           defaultLogLevel,
 		MaxPeers:             defaultMaxPeers,
+		MaxPeersPerIP:        defaultMaxPeersPerIP,
 		BanDuration:          defaultBanDuration,
 		BanThreshold:         defaultBanThreshold,
 		RPCMaxClients:        defaultMaxRPCClients,

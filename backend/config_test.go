@@ -32,6 +32,30 @@ func TestValidateMaxPeers(t *testing.T) {
 	}
 }
 
+func TestValidateMaxPeersPerIP(t *testing.T) {
+	tests := []struct {
+		name          string
+		maxPeersPerIP int
+		wantErr       bool
+	}{
+		{name: "negative", maxPeersPerIP: -1, wantErr: true},
+		{name: "zero", wantErr: true},
+		{name: "positive", maxPeersPerIP: 1},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateMaxPeersPerIP(test.maxPeersPerIP)
+			if test.wantErr && err == nil {
+				t.Fatal("expected validation error")
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("unexpected validation error: %v", err)
+			}
+		})
+	}
+}
+
 var (
 	rpcuserRegexp = regexp.MustCompile("(?m)^rpcuser=.+$")
 	rpcpassRegexp = regexp.MustCompile("(?m)^rpcpass=.+$")
