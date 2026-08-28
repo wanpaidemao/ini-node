@@ -59,6 +59,16 @@ func main() {
 		// Window sized to the golden ratio (1000 / 618 ≈ 1.618).
 		Width:  1000,
 		Height: 618,
+		// Frameless removes the OS title bar; the UI provides its own
+		// drag region (-webkit-app-region: drag) and window controls.
+		Frameless: true,
+		Windows: application.WindowsWindow{
+			// Enables non-client region tracking so the frameless titlebar's
+			// --wails-non-client-region: caption/minimize/maximize/close CSS
+			// regions are reported for native hit testing (drag, window
+			// controls). Without this the custom titlebar cannot be dragged.
+			WebView2CompositionHosting: true,
+		},
 		Mac: application.MacWindow{
 			InvisibleTitleBarHeight: 50,
 			Backdrop:                application.MacBackdropTranslucent,

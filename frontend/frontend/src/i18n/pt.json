@@ -54,7 +54,7 @@
   "create.tab_file": "Arquivo criptografado salvo",
   "create.tab_mnemonic": "Semente BIP39",
   "create.tab_wif": "WIF normal",
-  "create.title": "Criar / abrir carteira",
+  "create.title": "Abrir carteira",
   "create.type": "Tipo",
   "create.wif": "WIF",
   "create.word_count": "Palavras",

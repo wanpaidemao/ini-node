@@ -49,6 +49,7 @@
   /* layout shell */
   --rail-w: 200px;
   --nav-h: 52px;
+  --titlebar-h: 30px;
 
   color-scheme: light;
   background: var(--ink);

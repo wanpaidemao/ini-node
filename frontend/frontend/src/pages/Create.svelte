@@ -13,6 +13,9 @@
   let pass = $state("");
   let saved = $state(["main", "savings.wallet", "watch-only"]);
   let error = $state<string | null>(null);
+  // Create-new-wallet panel is collapsed by default: the page opens showing
+  // "Open existing wallet" only.  / 默认折叠"创建新钱包"面板:页面只显示"打开已有钱包"。
+  let createOpen = $state(false);
 
   const wordBank = [
     "abandon", "ability", "able", "about", "above", "absent", "absorb", "abstract", "absurd", "abuse",
@@ -57,9 +60,14 @@
       <p class="eyebrow">identity</p>
       <h1 class="h-page">{t("create.title")}</h1>
     </div>
+    <button class="btn" onclick={() => (createOpen = !createOpen)} aria-expanded={createOpen}>
+      <span class="chev" aria-hidden="true">{createOpen ? "▾" : "▸"}</span>
+      {t("create.new_wallet")}
+    </button>
   </div>
 
   <div class="two">
+    {#if createOpen}
     <!-- create -->
     <div class="card">
       <h2 class="h-card">{t("create.new_wallet")}</h2>
@@ -114,6 +122,7 @@
         {/if}
       {/if}
     </div>
+    {:else}
 
     <!-- open -->
     <div class="card">
@@ -164,6 +173,7 @@
         {/each}
       </ul>
     </div>
+    {/if}
   </div>
 </section>
 
@@ -190,7 +200,10 @@
   }
   .two {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    /* Create and open panels are mutually exclusive: only one card is
+       visible at a time, so a single column keeps it full-width.
+       创建与打开面板互斥显示,同一时刻只显示一张卡片,单列保持全宽。 */
+    grid-template-columns: 1fr;
     gap: 14px;
     align-items: start;
   }

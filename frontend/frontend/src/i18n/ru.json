@@ -54,7 +54,7 @@
   "create.tab_file": "Сохранённый зашифрованный файл",
   "create.tab_mnemonic": "Сид BIP39",
   "create.tab_wif": "Обычный WIF",
-  "create.title": "Создать / открыть кошелёк",
+  "create.title": "Открыть кошелёк",
   "create.type": "Тип",
   "create.wif": "WIF",
   "create.word_count": "Слова",

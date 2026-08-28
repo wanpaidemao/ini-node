@@ -1,5 +1,6 @@
 ﻿<script lang="ts">
   import { onMount, onDestroy } from "svelte";
+  import { Window } from "@wailsio/runtime";
   import { app, navigate, setConnected } from "./lib/store.svelte";
   import { Services } from "./lib/services";
   import { t, fmt } from "./lib/i18n";
@@ -109,6 +110,43 @@
 
 <div class="shell" class:nav-top={app.navMode === "top"} class:nav-side={app.navMode !== "top"} class:collapsed={collapsible}>
   <a class="skip-link" href="#main">Skip to content</a>
+
+  <!-- frameless titlebar: drag region + window controls -->
+  <!-- --wails-non-client-region drives native hit testing on Windows;
+       --wails-draggable is the cross-platform (JS) drag fallback so the
+       frameless window stays draggable on macOS/Linux too.
+       --wails-non-client-region 负责 Windows 原生命中测试,
+       --wails-draggable 提供跨平台(JS)拖动兜底,macOS/Linux 也能拖动。 -->
+  <div class="titlebar" style="--wails-non-client-region: caption; --wails-draggable: drag">
+    <span class="titlebar-drag" style="--wails-non-client-region: caption"></span>
+    <button
+      class="titlebar-btn"
+      style="--wails-non-client-region: minimize; --wails-draggable: no-drag"
+      aria-label="Minimize / 最小化"
+      title="Minimize / 最小化"
+      onclick={() => Window.Minimise()}
+    >
+      <svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><line x1="1" y1="6" x2="11" y2="6" stroke="currentColor" stroke-width="1.4" /></svg>
+    </button>
+    <button
+      class="titlebar-btn"
+      style="--wails-non-client-region: maximize; --wails-draggable: no-drag"
+      aria-label="Maximize / 最大化"
+      title="Maximize / 最大化"
+      onclick={() => Window.ToggleMaximise()}
+    >
+      <svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><rect x="2" y="2" width="8" height="8" fill="none" stroke="currentColor" stroke-width="1.4" /></svg>
+    </button>
+    <button
+      class="titlebar-btn titlebar-close"
+      style="--wails-non-client-region: close; --wails-draggable: no-drag"
+      aria-label="Close / 关闭"
+      title="Close / 关闭"
+      onclick={() => Window.Close()}
+    >
+      <svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><line x1="2" y1="2" x2="10" y2="10" stroke="currentColor" stroke-width="1.4" /><line x1="10" y1="2" x2="2" y2="10" stroke="currentColor" stroke-width="1.4" /></svg>
+    </button>
+  </div>
 
   <!-- top navigation (default): main menus with hover submenus · live node sync rail -->
   {#if app.navMode === "top"}
@@ -273,7 +311,7 @@
   .shell {
     display: grid;
     grid-template-columns: var(--rail-w) 1fr;
-    grid-template-rows: 100vh;
+    grid-template-rows: var(--titlebar-h) minmax(0, 1fr);
     height: 100vh;
     overflow: hidden;
     background: var(--ink);
@@ -282,7 +320,7 @@
   }
   .shell.nav-top {
     grid-template-columns: 1fr;
-    grid-template-rows: var(--nav-h) minmax(0, 1fr);
+    grid-template-rows: var(--titlebar-h) var(--nav-h) minmax(0, 1fr);
   }
   .shell.nav-top.collapsed {
     grid-template-columns: 1fr;
@@ -291,9 +329,58 @@
     grid-template-columns: 48px 1fr;
   }
 
+  /* ── frameless titlebar: drag region + window controls ── */
+  .titlebar {
+    grid-column: 1 / -1;
+    grid-row: 1;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: var(--titlebar-h);
+    padding: 0 4px 0 12px;
+    background: var(--violet);
+    border-bottom: 1px solid var(--line);
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .titlebar-title {
+    font-family: var(--font-display);
+    font-size: 12px;
+    font-weight: 800;
+    letter-spacing: 0.6px;
+    color: var(--ink-dim);
+    white-space: nowrap;
+  }
+  .titlebar-drag {
+    flex: 1;
+    align-self: stretch;
+    min-width: 0;
+  }
+  .titlebar-btn {
+    appearance: none;
+    border: none;
+    background: none;
+    color: var(--ink-dim);
+    width: 34px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+    cursor: default;
+  }
+  .titlebar-btn:hover {
+    background: rgba(0, 0, 0, 0.12);
+    color: var(--ink-fg);
+  }
+  .titlebar-close:hover {
+    background: #e81123;
+    color: #fff;
+  }
+
   /* ── top navigation bar ────────────────────────── */
   .topnav {
-    grid-row: 1;
+    grid-row: 2;
     position: relative;
     display: flex;
     align-items: center;
@@ -487,7 +574,7 @@
 
   /* ── side rail ────────────────────────────────── */
   .rail {
-    grid-row: 1;
+    grid-row: 2;
     background: var(--violet);
     border-right: 1px solid var(--line);
     display: flex;
@@ -593,17 +680,25 @@
   }
 
   .main-col {
-    grid-row: 1;
+    grid-row: 2;
     display: grid;
-    /* The topbar row was removed with the topbar itself; a single
-       minmax(0,1fr) row keeps the page content filling the full column
-       height (previously it was squeezed into the 48px topbar row). */
-    grid-template-rows: minmax(0, 1fr);
+    /* First row: optional "RPC not reachable" banner (auto height).  Second
+       row: the page content fills the rest.  A single minmax(0,1fr) row used
+       to stretch the banner to the full column and shove the page below the
+       visible area, making the "Open Control Center" button unclickable.
+       第一行:可选的"RPC 不可达"提示条(auto 高度);第二行:页面内容占满剩余。
+       之前只有一行 minmax(0,1fr) 时,提示条被拉伸占满整列、页面被挤出可视区,
+       导致"打开控制中心"按钮点不动。 */
+    grid-template-rows: auto minmax(0, 1fr);
     min-width: 0;
     min-height: 0;
   }
   .shell.nav-top .main-col {
+    grid-row: 3;
+  }
+  .main-col .page {
     grid-row: 2;
+    min-height: 0;
   }
 
   .page {
@@ -628,13 +723,13 @@
   @media (max-width: 760px) {
     .shell {
       grid-template-columns: 1fr;
-      grid-template-rows: auto 1fr;
+      grid-template-rows: var(--titlebar-h) auto 1fr;
     }
     .shell.collapsed {
       grid-template-columns: 1fr;
     }
     .shell.nav-top {
-      grid-template-rows: auto minmax(0, 1fr);
+      grid-template-rows: var(--titlebar-h) auto minmax(0, 1fr);
     }
     .rail-top,
     .collapse-btn {
@@ -668,7 +763,7 @@
       display: none;
     }
     .main-col {
-      grid-row: 2;
+      grid-row: 3;
     }
     .topnav {
       flex-wrap: wrap;

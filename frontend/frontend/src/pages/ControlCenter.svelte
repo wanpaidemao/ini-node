@@ -127,6 +127,28 @@
   let logLines: string[] = []
   let logLevel = 'info'
   let logsOpen = false
+  // btclog reports levels as abbreviations (TRC/DBG/INF/WRN/ERR/CRT) even in
+  // the lowercase ini value; map every variant to the <select> option names so
+  // the current level shows while the node is running.
+  // btclog 返回缩写级别(TRC/DBG/INF/WRN/ERR/CRT),统一映射为下拉框的小写全称,
+  // 保证节点运行中也能显示当前级别。
+  const LEVEL_ALIASES: Record<string, string> = {
+    trc: 'trace', trace: 'trace',
+    dbg: 'debug', debug: 'debug',
+    inf: 'info', info: 'info',
+    wrn: 'warn', warn: 'warn',
+    err: 'error', error: 'error',
+    crt: 'critical', critical: 'critical',
+    off: 'off',
+  }
+  function normaliseLevel(l: string): string {
+    // Preserve unmapped values verbatim (lowercased) instead of defaulting to
+    // "info": btcd supports "off", and coercing it to "info" would mislabel
+    // the current level and silently flip the node level if Apply is clicked.
+    // 未映射的级别(如 off)原样保留(仅小写化),不要默认成 info,否则会错误
+    // 显示级别,且点击 Apply 会把节点级别从 off 悄悄改成 info。
+    return LEVEL_ALIASES[(l || '').trim().toLowerCase()] || (l || '').trim().toLowerCase()
+  }
   async function loadLogs() {
     try {
       const res = await fetch('/api/logs?lines=100')
@@ -140,7 +162,7 @@
     try {
       const res = await fetch('/api/loglevel')
       const d = await res.json()
-      if (d.ok) logLevel = d.level || 'info'
+      if (d.ok) logLevel = normaliseLevel(d.level || 'info')
     } catch { /* ignore */ }
   }
   async function applyLogLevel() {
@@ -163,7 +185,13 @@
     logsModalOpen = true
     loadLogs()
   }
-  function clearLogs() {
+  async function clearLogs() {
+    // Truncate the log file on the backend too, otherwise reopening the
+    // viewer reloads the old lines from disk. / 同时清空后端日志文件,
+    // 否则重新打开查看器时会从磁盘重新加载旧日志。
+    try {
+      await fetch('/api/logs', { method: 'POST' })
+    } catch { /* ignore */ }
     logLines = []
   }
   function closeLogs() {
@@ -271,8 +299,15 @@
       <button class="btn btn-primary" onclick={startNode} disabled={busy} style="flex:1">Start / 启动</button>
       <button class="btn btn-ghost" onclick={() => stopNode(false)} disabled={busy} style="flex:1"
         title="Graceful stop via RPC: flushes the DB, no UTXO rebuild on next start / 通过 RPC 优雅停止:会 flush 数据库,下次启动无需重建 UTXO">Graceful stop / 优雅结束节点</button>
-      <button class="btn btn-danger" onclick={() => stopNode(true)} disabled={busy} style="flex:1"
-        title="Force kill: does NOT flush the DB, next start rebuilds UTXO (emergency only) / 强制结束:不 flush 数据库,下次启动重建 UTXO(仅应急)">Force stop / 强制结束节点</button>
+      <button class="btn btn-danger force-btn" onclick={() => stopNode(true)} disabled={busy}
+        style="width:40px;flex:none;display:inline-flex;align-items:center;justify-content:center;padding:6px 0"
+        title="Force kill: does NOT flush the DB, next start rebuilds UTXO (emergency only) / 强制结束:不 flush 数据库,下次启动重建 UTXO(仅应急)"
+        aria-label="Force stop / 强制结束">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <line x1="8" y1="1.5" x2="8" y2="7" />
+          <path d="M4.2 3.8a6 6 0 1 0 7.6 0" />
+        </svg>
+      </button>
     </div>
     {#if startErr}
       <p style="font-size:12px;margin-top:8px;color:#b91c1c">{startErr}</p>
@@ -345,6 +380,8 @@
           <option value="info">info</option>
           <option value="warn">warn</option>
           <option value="error">error</option>
+          <option value="critical">critical</option>
+          <option value="off">off</option>
         </select>
         <button class="btn btn-ghost" onclick={applyLogLevel} style="font-size:12px">Apply / 应用</button>
         <button class="btn btn-ghost" onclick={openLogs} style="font-size:12px">View / 查看</button>

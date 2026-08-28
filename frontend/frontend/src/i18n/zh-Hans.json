@@ -54,7 +54,7 @@
   "create.tab_file": "已存盘加密文件",
   "create.tab_mnemonic": "助记词 BIP39",
   "create.tab_wif": "Regular WIF",
-  "create.title": "创建 / 打开钱包",
+  "create.title": "打开钱包",
   "create.type": "类型",
   "create.wif": "WIF",
   "create.word_count": "数量",

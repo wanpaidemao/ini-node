@@ -54,7 +54,7 @@
   "create.tab_file": "Saved encrypted file",
   "create.tab_mnemonic": "BIP39 seed",
   "create.tab_wif": "Regular WIF",
-  "create.title": "Create / open wallet",
+  "create.title": "Open wallet",
   "create.type": "Type",
   "create.wif": "WIF",
   "create.word_count": "Words",

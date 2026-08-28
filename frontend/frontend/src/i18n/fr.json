@@ -54,7 +54,7 @@
   "create.tab_file": "Fichier chiffré enregistré",
   "create.tab_mnemonic": "Graine BIP39",
   "create.tab_wif": "WIF normal",
-  "create.title": "Créer / ouvrir un portefeuille",
+  "create.title": "Ouvrir un portefeuille",
   "create.type": "Type",
   "create.wif": "WIF",
   "create.word_count": "Mots",
