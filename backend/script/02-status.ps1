@@ -45,7 +45,7 @@ $req = [System.Net.HttpWebRequest]::Create("https://127.0.0.1:$rpcPort/")
     }
 }
 
-$proc = Get-Process -Name 'btcd*' -ErrorAction SilentlyContinue | Sort-Object StartTime | Select-Object -First 1
+$proc = Get-Process -Name 'ini*' -ErrorAction SilentlyContinue | Sort-Object StartTime | Select-Object -First 1
 if ($proc) {
     $cpu1 = $proc.CPU
     $uptime = (Get-Date) - $proc.StartTime

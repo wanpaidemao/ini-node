@@ -396,10 +396,10 @@ func handleNodeStart(opts map[string]string, w http.ResponseWriter, req *http.Re
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "running": true})
 		return
 	}
-	// Locate the backend via findIniPath (CWD or INI_NODE_INI); btcd.exe
+	// Locate the backend via findIniPath (CWD or INI_NODE_INI); ini.exe
 	// lives next to the ini in backend/.  Do NOT rely on os.Args[0], which
 	// points at the Wails binary and is not reliably next to backend/.
-	// 用 findIniPath 定位后端目录(CWD 或 INI_NODE_INI);btcd.exe 与 ini 同在
+	// 用 findIniPath 定位后端目录(CWD 或 INI_NODE_INI);ini.exe 与 ini 同在
 	// backend/。不要依赖 os.Args[0](指向 Wails 二进制,不一定在 backend/ 旁)。
 	ini := findIniPath()
 	if ini == "" {
@@ -410,9 +410,10 @@ func handleNodeStart(opts map[string]string, w http.ResponseWriter, req *http.Re
 		return
 	}
 	backendDir := filepath.Dir(ini)
-	btcd := filepath.Join(backendDir, "btcd.exe")
-	cmd := exec.Command(btcd, "--configfile="+ini)
-	cmd.Dir = filepath.Dir(btcd)
+	iniExe := filepath.Join(backendDir, "ini.exe")
+	cmd := exec.Command(iniExe, "--configfile="+ini)
+	hideWindow(cmd)
+	cmd.Dir = filepath.Dir(iniExe)
 	// Capture stdout/stderr to node.stdout.log/node.stderr.log only when
 	// logredirect=1 in the ini.  btcd already writes its own rotated
 	// btcd.log, so redirecting is opt-in (avoids an unbounded duplicate
@@ -487,16 +488,17 @@ func handleNodeStop(w http.ResponseWriter, req *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "stopped": true})
 }
 
-// handleForceNodeStop force-kills the btcd process.  This is the emergency
-// stop: it does NOT flush the database, so the next start performs an
-// unclean-shutdown repair (Reconstructing UTXO state).  Use handleNodeStop
+// handleForceNodeStop force-kills the ini node process.  This is the
+// emergency stop: it does NOT flush the database, so the next start performs
+// an unclean-shutdown repair (Reconstructing UTXO state).  Use handleNodeStop
 // (graceful) first whenever possible.
-// handleForceNodeStop 强制结束 btcd 进程。这是应急停止:不会 flush 数据库,
+// handleForceNodeStop 强制结束 ini 节点进程。这是应急停止:不会 flush 数据库,
 // 下次启动会做非正常关闭修复(重建 UTXO)。平时应优先用 handleNodeStop(优雅)。
 func handleForceNodeStop(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("content-type", "application/json")
 	cmd := exec.Command("powershell", "-NoProfile", "-Command",
-		"Stop-Process -Name btcd -Force -ErrorAction SilentlyContinue")
+		"Stop-Process -Name ini -Force -ErrorAction SilentlyContinue")
+	hideWindow(cmd)
 	_ = cmd.Run()
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "force": true})
 }
@@ -616,6 +618,7 @@ func handleWalletapiStart(o map[string]string, w http.ResponseWriter, req *http.
 	backendDir := filepath.Dir(ini)
 	exe := filepath.Join(backendDir, "walletapi.exe")
 	cmd := exec.Command(exe, "-rpcpass="+o["rpcpass"])
+	hideWindow(cmd)
 	cmd.Dir = backendDir
 	if err := cmd.Start(); err != nil {
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": err.Error()})
@@ -630,6 +633,7 @@ func handleWalletapiStop(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("content-type", "application/json")
 	cmd := exec.Command("powershell", "-NoProfile", "-Command",
 		"Stop-Process -Name walletapi -Force -ErrorAction SilentlyContinue")
+	hideWindow(cmd)
 	_ = cmd.Run()
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
 }

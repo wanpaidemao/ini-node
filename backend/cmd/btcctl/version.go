@@ -17,12 +17,12 @@ const semanticAlphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqr
 // versioning 2.0.0 spec (http://semver.org/).
 const (
 	appMajor uint = 0
-	appMinor uint = 23
+	appMinor uint = 0
 	appPatch uint = 1
 
 	// appPreRelease MUST only contain characters from semanticAlphabet
 	// per the semantic versioning spec.
-	appPreRelease = "beta"
+	appPreRelease = "Test"
 )
 
 // appBuild is defined as a variable so it can be overridden during the build
@@ -34,7 +34,7 @@ var appBuild string
 // semantic versioning 2.0.0 spec (http://semver.org/).
 func version() string {
 	// Start with the major, minor, and patch versions.
-	version := fmt.Sprintf("%d.%d.%d", appMajor, appMinor, appPatch)
+	version := fmt.Sprintf("%02d.%02d.%02d", appMajor, appMinor, appPatch)
 
 	// Append pre-release version if there is one.  The hyphen called for
 	// by the semantic versioning spec is automatically appended and should

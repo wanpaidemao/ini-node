@@ -1,4 +1,4 @@
-﻿# 启动 sugard 节点(btcd)
+﻿# 启动 sugarchain 节点(ini)
 # 用法: .\05-run.ps1 [-ExePath <path>] [-IniFile <path>]
 # 默认从项目根构建二进制并设参启动; 已运行则仅提示。
 
@@ -11,12 +11,12 @@ $ErrorActionPreference = 'Stop'
 
 # 1) 定位二进制
 if (-not $ExePath) {
-    $built = Join-Path $PSScriptRoot "..\btcd.exe"
+    $built = Join-Path $PSScriptRoot "..\ini.exe"
     if (Test-Path $built) { $ExePath = $built }
     else {
-        $tmp = "C:\Users\adest\AppData\Local\Temp\opencode\btcd-new.exe"
+        $tmp = "C:\Users\adest\AppData\Local\Temp\opencode\ini-new.exe"
         if (Test-Path $tmp) { $ExePath = $tmp }
-        else { throw "找不到 btcd 二进制, 请用 -ExePath 指定" }
+        else { throw "找不到 ini 二进制, 请用 -ExePath 指定" }
     }
 }
 if (-not (Test-Path $ExePath)) { throw "二进制不存在: $ExePath" }

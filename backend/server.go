@@ -72,7 +72,7 @@ var (
 
 	// userAgentVersion is the user agent version and is used to help
 	// identify ourselves to other bitcoin peers.
-	userAgentVersion = fmt.Sprintf("%d.%d.%d", appMajor, appMinor, appPatch)
+	userAgentVersion = fmt.Sprintf("%02d.%02d.%02d", appMajor, appMinor, appPatch)
 )
 
 // zeroHash is the zero value hash (all zeros).  It is defined as a convenience.
@@ -2968,7 +2968,7 @@ out:
 			// listen port?
 			// XXX this assumes timeout is in seconds.
 			listenPort, err := s.nat.AddPortMapping("tcp", int(lport), int(lport),
-				"btcd listen port", 20*60)
+				"ini listen port", 20*60)
 			if err != nil {
 				srvrLog.Warnf("can't add UPnP port mapping: %v", err)
 			}
@@ -3244,7 +3244,7 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 
 	// Log that the node is pruned.
 	if cfg.Prune != 0 {
-		btcdLog.Infof("Prune set to %d MiB", cfg.Prune)
+		iniLog.Infof("Prune set to %d MiB", cfg.Prune)
 	}
 
 	// Create a new block chain instance with the appropriate configuration.

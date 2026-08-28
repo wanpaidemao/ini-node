@@ -4,9 +4,9 @@ REM copy backend artifacts into frontend\bin so everything runs from one dir.
 setlocal
 set ROOT=%~dp0
 
-echo [1/4] Building backend: btcd.exe ...
+echo [1/4] Building backend: ini.exe ...
 cd /d "%ROOT%backend"
-go build -o ..\frontend\bin\btcd.exe . || goto :err
+go build -o ..\frontend\bin\ini.exe . || goto :err
 
 echo [2/4] Building backend: walletapi.exe ...
 go build -o ..\frontend\bin\walletapi.exe .\cmd\walletapi\ || goto :err
@@ -16,10 +16,10 @@ cd /d "%ROOT%frontend"
 wails3 build || goto :err
 
 echo [4/4] Verifying artifacts in frontend\bin ...
-if exist "%ROOT%frontend\bin\btcd.exe" (
-  echo   OK: frontend\bin\btcd.exe
+if exist "%ROOT%frontend\bin\ini.exe" (
+  echo   OK: frontend\bin\ini.exe
 ) else (
-  echo   MISSING: frontend\bin\btcd.exe
+  echo   MISSING: frontend\bin\ini.exe
 )
 if exist "%ROOT%frontend\bin\walletapi.exe" (
   echo   OK: frontend\bin\walletapi.exe

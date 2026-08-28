@@ -60,7 +60,7 @@ var (
 	amgrLog = backendLog.Logger("AMGR")
 	cmgrLog = backendLog.Logger("CMGR")
 	bcdbLog = backendLog.Logger("BCDB")
-	btcdLog = backendLog.Logger("BTCD")
+	iniLog = backendLog.Logger("INI")
 	chanLog = backendLog.Logger("CHAN")
 	discLog = backendLog.Logger("DISC")
 	indxLog = backendLog.Logger("INDX")
@@ -97,7 +97,7 @@ var subsystemLoggers = map[string]btclog.Logger{
 	"AMGR":                amgrLog,
 	"CMGR":                cmgrLog,
 	"BCDB":                bcdbLog,
-	"BTCD":                btcdLog,
+	"INI":                 iniLog,
 	"CHAN":                chanLog,
 	"DISC":                discLog,
 	"INDX":                indxLog,
@@ -158,12 +158,12 @@ func setLogLevels(logLevel string) {
 
 // currentLogLevel returns the current log level of all subsystems as a
 // string.  When every subsystem is set to the same level, that single level
-// is returned; otherwise the level of the main BTCD subsystem is returned as
+// is returned; otherwise the level of the main INI subsystem is returned as
 // a representative value (frontends consume a single dropdown value).
 func currentLogLevel() string {
-	rep := subsystemLoggers["BTCD"].Level()
+	rep := subsystemLoggers["INI"].Level()
 	for id, logger := range subsystemLoggers {
-		if id == "BTCD" {
+		if id == "INI" {
 			continue
 		}
 		if logger.Level() != rep {

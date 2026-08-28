@@ -135,7 +135,7 @@ Content-Type: application/json
 | `getinfo` | 综合状态信息 / General state |
 | `getmempoolinfo` | 内存池信息 / Mempool info |
 | `help [command]` | 全部命令列表或指定命令帮助 / Help |
-| `debuglevel <level>` | 动态改日志级别(见 §5)/ Change log level |
+| `debuglevel <level>` | 动态改日志级别(见 §6)/ Change log level |
 | `stop` | 优雅停机 / Shutdown |
 | `signmessagewithprivkey <key> <message>` | 用私钥签名消息 / Sign message |
 | `verifymessage <address> <signature> <message>` | 验证消息签名 / Verify message |
@@ -185,7 +185,57 @@ WebSocket-only;used for notifications and rescan.
 
 ---
 
-## 5. debuglevel — 动态改日志级别 / Change log level at runtime
+## 5. addnode / node — 主动连接与节点管理 / Connect & manage peers
+
+两个命令都能让节点**主动连接**指定 IP/域名,区别在语义:
+
+| 命令 / Command | 适用 / Scope | 子命令 / Sub-commands |
+|---|---|---|
+| `addnode` | 经典版,管理持久化节点 / classic, persistent peers | `add` / `remove` / `onetry` |
+| `node` | 新式版,按节点 ID 或地址操作 / modern, by id or addr | `connect` / `disconnect` / `remove` |
+
+### 5.1 addnode
+
+```
+& rpc.ps1 -Method addnode -ParamsJson '["1.2.3.4:34230","add"]'     # 连接并设为永久节点 / add & persist
+& rpc.ps1 -Method addnode -ParamsJson '["1.2.3.4:34230","onetry"]'  # 临时连接一次 / one try
+& rpc.ps1 -Method addnode -ParamsJson '["1.2.3.4:34230","remove"]'  # 移除永久节点 / remove
+```
+
+| 子命令 / Sub-command | 行为 / Behavior |
+|---|---|
+| `add` | 主动连接并**持久化**(重启后保留)/ permanent peer |
+| `onetry` | **临时**连接一次,失败/断开后不自动重连 / one-shot |
+| `remove` | 从持久化列表移除 / drop permanent peer |
+
+### 5.2 node
+
+```
+& rpc.ps1 -Method node -ParamsJson '["connect","1.2.3.4:34230"]'         # 临时连接(默认 temp)/ connect temp
+& rpc.ps1 -Method node -ParamsJson '["connect","1.2.3.4:34230","perm"]'  # 永久连接 / connect perm
+& rpc.ps1 -Method node -ParamsJson '["disconnect","1.2.3.4:34230"]'      # 按地址断开(临时节点)/ by addr
+& rpc.ps1 -Method node -ParamsJson '["disconnect","42"]'                 # 按 peer id 断开 / by node id
+& rpc.ps1 -Method node -ParamsJson '["remove","1.2.3.4:34230"]'          # 移除永久节点 / remove
+```
+
+| 子命令 / Sub-command | 行为 / Behavior |
+|---|---|
+| `connect <addr> [perm\|temp]` | 主动连接;默认 temp,`perm` 则持久化 / connect |
+| `disconnect <id\|addr>` | 断开连接;**永久节点需用 remove** / disconnect |
+| `remove <id\|addr>` | 移除节点;**临时节点需用 disconnect** / remove |
+
+### 5.3 注意 / Notes
+
+- target 可为 `IP:port`(省略端口自动补默认 P2P 端口 34230),也可为
+  `getpeerinfo` 返回的**数字 peer id**(仅 `node` 命令支持,`addnode` 不支持)。
+- `addnode ... onetry` 与 `node connect ... temp` 等价。
+- 永久/临时语义混用会报错,例如
+  `can't disconnect a permanent peer, use remove`。
+- 查看当前连接用 `getpeerinfo`(含 id/addr/inbound/subver/bytes 等字段)。
+
+---
+
+## 6. debuglevel — 动态改日志级别 / Change log level at runtime
 
 ```
 & rpc.ps1 -Method debuglevel -ParamsJson '["warn"]'        # 全部子系统设 warn
@@ -194,7 +244,7 @@ WebSocket-only;used for notifications and rescan.
 ```
 
 - 级别:`trace` < `debug` < `info` < `warn` < `error` < `critical`。
-- 子系统:`AMGR ADXR BCDB BMGR BTCD CHAN DISC INDX MINR PEER RPCS SCRP SRVR SYNC TXMP`。
+- 子系统:`AMGR ADXR BCDB BMGR INI CHAN DISC INDX MINR PEER RPCS SCRP SRVR SYNC TXMP`。
 - 已知怪癖:返回 `Done.` 后,日志可能打一条
   `[ERR] RPCS: Failed to marshal reply: rpcversion '' is invalid`
   (btcjson 空 rpcversion 的序列化问题),**级别实际已生效**,可忽略。
@@ -202,7 +252,7 @@ WebSocket-only;used for notifications and rescan.
 
 ---
 
-## 6. 常用排障流程 / Common troubleshooting flow
+## 7. 常用排障流程 / Common troubleshooting flow
 
 **判断是否卡在高度索引空洞(此前 bug):**
 ```
@@ -212,11 +262,11 @@ WebSocket-only;used for notifications and rescan.
 ```
 
 **恢复:** 先 `stop` 节点,用 `cmd/dbprobe.exe -repair` 补 `heightidx` 空洞,
-再用修复后的 `btcd-new.exe` 启动续传。启动后 `getblockcount` 应持续增长、越过断点。
+再用修复后的 `ini-new.exe` 启动续传。启动后 `getblockcount` 应持续增长、越过断点。
 
 ---
 
-## 7. 坑 / Pitfalls
+## 8. 坑 / Pitfalls
 
 1. **PowerShell JSON 序列化**:`ConvertFrom-Json` + `ConvertTo-Json` 会把单元素
    数组折叠成 `{"value":["warn"],"Count":1}`,params 非法、RPC 静默失败(空 BODY,
@@ -228,7 +278,7 @@ WebSocket-only;used for notifications and rescan.
 
 ---
 
-## 8. 相关文档 / Related docs
+## 9. 相关文档 / Related docs
 
 - 完整英文 API 参考(含每个命令返回值结构):
   `docs/json_rpc_api.md`(btcd 生成)

@@ -29,7 +29,7 @@ func main() {
 
 	msg := wire.NewMsgVersion(ourNA, theirNA, nonce, 0)
 	msg.ProtocolVersion = int32(wire.ProtocolVersion)
-	msg.AddUserAgent("btcd", "0.26.2")
+	msg.AddUserAgent("ini", "0.26.2")
 	netv := wire.BitcoinNet(0x9d4beb9f)
 	if err := wire.WriteMessage(conn, msg, wire.ProtocolVersion, netv); err != nil {
 		fmt.Println("write msg err:", err)

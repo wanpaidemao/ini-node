@@ -49,15 +49,15 @@ function Invoke-Rpc([string]$method) {
     } catch { return 'ERR' }
 }
 
-$proc = Get-Process -Name 'btcd*' -ErrorAction SilentlyContinue | Sort-Object StartTime | Select-Object -First 1
-if (-not $proc) { Write-Output "no btcd process found"; exit 1 }
+$proc = Get-Process -Name 'ini*' -ErrorAction SilentlyContinue | Sort-Object StartTime | Select-Object -First 1
+if (-not $proc) { Write-Output "no ini process found"; exit 1 }
 $started = $proc.StartTime
 if (-not (Test-Path $OutFile)) { Set-Content -Value "elapsed_min,header_tip,header_target,block_height,ibd,rss_mb,private_mb,peers" -Path $OutFile }
 
 $endAt = if ($DurationMinutes -gt 0) { (Get-Date).AddMinutes($DurationMinutes) } else { $null }
 while ($true) {
     $p = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
-    if (-not $p) { Write-Output "btcd exited"; break }
+    if (-not $p) { Write-Output "ini exited"; break }
     $el = [math]::Round(((Get-Date) - $started).TotalMinutes, 2)
     $sync = Invoke-Rpc 'getblocksyncstatus'
     $hdr = -1; $tg = -1; $ibd = '?'; $peers = 0

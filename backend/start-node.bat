@@ -10,7 +10,7 @@ rem  - Logs:    logs\node.stdout.log / logs\node.stderr.log
 rem ============================================================
 cd /d C:\Users\adest\Desktop\git\Mimo\apiserver\new\sugarchain-node\backend
 
-rem Launch btcd in a new window, detached from this shell.
-start "btcd-node" btcd.exe --configfile=btcd-runtime.ini
+rem Launch ini in a new window, detached from this shell.
+start "ini-node" ini.exe --configfile=btcd-runtime.ini
 
 exit 0
