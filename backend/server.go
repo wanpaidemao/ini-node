@@ -72,7 +72,8 @@ var (
 
 	// userAgentVersion is the user agent version and is used to help
 	// identify ourselves to other bitcoin peers.
-	userAgentVersion = fmt.Sprintf("%02d.%02d.%02d", appMajor, appMinor, appPatch)
+	// userAgentVersion = fmt.Sprintf("%02d.%02d.%02d", appMajor, appMinor, appPatch)
+	userAgentVersion = fmt.Sprintf("%d.%d.%d", appMajor, appMinor, appPatch)
 )
 
 // zeroHash is the zero value hash (all zeros).  It is defined as a convenience.
@@ -2956,7 +2957,7 @@ func (s *server) upnpUpdateThread() {
 	// Go off immediately to prevent code duplication, thereafter we renew
 	// lease every 15 minutes.
 	timer := time.NewTimer(0 * time.Second)
-	lport, _ := strconv.ParseInt(activeNetParams.DefaultPort, 10, 16)
+	lport, _ := strconv.ParseInt(activeNetParams.DefaultPort, 10, 0)
 	first := true
 out:
 	for {

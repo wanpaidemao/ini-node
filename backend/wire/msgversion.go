@@ -16,8 +16,10 @@ import (
 // version message (MsgVersion).
 const MaxUserAgentLen = 256
 
-// DefaultUserAgent for wire in the stack
-const DefaultUserAgent = "/btcwire:0.5.0/"
+// DefaultUserAgent is the base user agent for version messages. It is left as
+// a bare leading "/" so that the application-level name/version appended via
+// AddUserAgent becomes the only user agent component (e.g. "/ini:0.0.1/").
+const DefaultUserAgent = "/"
 
 // MsgVersion implements the Message interface and represents a bitcoin version
 // message.  It is used for a peer to advertise itself as soon as an outbound

@@ -1797,11 +1797,21 @@ func (b *BlockChain) initChainState() error {
 			for h := startH; h <= snapHeight; h++ {
 				hash, herr := dbFetchHashByHeight(dbTx, h)
 				if herr != nil {
-					return herr
+					log.Warnf("Snapshot height %d: %v; falling back to full scan", h, herr)
+					useSnapshot = false
+					i = 0
+					lastNode = nil
+					runningWorkSum = nil
+					break
 				}
 				header, status, _, rerr := dbFetchBlockRowByHash(dbTx, hash)
 				if rerr != nil {
-					return rerr
+					log.Warnf("Snapshot height %d hash %s: %v; falling back to full scan", h, hash, rerr)
+					useSnapshot = false
+					i = 0
+					lastNode = nil
+					runningWorkSum = nil
+					break
 				}
 				var parent *blockNode
 				if lastNode != nil && header.PrevBlock == lastNode.hash {
@@ -1822,7 +1832,8 @@ func (b *BlockChain) initChainState() error {
 				lastNode = node
 				i = h
 			}
-		} else {
+		}
+		if !useSnapshot {
 			cursor := blockIndexBucket.Cursor()
 			for ok := cursor.First(); ok; ok = cursor.Next() {
 				header, status, err := deserializeBlockRow(cursor.Value())
@@ -1945,7 +1956,7 @@ func (b *BlockChain) initChainState() error {
 					b.writeLoadProgress(i, headerStateHeight)
 				}
 			}
-		} // end else (full scan fallback) / else 结束（全量扫描回退）
+		} // end full scan fallback / 全量扫描回退
 
 		// Set the best chain view and the best header to the stored best state.
 		tip := b.index.LookupNode(&state.hash)
