@@ -30,6 +30,14 @@ const (
 	// not be performed.
 	BFNoPoWCheck
 
+	// BFMinerSubmit may be set to indicate that the block was submitted by the
+	// local miner via the submitblock RPC.  A miner-submitted block must land
+	// on the network-projected header chain (when that chain already covers
+	// the block's height) before it may become a best-chain tip; otherwise a
+	// locally-mined block that no peer accepts could displace the real
+	// main-chain tip.
+	BFMinerSubmit
+
 	// BFNone is a convenience value to specifically indicate no flags.
 	BFNone BehaviorFlags = 0
 

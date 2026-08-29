@@ -229,6 +229,11 @@ const (
 	// been found to violate a consensus rule, as opposed to having an
 	// invalid ancestor.
 	ErrKnownInvalidBlock
+
+	// ErrMinedBlockNotOnMainChain indicates that a miner-submitted block is
+	// not on the network-projected header chain at its height, so it must not
+	// become a best-chain tip.
+	ErrMinedBlockNotOnMainChain
 )
 
 // Map of ErrorCode values back to their constant names for pretty printing.
@@ -277,6 +282,7 @@ var errorCodeStrings = map[ErrorCode]string{
 	ErrInvalidAncestorBlock:      "ErrInvalidAncestorBlock",
 	ErrPrevBlockNotBest:          "ErrPrevBlockNotBest",
 	ErrKnownInvalidBlock:         "ErrKnownInvalidBlock",
+	ErrMinedBlockNotOnMainChain:  "ErrMinedBlockNotOnMainChain",
 }
 
 // String returns the ErrorCode as a human-readable name.

@@ -92,6 +92,21 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
 	blockHeight := prevNode.height + 1
 	block.SetHeight(blockHeight)
 
+	// A miner-submitted block must land on the network-projected header chain
+	// (when that chain already covers this height) before it may become a
+	// best-chain tip.  This prevents a locally-mined block that no peer accepts
+	// from displacing the real main-chain tip (observed: local block a23e7e62
+	// vs network main-chain 44060189 b345517e).
+	if flags&BFMinerSubmit == BFMinerSubmit {
+		if headerNode := b.bestHeader.NodeByHeight(blockHeight); headerNode != nil &&
+			!headerNode.hash.IsEqual(block.Hash()) {
+			str := fmt.Sprintf("miner-submitted block %v is not on the "+
+				"network main chain (header chain has %v at height %d)",
+				block.Hash(), headerNode.hash, blockHeight)
+			return false, ruleError(ErrMinedBlockNotOnMainChain, str)
+		}
+	}
+
 	// The block must pass all of the validation rules which depend on the
 	// position of the block within the block chain.
 	err := b.checkBlockContext(block, prevNode, flags)
