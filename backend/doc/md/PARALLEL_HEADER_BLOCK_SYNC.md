@@ -1,5 +1,8 @@
 # 并行 Header/Block 同步（Pipelined Initial Sync）方案
 
+> ⚠️ 核对状态（2026-08-30）：本文行号引用已过期（`server.go:3248` → 实际 3378），请以代码为准；并行同步机制已实现。
+> ⚠️ Audit (2026-08-30): line refs stale; parallel sync implemented.
+
 > 目标：header 并行下载期间，一旦已应用的 header 高度领先已连接 block 高度达到阈值，
 > 立即用同一批 peer 同时启动并行 block 下载；header 下载不拆除，两边同时推进，
 > header 全部就位后再由 block 单独追赶至同步。总 IBD 时长从 `T_header + T_block`

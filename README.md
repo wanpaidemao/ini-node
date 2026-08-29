@@ -51,11 +51,10 @@ go build -o btcd.exe .
 
 ---
 
-## 相关仓库 / Related Repos
+## 文档索引 / Documentation
 
-| 仓库 | 说明 |
-|------|------|
-| [wanpaidemao/ini-node](https://github.com/wanpaidemao/ini-node) | 本仓库（Go 全节点） |
-| [sugarchain-project/umami](https://github.com/sugarchain-project/umami) | C++ 原版（Sugarchain Core） |
-| [wanpaidemao/web-wallet](https://github.com/wanpaidemao/web-wallet) | Go 重构 web-wallet |
-| [sugarchain-project/web-wallet](https://github.com/sugarchain-project/web-wallet) | 原版 HTML web-wallet |
+- **开发文档总索引**：见 [dev_doc/README.md](dev_doc/README.md)（按类别：任务规范 / 上游迁移 / 同步存储 / 共识网络 / 前后端 / 启动加载）
+- **任务跟踪**：[dev_doc/待办/待办.md](dev_doc/待办/待办.md)
+- **开发流程与提交规范**：[dev_doc/开发流程与提交规范.md](dev_doc/开发流程与提交规范.md)
+- **btcd 上游同步方案**：[dev_doc/btcd上游同步迁移方案-20260829.md](dev_doc/btcd上游同步迁移方案-20260829.md)
+- **后端技术文档**：`backend/doc/md/`（架构 / 同步 / RPC）

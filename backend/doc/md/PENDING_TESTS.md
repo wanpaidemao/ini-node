@@ -19,7 +19,7 @@
 - [x] **IBD 期间跳过 PoW 检查** — 镜像 umami PR #122
   - `netsync/manager.go` handleHeadersMsg 在 ibdMode 下传 `BFNoPoWCheck`
   - header 同步速率 ~500-870 headers/s（此前 PoW 全量校验约 35/s）
-- [x] **重启后 header 持久化（步骤 2/3）** — `flushToDB` 写入 header-only 节点(`blockIndexBucket`+`hashIndex`,批量 `headerFlushBatchSize=10000`,`FlushBlockIndex` 关停兜底);`bestHeaderState` 存储/恢复 header tip,重启后 `initChainState` 恢复到上次 header tip(双 tip 分离)。单元用例 `TestBestHeaderState`/`TestFlushToDB`(已改"全部节点落盘")✅
+- [x] **重启后 header 持久化（步骤 2/3）** — `flushToDB` 写入 header-only 节点(`blockIndexBucket`+`hashIndex`,批量 `headerFlushBatchSize=20000`,`FlushBlockIndex` 关停兜底);`bestHeaderState` 存储/恢复 header tip,重启后 `initChainState` 恢复到上次 header tip(双 tip 分离)。单元用例 `TestBestHeaderState`/`TestFlushToDB`(已改"全部节点落盘")✅
 - [x] **步骤 4 header 内存窗口化（代码落地 + 单测）** — `--headerwindow=N` 时仅物化每 tip 尾部窗口节点,其余落盘驱逐:
   - `blockIndex.evictWindow` 驱逐 header 边界以下节点(保留 bestChain 尾部窗口,兼容 header 远快于 block 的场景);`chainView.pruneBelow` 割断边界锚点 parent/ancestor
   - 窗口边界锚点 `workSum` 由 `initChainState` 逐行累加(不物化,无启动尖峰);`parentHash` 保留使 header 可重建
@@ -40,7 +40,7 @@
   - `netsync/manager.go` 重写 `fetchHeaders` 为并行下载:`headerSyncState`(`ranges`/`peerRange`/`nextHeight`/`nextAssign`/`target`/`sliceLen`)+ 打乱 higherPeers、封顶 `maxHeaderSyncPeers=8`;切片 `assignHeaderRange`/`launchHeaderRange`(non-overlap,`headerLocator` 用 `HeaderHashByHeight` 定位);乱序到达按序落盘 `handleParallelHeadersMsg`→`processReadyHeaderRanges`(每 front 完成即应用,front peer 接续下一片 + 空闲 peer 顶格)
   - 慢 peer 绕行:`reissueStaleHeaderRanges`/`reissueFrontRange`(`headerRangeStallTimeout` 重发,front 空缺补洞)/`dropHeaderPeer`/`abortHeaderSync`/`finishHeaderSync`;新 peer 折叠 `headerSyncAddPeer`
   - **响应校验守卫**:`handleParallelHeadersMsg` 用 `HeaderHashByHeight(rng.start-1)` 校验 `headers[0].PrevBlock` → 过期/错配响应直接忽略,激进重发安全
-  - leveldb:`database/ffldb/db.go` `defaultCompactionTableSize=16MB`/`defaultWriteBuffer=8MB`(原 2MB → .ldb 数量与写放大骤降;实测 .ldb ~17MB)
+  - leveldb:`database/ffldb/db.go` `defaultCompactionTableSize=64MB`/`defaultWriteBuffer=64MB`(原 2MB → 8/16 → 现 64/64;写放大与 .ldb 数量骤降)
   - **新增 4 单测全绿**:`TestParallelHeaderSync`/`TestParallelHeaderSyncDropFrontPeer`/`TestParallelHeaderSyncShortResponse`/`TestParallelHeaderSyncAddPeer`
 - [x] **并行 header 冒烟(主网临时 datadir,步骤 8 变体)**:8 peer 并行 `getchaintips` 确认 header 高度推进;**验证全干净**:`failed header verification`=0、`stale response`=0、空响应丢 peer=0、崩溃重启=0、stderr=0 字节、RSS 有界(~600MB/650k 高度)
   - 迭代:初版 60s 超时 + 慢 peer 挡 front → ~8k/min;`60s→12s→6s` + 校验守卫 → **~54k/min(≈895 h/s),追平/略超单 peer 基线(40–60k)**;根因 = in-order 落盘下 front 落在慢 peer 上整条下载等满超时,已用短超时 + 守卫解决

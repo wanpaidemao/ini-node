@@ -1,5 +1,8 @@
 # Header 同步内存问题分析(第一优先:同步速度)/ Header Sync Memory Analysis (Speed First)
 
+> ⚠️ 核对状态（2026-08-30）：本文行号引用已过期（偏移 30~330 行），请以代码为准；关键数值已修正（`headerFlushBatchSize=20000` 非 10000）。
+> ⚠️ Audit (2026-08-30): line refs stale; headerFlushBatchSize=20000.
+
 > 状态:分析文档 · 未改代码 · 更新时间:2026-08-12
 > 前提:本 fork 已实现窗口化 + 冷读兜底(见 `HEADER_INDEX_MEMORY.md`,步骤 1-6 已提交),并行 header 拉取已上线(`netsync/manager.go`,`--headerwindow` 窗口生效)。
 
@@ -27,7 +30,7 @@
 
 ### 常量(回退版本,`backend/blockchain/accept.go`)
 ```go
-const headerFlushBatchSize = 10000  // accept.go:20  每收 10000 头 → 批量落盘一次
+const headerFlushBatchSize = 20000  // accept.go:22  每收 20000 头 → 批量落盘一次（现值）
 const blockFlushBatchSize = 1000    // accept.go:25  block 下载期:每连接 1000 块 → 落盘一次
 ```
 

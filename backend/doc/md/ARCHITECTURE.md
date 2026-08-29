@@ -1,5 +1,8 @@
 # Sugarchain 主网节点存储架构 / Storage Architecture
 
+> ⚠️ 核对状态（2026-08-30）：本文行号已按当前代码修正（chainio.go 等偏移 30~331 行），但**行号仍会随代码变动，请以代码为准**；leveldb 参数已修正为 64/64MB。
+> ⚠️ Audit (2026-08-30): line refs updated to current code; treat as approximate.
+
 > 状态:文档 · 更新时间:2026-08-08
 > 依据代码:sugarchain-node 仓库(btcd fork, 含 header 窗口化/冷读/并行同步改造)
 > 本文回答四件事:block 存成什么样、header 存成什么样、二者如何关联、读写流程怎么走。
@@ -34,8 +37,8 @@ sugarmainnet/
 
 | 常量 | 值 | 位置 |
 |---|---|---|
-| `blockFilenameTemplate` | `"%09d" + ".fdb"` | `blockio.go:49` |
-| `blockFileExtension` | `".fdb"` | `blockio.go:50` |
+| `blockFilenameTemplate` | `"%09d" + ".fdb"` | `blockio.go:44` |
+| `blockFileExtension` | `".fdb"` | `blockio.go:33` |
 | `maxBlockFileSize` | `512 * 1024 * 1024`(512 MiB) | `blockio.go:57` |
 
 写满一个文件就落到下一个(`writeBlock`,`blockio.go:432`):当前文件 `<network+len+block+crc>` 的末偏移超过 512MiB 时,关闭当前写文件、`curFileNum++`、`curOffset` 归零。
@@ -97,7 +100,7 @@ header 就是 block 的**前缀 80 字节**。哪个 hash 存哪条记录,由 `f
 
 一行 36B key + 81B value = **117B/条**。header 阶段即全量写入(43.75M 条),block 阶段每块只更新行尾 status 一个字节。
 
-> 注意:`blockheaderidx` 的 height 前缀用 **BigEndian**(`blockIndexKey`,`chainio.go:1935`,为让 leveldb key 高度有序),而 `heightidx`/`hashidx` 用 **LittleEndian**(`byteOrder = binary.LittleEndian`,`chainio.go:89`)。两处字节序不同,极易搞混。
+> 注意:`blockheaderidx` 的 height 前缀用 **BigEndian**(`blockIndexKey`,`chainio.go:2266`,为让 leveldb key 高度有序),而 `heightidx`/`hashidx` 用 **LittleEndian**(`byteOrder = binary.LittleEndian`,`chainio.go:89`)。两处字节序不同,极易搞混。
 
 ### 3.3 内存:blockNode + 滑动窗口
 
@@ -137,7 +140,7 @@ header 就是 block 的**前缀 80 字节**。哪个 hash 存哪条记录,由 `f
 | *(顶层 key)* `chainstate` | `chainstate` | bestChainState 序列化(见 §4.3) | tip 推进 | 主链 tip 持久化 |
 | *(顶层 key)* `headerchainstate` | `headerchainstate` | bestHeaderState(见 §4.3) | bestHeader tip 推进 | **header tip 持久化(崩溃续传关键,本 fork 新增)** |
 
-`chainstate` value 序列化(`chainio.go:1155`):
+`chainstate` value 序列化(`chainio.go:1305`):
 
 ```
 <hash32><height u32 LE><totalTxns u64 LE><workSumLen u32 LE><workSum bytes>
@@ -185,7 +188,7 @@ Blockchain 接受 block
 - 块体写不等 leveldb 缓存:块直接落 `.fdb`,只把 **location** 进缓存 → 缓存留给 metadata 的批量追加型索引。
 - **metadata 缓存 flush 阈值**:`defaultCacheSize=100MB`、`defaultFlushSecs=300s`(`dbcache.go:24, 29`)。
 - 先 sync 后 metadata(`flush/`):保证 `.fdb` 真落盘后才让 index 可见,崩溃时由 §7 的 reconcile 修复。
-- leveldb 调优已改:`CompactionTableSize=16MB`、`WriteBuffer=8MB`(`db.go:2123, 2129`),header 阶段写放大与文件数大降。
+- leveldb 调优已改:`CompactionTableSize=64MB`、`WriteBuffer=64MB`、L0 触发 8、slowdown/pause 24/48(`database/ffldb/db.go:2186,2195,2201`,应用于 openDB ~2273),header 阶段写放大与文件数大降。
 
 ---
 
@@ -198,7 +201,7 @@ Blockchain 接受 block
 ```text
 1. b.nodeAtHeight(h) / index.LookupNode(hash)      # 内存窗口内?直接拿 blockNode
    └─ 窗口外 → materializeColdNode(冷读,§6.3)      # 只拿 header/status,不含 body
-2. db.FetchBlock(hash)  (ffldb, db.go:1312)
+2. db.FetchBlock(hash)  (ffldb, db.go:1340)
       a. pendingBlocks? → 直接返回内存字节
       b. ffldb-blockIdx.Get(hash) → blockLocation(12B)
       c. 打开对应 .fdb → 定位 fileOffset → ReadAt 全长 →
@@ -208,9 +211,9 @@ Blockchain 接受 block
 
 ### 6.2 读区块头
 
-- **带 block:**`dbFetchHeaderByHash`(`chainio.go:1851`)`→ db.FetchBlockHeader(hash)`。
+- **带 block:**`dbFetchHeaderByHash`(`chainio.go:2182`)`→ db.FetchBlockHeader(hash)`。
   ffldb 实现 `FetchBlockHeader = FetchBlockRegion{Hash, offset:0, len:80}` → 先查 `ffldb-blockidx` 拿 location,再 `readBlockRegion` 读记录 `fileOffset+8` 处 80 字节(只读 80B,不读整块)。
-- **header-only(窗口外,内存中只有 header/status):**`dbFetchBlockRowByHeight/ByHash`(`chainio.go:1120`):`heightidx → hash → blockheaderidx → (header, status, height)`,**全程 leveldb,不碰 .fdb 文件** —— 这是 header 窗口化之后冷读的解码路径。
+- **header-only(窗口外,内存中只有 header/status):**`dbFetchBlockRowByHeight/ByHash`(`chainio.go:1242/1268`):`heightidx → hash → blockheaderidx → (header, status, height)`,**全程 leveldb,不碰 .fdb 文件** —— 这是 header 窗口化之后冷读的解码路径。
 - 内存热路径:`blockIndex.LookupNode` 直接返回驻留 `blockNode.Header()`。
 
 ### 6.3 冷读(窗口外兜底,`coldread.go`)
@@ -270,7 +273,7 @@ A: header 已在 metadata,双 tip 恢复 → 不需要;block 由 reconcile 截�
 | ffld 事务/commit/flush | `database/ffldb/db.go`, `database/ffldb/dbcache.go` |
 | 崩溃恢复 reconcile | `database/ffldb/reconcile.go` |
 | header/block 序列化 | `wire/blockheader.go`, `wire/msgblock.go` |
-| chain 层索引 bucket 读写 | `blockchain/chainio.go`(`dbStoreBlockNode:1899`, `blockIndexKey:1935`) |
+| chain 层索引 bucket 读写 | `blockchain/chainio.go`(`dbStoreBlockNode:2230`, `blockIndexKey:2266`) |
 | cold 冷读 | `blockchain/coldread.go` |
 | 内存窗口 | `blockchain/blockindex.go`(setWindow/evictWindow), `chainview.go` |
 | UTXO flush | `blockchain/utxocache.go`(Required/IfNeeded/Periodic) |

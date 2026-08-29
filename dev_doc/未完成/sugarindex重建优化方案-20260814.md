@@ -2,7 +2,8 @@
 
 > 制定日期：2026-08-14
 > 现状：开启 `sugarindex=1` 后节点启动时全量重建地址索引，实测约 **2.4 万块/分钟**，4385 万块全程约 **30 小时**，期间 RPC 不可用。
-> 状态：**方案待定，未实施**（当前重建已在进行，不建议中途打断）。
+> 状态（2026-08-30 对代码核实）：**已部分实施**——`sugarindex/db.go` 的 `WriteBuffer`/`CompactionTableSize` 已调至 **64MB**（:87/:88）；
+> **L0 触发调参、并行重建、批写合并等未实施**。
 
 ---
 
@@ -12,7 +13,7 @@
 |------|------|------|
 | `sugarindex/indexer.go:86-105` | `Init`：`for height := tip+1; height <= best; height++` 逐块同步 | 单线程串行：读区块+读 spend journal+写索引，三者叠加 |
 | `sugarindex/indexer.go:160-185` | `connectBlock`：每块构造 `leveldb.Batch` → `m.db.Write(batch, nil)` | 4385 万块 × 每块一次写事务，写频率极高 |
-| `sugarindex/db.go:33-38` | `openIndexDB`：仅 `BloomFilter(10)`，**无 WriteBuffer/CompactionTableSize/L0 调参** | goleveldb 默认 WriteBuffer 仅 **4 MB** → 频繁刷 L0、海量小 SST、写放大严重 |
+| `sugarindex/db.go:33-38` | `openIndexDB`：`BloomFilter(10)` + **WriteBuffer=64MB** + **CompactionTableSize=64MB**（已调，:87/:88）；**L0 触发未设** | 写缓冲/SST 已放大；L0 触发仍默认 → 部分写放大仍存在 |
 | `sugarindex/db.go:82-` | `putObfuscated`：每次写做 XOR 混淆 | 额外 CPU（相对小头） |
 | 主库 ffldb | `database/ffldb/db.go:2123-2166` | 已调至 WriteBuffer 64MB / Table 64MB / Total 256MB / L0 触发 8 |
 

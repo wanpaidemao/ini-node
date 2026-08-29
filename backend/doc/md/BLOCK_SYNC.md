@@ -1,5 +1,8 @@
 # 区块同步（Block Sync）逻辑详解
 
+> ⚠️ 核对状态（2026-08-30）：本文**行号引用已过期**——代码经窗口化/冷读/并行同步大改后行号偏移 30~330 行，请**以代码为准**；关键数值已修正（`maxBlockRequestWindow=8000`、`headerFlushBatchSize=20000`）。
+> ⚠️ Audit (2026-08-30): line refs are stale after heavy code evolution; verify against code. Key values fixed.
+
 > Sugarchain Go 节点（btcd fork）的完整区块同步机制：下载依据、数据结构、
 > 线格式、存储布局、并行下载。所有代码引用基于当前 `master`。
 > 关键文件：`netsync/manager.go`、`blockchain/chain.go`、`blockchain/chainio.go`、
@@ -233,13 +236,13 @@ type InvVect struct {
 
 | 常量 | 值 | 作用 |
 |---|---|---|
-| `maxBlockRequestWindow` | **2048** | 请求地平线不超过主链 tip 前方 2048 高度 |
+| `maxBlockRequestWindow` | **8000** | 请求地平线不超过主链 tip 前方 8000 高度 |
 | `minInFlightBlocks` | **10** | peer 在途请求数 < 10 时才补量 |
 | `maxRequestedBlocks` | 50,000 | 全局在途请求表上限（超限随机驱逐） |
 
 **为什么要有窗口**：如果一次把剩余整条 header 链（数千万高度）全部请求，
 并行下载会把区块分散到数万高度之外，孤儿池被灌满、低高度块被驱逐、连接卡死。
-窗口把请求限制在主链 tip 前方 2048 高度内，**连接推进时窗口跟着滑**，
+窗口把请求限制在主链 tip 前方 8000 高度内，**连接推进时窗口跟着滑**，
 孤儿数量保持可控。
 
 ---
@@ -282,7 +285,7 @@ type blockSlice struct { start, end int32 }
 ### 6.3 启动并行（`finishHeaderSync`，`manager.go:1753-1813`）
 
 ```
-sliceLen = maxBlockRequestWindow(2048) / len(blockSync)
+sliceLen = maxBlockRequestWindow(8000) / maxHeaderSyncPeers(8) = 1000（当前实现除以 maxHeaderSyncPeers，非活跃 peer 数）
 blockSyncState{ nextAssign: bestHeight+1, target: bestHeaderHeight }
 sm.syncPeer = blockSync[0]                    // 用于 stall/进度跟踪
 for each peer: fetchHeaderBlocks(peer)        // 每个 peer 领第一个 slice
@@ -431,7 +434,7 @@ fetchBlockByHeight(h)   // UTXO 重建专用，不依赖内存节点
 
 - 块数据：`maybeAcceptBlock`（`accept.go:70`）里 `dbStoreBlock` 先写 `.fdb`，
   再推进 `blockDownload` 游标（`accept.go:77-83`）。
-- 索引行：header 批量 flush（每 `headerFlushBatchSize=10000` 个，`accept.go:302-309`）
+- 索引行：header 批量 flush（每 `headerFlushBatchSize=20000` 个）
   或 `connectBlock` 合并提交（每块）。
 - best state：`dbPutBestState` 在 `connectBlock`/`disconnectBlock` 时写 `chainstate`。
 

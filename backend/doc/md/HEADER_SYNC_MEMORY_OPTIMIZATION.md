@@ -1,5 +1,8 @@
 # Header 同步内存/GC 优化方案(FreeOSMemory + 对象池 + 偏移视图)/ Header Sync Memory & GC Optimization Plan
 
+> ⚠️ 核对状态（2026-08-30）：本文行号引用已过期（偏移 30~330 行），请以代码为准；所描述机制（FreeOSMemory/对象池/偏移视图等）**均已实现**；关键数值已修正（GOGC=60 非 10、`headerFlushBatchSize=20000`）。
+> ⚠️ Audit (2026-08-30): line refs stale; mechanisms implemented; GOGC=60, headerFlushBatchSize=20000.
+
 > 状态:方案 · 未改代码 · 更新时间:2026-08-12
 > 关联:`HEADER_INDEX_MEMORY.md`(窗口化,步骤 1-6 已提交)、`HEADER_SYNC_SPEED_MEMORY.md`(速度优先)
 > 范围:本次只出方案,不落代码;按 §5 顺序分步实施、分步验证。
@@ -16,7 +19,7 @@ pprof `inuse_space`(tip≈28.5M 时):
 | 其余(sigcache/treap/big.Int 等) | ~100MB | ~20% | |
 
 - **live 堆 ≈ 473MB**,但 **RSS ≈ 1.25GB**。差值 ~780MB = Go heap arena 高水位(本轮已分配/回收 ~5.4GB blockNode,arena 未归还 OS)+ DB 文件映射缓存。
-- `GOGC=10` **已启用**(`btcd.go:444`,未设环境变量时 `debug.SetGCPercent(10)`)。所以问题不是 GC 频率,而是:① chainView 数组线性增长;② 每 header 的 blockNode(~200B)+ workSum big.Int(~70B) 分配/回收尖峰;③ arena 归还滞后。
+- `GOGC=60` **已启用**(`btcd.go:521`,未设环境变量时 `debug.SetGCPercent(60)`)。所以问题不是 GC 频率,而是:① chainView 数组线性增长;② 每 header 的 blockNode(~200B)+ workSum big.Int(~70B) 分配/回收尖峰;③ arena 归还滞后。
 
 ## 2. 目标
 
@@ -26,7 +29,7 @@ pprof `inuse_space`(tip≈28.5M 时):
 
 ## 3. 改动清单(含用户指定调整)
 
-### A. `headerFlushBatchSize` 10000 → 20000(用户指定,`accept.go:20`)
+### A. `headerFlushBatchSize` 10000 → 20000（已实施，`accept.go:22`）
 - 批量落盘事务频率减半;`forceEvict` 从每 10k 头一次变为**每 20k 头一次**;`FreeOSMemory` 触发点(见 B)随之按 20k 头节奏。
 - 影响:index 上界 = 窗口(50000)+ 一个批量(20000)≈ 70k 节点 ≈ 18MB,无碍;重启重下上限从 ≤10k 翻倍到 ≤20k 头(可接受,header 同步中重启本就罕见)。
 
@@ -110,5 +113,5 @@ A/B/C/D 代码面独立(accept.go / blockindex.go / chainview.go + chain.go 注�
 ## 7. 不做/留待
 
 - UTXO 缓存(100MB+)为块连接期固有,不动。
-- `GOGC=10` 维持;若要更省 CPU,可评估 `GOGC=100 + GOMEMLIMIT=4GiB` 组合(本方案落地后 live 堆已很小,收益有限)。
+- `GOGC=60` 维持（当前代码已设 60）；若要更省 CPU,可评估 `GOGC=100 + GOMEMLIMIT=4GiB` 组合(本方案落地后 live 堆已很小,收益有限)。
 - 块下载期的 `blockSlice`/`requestedBlocks` 内存优化留待 block 阶段观察。

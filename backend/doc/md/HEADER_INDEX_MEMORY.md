@@ -1,5 +1,8 @@
 # Header 索引内存优化(方案 B:落盘 + 滑动窗口)/ Header Index Memory Optimization (Option B: Disk-Backed + Sliding Window)
 
+> ⚠️ 核对状态（2026-08-30）：本文行号引用已过期（代码大改后偏移 30~330 行），请以代码为准；所描述的窗口化/冷读/bestHeaderState 机制**均已实现**。
+> ⚠️ Audit (2026-08-30): line refs stale; mechanisms described are implemented.
+
 > 状态:方案草案 · 更新时间:2026-08-04
 > 状态图例:`[ ]` 待办 · `[~]` 进行中 · `[x]` 已完成
 

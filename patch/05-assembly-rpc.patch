@@ -1,0 +1,1482 @@
+diff --git a/server.go b/server.go
+index f41f0e52..ec39c6fe 100644
+--- a/server.go
++++ b/server.go
+@@ -14,6 +14,8 @@ import (
+ 	"fmt"
+ 	"math"
+ 	"net"
++	"os"
++	"path/filepath"
+ 	"runtime"
+ 	"sort"
+ 	"strconv"
+@@ -37,9 +39,11 @@ import (
+ 	"github.com/btcsuite/btcd/mining/cpuminer"
+ 	"github.com/btcsuite/btcd/netsync"
+ 	"github.com/btcsuite/btcd/peer"
++	"github.com/btcsuite/btcd/sugarindex"
+ 	"github.com/btcsuite/btcd/txscript/v2"
+ 	"github.com/btcsuite/btcd/wire/v2"
+ 	"github.com/decred/dcrd/lru"
++	"github.com/syndtr/goleveldb/leveldb"
+ )
+ 
+ const (
+@@ -64,10 +68,11 @@ const (
+ var (
+ 	// userAgentName is the user agent name and is used to help identify
+ 	// ourselves to other bitcoin peers.
+-	userAgentName = "btcd"
++	userAgentName = "ini"
+ 
+ 	// userAgentVersion is the user agent version and is used to help
+ 	// identify ourselves to other bitcoin peers.
++	// userAgentVersion = fmt.Sprintf("%02d.%02d.%02d", appMajor, appMinor, appPatch)
+ 	userAgentVersion = fmt.Sprintf("%d.%d.%d", appMajor, appMinor, appPatch)
+ )
+ 
+@@ -225,6 +230,7 @@ type peerState struct {
+ 	persistentPeers map[int32]*serverPeer
+ 	banned          map[string]time.Time
+ 	outboundGroups  map[string]int
++	outboundIPs     map[string]int
+ }
+ 
+ // Count returns the count of all known peers.
+@@ -253,6 +259,39 @@ func (ps *peerState) forAllPeers(closure func(sp *serverPeer)) {
+ 	ps.forAllOutboundPeers(closure)
+ }
+ 
++// peerIP extracts the remote host (without port) from a server peer, or an
++// empty string when the peer has no usable network address yet.
++func peerIP(sp *serverPeer) string {
++	na := sp.NA()
++	if na == nil {
++		return ""
++	}
++	lna := na.ToLegacy()
++	if lna == nil || lna.IP == nil {
++		return ""
++	}
++	return lna.IP.String()
++}
++
++// trackOutbound records an outbound peer in both the network-group and the
++// per-IP accounting maps so automatic connections avoid duplicating a host.
++func trackOutbound(state *peerState, sp *serverPeer) {
++	state.outboundGroups[addrmgr.GroupKey(sp.NA())]++
++	if ip := peerIP(sp); ip != "" {
++		state.outboundIPs[ip]++
++	}
++}
++
++// untrackOutbound removes an outbound peer from both accounting maps.
++func untrackOutbound(state *peerState, sp *serverPeer) {
++	if !sp.Inbound() && sp.VersionKnown() {
++		state.outboundGroups[addrmgr.GroupKey(sp.NA())]--
++		if ip := peerIP(sp); ip != "" {
++			state.outboundIPs[ip]--
++		}
++	}
++}
++
+ // cfHeaderKV is a tuple of a filter header and its associated block hash. The
+ // struct is used to cache cfcheckpt responses.
+ type cfHeaderKV struct {
+@@ -306,6 +345,10 @@ type server struct {
+ 	addrIndex *indexers.AddrIndex
+ 	cfIndex   *indexers.CfIndex
+ 
++	// sugarIndex is the umami-byte-compatible address/spent/timestamp index
++	// (raw LevelDB under <datadir>/index).  It powers the getaddress* RPCs.
++	sugarIndex *sugarindex.Manager
++
+ 	// The fee estimator keeps track of how long transactions are left in
+ 	// the mempool before they are mined into blocks.
+ 	feeEstimator *mempool.FeeEstimator
+@@ -1900,7 +1943,25 @@ func (s *server) handleAddPeerMsg(state *peerState, sp *serverPeer) bool {
+ 		delete(state.banned, host)
+ 	}
+ 
+-	// TODO: Check for max peers from a single IP.
++	// Limit the number of inbound peers from a single IP address so one host
++	// cannot exhaust the peer budget.  Whitelisted peers are exempt.
++	if sp.Inbound() && !sp.isWhitelisted && cfg.MaxPeersPerIP > 0 {
++		ip := peerIP(sp)
++		if ip != "" {
++			perIPCount := 0
++			state.forAllPeers(func(ep *serverPeer) {
++				if ep.Connected() && peerIP(ep) == ip {
++					perIPCount++
++				}
++			})
++			if perIPCount >= cfg.MaxPeersPerIP {
++				srvrLog.Infof("Max peers per IP reached [%d] for %s - "+
++					"disconnecting peer %s", cfg.MaxPeersPerIP, ip, sp)
++				sp.Disconnect()
++				return false
++			}
++		}
++	}
+ 
+ 	// Limit max number of total peers.
+ 	if state.Count() >= cfg.MaxPeers {
+@@ -1917,7 +1978,7 @@ func (s *server) handleAddPeerMsg(state *peerState, sp *serverPeer) bool {
+ 	if sp.Inbound() {
+ 		state.inboundPeers[sp.ID()] = sp
+ 	} else {
+-		state.outboundGroups[addrmgr.GroupKey(sp.NA())]++
++		trackOutbound(state, sp)
+ 		if sp.persistent {
+ 			state.persistentPeers[sp.ID()] = sp
+ 		} else {
+@@ -2003,9 +2064,7 @@ func (s *server) handleDonePeerMsg(state *peerState, sp *serverPeer) {
+ 	}
+ 
+ 	if _, ok := list[sp.ID()]; ok {
+-		if !sp.Inbound() && sp.VersionKnown() {
+-			state.outboundGroups[addrmgr.GroupKey(sp.NA())]--
+-		}
++		untrackOutbound(state, sp)
+ 		delete(list, sp.ID())
+ 		srvrLog.Debugf("Removed peer %s", sp)
+ 	}
+@@ -2142,6 +2201,11 @@ type getOutboundGroup struct {
+ 	reply chan int
+ }
+ 
++type getOutboundIP struct {
++	ip    string
++	reply chan int
++}
++
+ type getAddedNodesMsg struct {
+ 	reply chan []*serverPeer
+ }
+@@ -2219,7 +2283,7 @@ func (s *server) handleQuery(state *peerState, querymsg interface{}) {
+ 		found := disconnectPeer(state.persistentPeers, msg.cmp, func(sp *serverPeer) {
+ 			// Keep group counts ok since we remove from
+ 			// the list now.
+-			state.outboundGroups[addrmgr.GroupKey(sp.NA())]--
++			untrackOutbound(state, sp)
+ 		})
+ 
+ 		if found {
+@@ -2234,6 +2298,13 @@ func (s *server) handleQuery(state *peerState, querymsg interface{}) {
+ 		} else {
+ 			msg.reply <- 0
+ 		}
++	case getOutboundIP:
++		count, ok := state.outboundIPs[msg.ip]
++		if ok {
++			msg.reply <- count
++		} else {
++			msg.reply <- 0
++		}
+ 	// Request a list of the persistent (added) peers.
+ 	case getAddedNodesMsg:
+ 		// Respond with a slice of the relevant peers.
+@@ -2255,7 +2326,7 @@ func (s *server) handleQuery(state *peerState, querymsg interface{}) {
+ 		found = disconnectPeer(state.outboundPeers, msg.cmp, func(sp *serverPeer) {
+ 			// Keep group counts ok since we remove from
+ 			// the list now.
+-			state.outboundGroups[addrmgr.GroupKey(sp.NA())]--
++			untrackOutbound(state, sp)
+ 		})
+ 		if found {
+ 			// If there are multiple outbound connections to the same
+@@ -2263,7 +2334,7 @@ func (s *server) handleQuery(state *peerState, querymsg interface{}) {
+ 			// peers are found.
+ 			for found {
+ 				found = disconnectPeer(state.outboundPeers, msg.cmp, func(sp *serverPeer) {
+-					state.outboundGroups[addrmgr.GroupKey(sp.NA())]--
++					untrackOutbound(state, sp)
+ 				})
+ 			}
+ 			msg.reply <- nil
+@@ -2492,6 +2563,7 @@ func (s *server) peerHandler() {
+ 		outboundPeers:   make(map[int32]*serverPeer),
+ 		banned:          make(map[string]time.Time),
+ 		outboundGroups:  make(map[string]int),
++		outboundIPs:     make(map[string]int),
+ 	}
+ 
+ 	if !cfg.DisableDNSSeed {
+@@ -2610,6 +2682,15 @@ func (s *server) OutboundGroupCount(key string) int {
+ 	return <-replyChan
+ }
+ 
++// OutboundIPCount returns the number of currently connected outbound peers
++// with the given remote IP.  It is used to avoid dialing the same host more
++// than once so each of the (limited) outbound slots reaches a distinct node.
++func (s *server) OutboundIPCount(ip string) int {
++	replyChan := make(chan int)
++	s.query <- getOutboundIP{ip: ip, reply: replyChan}
++	return <-replyChan
++}
++
+ // AddBytesSent adds the passed number of bytes to the total bytes sent counter
+ // for the server.  It is safe for concurrent access.
+ func (s *server) AddBytesSent(bytesSent uint64) {
+@@ -2755,6 +2836,21 @@ func (s *server) Stop() error {
+ 		s.rpcServer.Stop()
+ 	}
+ 
++	// Flush any pending block index updates so a restart can resume the
++	// header sync from the last written header instead of re-downloading
++	// the final batch.
++	if err := s.chain.FlushBlockIndex(); err != nil {
++		srvrLog.Errorf("Failed to flush block index: %v", err)
++	}
++
++	// Close the sugar index LevelDB if it was opened.
++	if s.sugarIndex != nil {
++		if err := s.sugarIndex.Close(); err != nil {
++			srvrLog.Errorf("Failed to close sugar index: %v", err)
++		}
++		s.sugarIndex = nil
++	}
++
+ 	// Save fee estimator state in the database.
+ 	s.db.Update(func(tx database.Tx) error {
+ 		metadata := tx.Metadata()
+@@ -2861,7 +2957,7 @@ func (s *server) upnpUpdateThread() {
+ 	// Go off immediately to prevent code duplication, thereafter we renew
+ 	// lease every 15 minutes.
+ 	timer := time.NewTimer(0 * time.Second)
+-	lport, _ := strconv.ParseInt(activeNetParams.DefaultPort, 10, 16)
++	lport, _ := strconv.ParseInt(activeNetParams.DefaultPort, 10, 0)
+ 	first := true
+ out:
+ 	for {
+@@ -2873,7 +2969,7 @@ out:
+ 			// listen port?
+ 			// XXX this assumes timeout is in seconds.
+ 			listenPort, err := s.nat.AddPortMapping("tcp", int(lport), int(lport),
+-				"btcd listen port", 20*60)
++				"ini listen port", 20*60)
+ 			if err != nil {
+ 				srvrLog.Warnf("can't add UPnP port mapping: %v", err)
+ 			}
+@@ -2965,7 +3061,27 @@ func setupRPCListeners() ([]net.Listener, error) {
+ // connections from peers.
+ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
+ 	db database.DB, chainParams *chaincfg.Params,
+-	interrupt <-chan struct{}) (*server, error) {
++	interrupt <-chan struct{}) (retServer *server, retErr error) {
++
++	// sugarIndex tracks the sugar index handle so the error-path defer below
++	// can close it even when the function returns (nil, err) -- every failure
++	// path returns a nil server, so checking retServer would never fire.
++	// The sugar index LevelDB is opened partway through construction (below).
++	// If any later step fails, the open handle would leak and hold the index
++	// directory lock; the automatic metadata-recovery retry in btcd.go would
++	// then fail to reopen it with "being used by another process" and the node
++	// would crash on every startup.  Close it on the error path only -- a
++	// successful return hands ownership to the server, whose Stop() closes it.
++	// sugar index 的 LevelDB 在构造中途打开;若后续步骤失败,泄漏的句柄会占住
++	// index 目录锁,导致 btcd.go 的 metadata 自动恢复重试时 "being used by
++	// another process" 而每次启动即闪退。仅在出错返回时关闭;成功返回时由
++	// server.Stop() 负责关闭。
++	var sugarIndex *sugarindex.Manager
++	defer func() {
++		if retErr != nil && sugarIndex != nil {
++			_ = sugarIndex.Close()
++		}
++	}()
+ 
+ 	services := defaultServices
+ 	if cfg.NoPeerBloomFilters {
+@@ -3069,6 +3185,58 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
+ 		indexManager = indexers.NewManager(db, indexes)
+ 	}
+ 
++	// The sugar index is a standalone umami-byte-compatible raw LevelDB.  It
++	// deliberately replaces btcd's native indexes when enabled (they are not
++	// byte-compatible with umami and would only waste CPU/memory/disk).
++	if cfg.SugarIndex {
++		indexPath := filepath.Join(cfg.DataDir, "index")
++		var siErr error
++		s.sugarIndex, siErr = sugarindex.NewManager(indexPath)
++		if siErr != nil && isCorruptionError(siErr) {
++			// The sugar index LevelDB is corrupted (e.g. a torn write after a
++			// killed node).  The metadata auto-recovery in btcd.go only covers
++			// the block-index metadata DB, so a corrupted index file would
++			// crash every startup forever ("Unable to start server ... bad
++			// magic number").  Recover it here the same way: rebuild the
++			// manifest with goleveldb.RecoverFile; if that also fails, back up
++			// the whole directory aside and recreate the index from scratch
++			// (Init rebuilds it incrementally from the chain).
++			// sugar index LevelDB 损坏(如强杀后的撕裂写)。btcd.go 的 metadata
++			// 自动恢复只覆盖 block-index 的 metadata DB,损坏的 index 文件会让
++			// 每次启动永远闪退("Unable to start server ... bad magic
++			// number")。在此同样方式恢复:用 goleveldb.RecoverFile 重建
++			// manifest;若仍失败,把整个目录备份到一边,从零重建 index
++			// (Init 会从链上增量重建)。
++			srvrLog.Warnf("Sugar index open failed with corruption (%v); "+
++				"attempting automatic recovery", siErr)
++			if ldb, rerr := leveldb.RecoverFile(indexPath, nil); rerr == nil {
++				srvrLog.Infof("Sugar index database recovered successfully")
++				_ = ldb.Close()
++				s.sugarIndex, siErr = sugarindex.NewManager(indexPath)
++			} else {
++				srvrLog.Warnf("Sugar index recovery failed (%v); backing "+
++					"up corrupted index and rebuilding from scratch", rerr)
++				backupPath := fmt.Sprintf("%s.corrupt", indexPath)
++				if berr := os.RemoveAll(backupPath); berr != nil {
++					return nil, berr
++				}
++				if berr := os.Rename(indexPath, backupPath); berr != nil {
++					return nil, berr
++				}
++				s.sugarIndex, siErr = sugarindex.NewManager(indexPath)
++			}
++		}
++		if siErr != nil {
++			return nil, siErr
++		}
++		// Mirror the handle into the local variable so the error-path defer
++		// above can close it if a later construction step fails.
++		// 把句柄镜像到局部变量,后续构造失败时上面的 defer 才能关闭它。
++		sugarIndex = s.sugarIndex
++		sugarindex.UseLogger(indxLog)
++		indexManager = s.sugarIndex
++	}
++
+ 	// Merge given checkpoints with the default ones unless they are disabled.
+ 	var checkpoints []chaincfg.Checkpoint
+ 	if !cfg.DisableCheckpoints {
+@@ -3077,27 +3245,79 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
+ 
+ 	// Log that the node is pruned.
+ 	if cfg.Prune != 0 {
+-		btcdLog.Infof("Prune set to %d MiB", cfg.Prune)
++		iniLog.Infof("Prune set to %d MiB", cfg.Prune)
+ 	}
+ 
+ 	// Create a new block chain instance with the appropriate configuration.
++	// If the sugar index LevelDB is corrupted, IndexManager.Init fails with a
++	// corruption error while wiping/rebuilding the index; back the corrupted
++	// directory up and retry once with a fresh index (Init rebuilds it from
++	// the chain).  Without this every startup crashes forever.
++	// 创建区块链实例。若 sugar index LevelDB 损坏,IndexManager.Init 在
++	// wipe/rebuild 阶段会以 corruption 错误失败;把损坏目录备份后换全新
++	// index 重试一次(Init 会从链上重建)。否则每次启动都会永远闪退。
+ 	var err error
+-	s.chain, err = blockchain.New(&blockchain.Config{
+-		DB:               s.db,
+-		Interrupt:        interrupt,
+-		ChainParams:      s.chainParams,
+-		Checkpoints:      checkpoints,
+-		TimeSource:       s.timeSource,
+-		SigCache:         s.sigCache,
+-		IndexManager:     indexManager,
+-		HashCache:        s.hashCache,
+-		Prune:            cfg.Prune * 1024 * 1024,
+-		UtxoCacheMaxSize: uint64(cfg.UtxoCacheMaxSizeMiB) * 1024 * 1024,
+-	})
++	newChain := func() error {
++		var cerr error
++		s.chain, cerr = blockchain.New(&blockchain.Config{
++			DB:               s.db,
++			Interrupt:        interrupt,
++			ChainParams:      s.chainParams,
++			Checkpoints:      checkpoints,
++			TimeSource:       s.timeSource,
++			SigCache:         s.sigCache,
++			IndexManager:     indexManager,
++			HashCache:        s.hashCache,
++			Prune:            cfg.Prune * 1024 * 1024,
++			UtxoCacheMaxSize: uint64(cfg.UtxoCacheMaxSizeMiB) * 1024 * 1024,
++			SugarIndexDir:    filepath.Join(cfg.DataDir, "index"),
++			HeaderWindow:     cfg.HeaderWindow,
++		})
++		return cerr
++	}
++	err = newChain()
++	if err != nil && cfg.SugarIndex && isCorruptionError(err) {
++		// Close the sugar index handle opened earlier, back the corrupted
++		// directory up, and recreate it from scratch before retrying.
++		// 先关闭前面打开的 sugar index 句柄,备份损坏目录,从零重建后再重试。
++		srvrLog.Warnf("Chain init failed with corruption (%v); backing up "+
++			"corrupted sugar index and retrying with a fresh one", err)
++		if s.sugarIndex != nil {
++			_ = s.sugarIndex.Close()
++			s.sugarIndex = nil
++			sugarIndex = nil
++		}
++		indexPath := filepath.Join(cfg.DataDir, "index")
++		backupPath := indexPath + ".corrupt"
++		if berr := os.RemoveAll(backupPath); berr != nil {
++			return nil, berr
++		}
++		if berr := os.Rename(indexPath, backupPath); berr != nil {
++			return nil, berr
++		}
++		var siErr error
++		s.sugarIndex, siErr = sugarindex.NewManager(indexPath)
++		if siErr != nil {
++			return nil, siErr
++		}
++		sugarIndex = s.sugarIndex
++		indexManager = s.sugarIndex
++		if err = newChain(); err != nil {
++			return nil, err
++		}
++	}
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
++	// Wire the sugar index to the chain so txid lookups (getrawtransaction
++	// via the txid table) can resolve (height, txIndex) entries.
++	// 把 sugar index 挂接上链,使 txid 查询(getrawtransaction 走 txid 表)
++	// 能把 (height, txIndex) 解析为真实交易。
++	if s.sugarIndex != nil {
++		s.sugarIndex.SetChain(s.chain)
++	}
++
+ 	// Search for a FeeEstimator state in the database. If none can be found
+ 	// or if it cannot be loaded, create a new one.
+ 	db.Update(func(tx database.Tx) error {
+@@ -3162,6 +3382,7 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
+ 		ChainParams:        s.chainParams,
+ 		DisableCheckpoints: cfg.DisableCheckpoints,
+ 		MaxPeers:           cfg.MaxPeers,
++		BlockSyncStartLead: cfg.BlockSyncStartLead,
+ 		FeeEstimator:       s.feeEstimator,
+ 	})
+ 	if err != nil {
+@@ -3213,11 +3434,17 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
+ 				// Just check that we don't already have an address
+ 				// in the same group so that we are not connecting
+ 				// to the same network segment at the expense of
+-				// others.
++				// others, and that the exact remote IP is not
++				// already connected so each outbound slot reaches
++				// a distinct node.
+ 				key := addrmgr.GroupKey(addr.NetAddress())
+ 				if s.OutboundGroupCount(key) != 0 {
+ 					continue
+ 				}
++				ip := addr.NetAddress().ToLegacy().IP.String()
++				if ip != "" && s.OutboundIPCount(ip) != 0 {
++					continue
++				}
+ 
+ 				// only allow recent nodes (10mins) after we failed 30
+ 				// times
+@@ -3324,6 +3551,7 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
+ 			AddrIndex:    s.addrIndex,
+ 			CfIndex:      s.cfIndex,
+ 			FeeEstimator: s.feeEstimator,
++			SugarIndex:   s.sugarIndex,
+ 		})
+ 		if err != nil {
+ 			return nil, err
+diff --git a/config.go b/config.go
+index c33a533b..a03db644 100644
+--- a/config.go
++++ b/config.go
+@@ -43,7 +43,8 @@ const (
+ 	defaultLogLevel              = "info"
+ 	defaultLogDirname            = "logs"
+ 	defaultLogFilename           = "btcd.log"
+-	defaultMaxPeers              = 125
++	defaultMaxPeers              = 32
++	defaultMaxPeersPerIP         = 8
+ 	defaultBanDuration           = time.Hour * 24
+ 	defaultBanThreshold          = 100
+ 	defaultConnectTimeout        = time.Second * 30
+@@ -69,6 +70,8 @@ const (
+ 	sampleConfigFilename         = "sample-btcd.conf"
+ 	defaultTxIndex               = false
+ 	defaultAddrIndex             = false
++	defaultSugarIndex            = false
++	defaultBlockSyncStartLead    = 20000
+ 	pruneMinSize                 = 1536
+ )
+ 
+@@ -104,6 +107,15 @@ func validateMaxPeers(maxPeers int) error {
+ 	return nil
+ }
+ 
++// validateMaxPeersPerIP ensures btcd has a positive per-IP inbound peer budget.
++func validateMaxPeersPerIP(maxPeersPerIP int) error {
++	if maxPeersPerIP <= 0 {
++		return fmt.Errorf("maxpeersperip must be greater than zero: %d", maxPeersPerIP)
++	}
++
++	return nil
++}
++
+ // config defines the configuration options for btcd.
+ //
+ // See loadConfig for details on the configuration load process.
+@@ -139,6 +151,7 @@ type config struct {
+ 	LogDir               string        `long:"logdir" description:"Directory to log output."`
+ 	MaxOrphanTxs         int           `long:"maxorphantx" description:"Max number of orphan transactions to keep in memory"`
+ 	MaxPeers             int           `long:"maxpeers" description:"Max number of inbound and outbound peers. Must be greater than zero. Outbound slots for the configured peer mode are reserved before inbound capacity is calculated"`
++	MaxPeersPerIP        int           `long:"maxpeersperip" description:"Max number of inbound peers allowed from a single IP address. Must be greater than zero. Whitelisted peers are exempt."`
+ 	MiningAddrs          []string      `long:"miningaddr" description:"Add the specified payment address to the list of addresses to use for generated blocks -- At least one address is required if the generate option is set"`
+ 	MinRelayTxFee        float64       `long:"minrelaytxfee" description:"The minimum transaction fee in BTC/kB to be considered a non-zero fee."`
+ 	DisableBanning       bool          `long:"nobanning" description:"Disable banning of misbehaving peers"`
+@@ -186,6 +199,9 @@ type config struct {
+ 	TorIsolation         bool          `long:"torisolation" description:"Enable Tor stream isolation by randomizing user credentials for each connection."`
+ 	TrickleInterval      time.Duration `long:"trickleinterval" description:"Minimum time between attempts to send new inventory to a connected peer"`
+ 	UtxoCacheMaxSizeMiB  uint          `long:"utxocachemaxsize" description:"The maximum size in MiB of the UTXO cache"`
++	HeaderWindow         int32         `long:"headerwindow" description:"Keep only this many recent headers (and blocks) in memory; older headers are read from disk on demand. A value of 0 keeps the full index in memory (default, historical btcd behavior)"`
++	BlockSyncStartLead   int32         `long:"blocksyncstartlead" description:"Start downloading blocks while headers are still being downloaded once the applied header tip leads the connected best chain by this many heights. A value of 0 disables the overlap and keeps the historical header-then-block download. A negative value starts block download immediately with the first header batch."`
++	SugarIndex           bool          `long:"sugarindex" description:"Maintain a SugarChain-compatible (umami byte-for-byte) address/spent/timestamp index in <datadir>/index and enable the getaddress* family of RPCs"`
+ 	TxIndex              bool          `long:"txindex" description:"Maintain a full hash-based transaction index which makes all transactions available via the getrawtransaction RPC"`
+ 	V2Transport          bool          `long:"v2transport" description:"Enable P2P v2 encrypted transport protocol (BIP324) (default: false)"`
+ 	UserAgentComments    []string      `long:"uacomment" description:"Comment to add to the user agent -- See BIP 14 for more information."`
+@@ -429,6 +445,7 @@ func loadConfig() (*config, []string, error) {
+ 		ConfigFile:           defaultConfigFile,
+ 		DebugLevel:           defaultLogLevel,
+ 		MaxPeers:             defaultMaxPeers,
++		MaxPeersPerIP:        defaultMaxPeersPerIP,
+ 		BanDuration:          defaultBanDuration,
+ 		BanThreshold:         defaultBanThreshold,
+ 		RPCMaxClients:        defaultMaxRPCClients,
+@@ -453,6 +470,8 @@ func loadConfig() (*config, []string, error) {
+ 		Generate:             defaultGenerate,
+ 		TxIndex:              defaultTxIndex,
+ 		AddrIndex:            defaultAddrIndex,
++		SugarIndex:           defaultSugarIndex,
++		BlockSyncStartLead:   defaultBlockSyncStartLead,
+ 		V2Transport:          false,
+ 	}
+ 
+@@ -813,7 +832,7 @@ func loadConfig() (*config, []string, error) {
+ 	}
+ 
+ 	if cfg.DisableRPC {
+-		btcdLog.Infof("RPC service is disabled")
++		iniLog.Infof("RPC service is disabled")
+ 	}
+ 
+ 	// Default RPC to listen on localhost only.
+@@ -1190,7 +1209,7 @@ func loadConfig() (*config, []string, error) {
+ 	// done.  This prevents the warning on help messages and invalid
+ 	// options.  Note this should go directly before the return.
+ 	if configFileError != nil {
+-		btcdLog.Warnf("%v", configFileError)
++		iniLog.Warnf("%v", configFileError)
+ 	}
+ 
+ 	return &cfg, remainingArgs, nil
+diff --git a/config_test.go b/config_test.go
+index e4b2a95a..9a116be6 100644
+--- a/config_test.go
++++ b/config_test.go
+@@ -32,6 +32,30 @@ func TestValidateMaxPeers(t *testing.T) {
+ 	}
+ }
+ 
++func TestValidateMaxPeersPerIP(t *testing.T) {
++	tests := []struct {
++		name          string
++		maxPeersPerIP int
++		wantErr       bool
++	}{
++		{name: "negative", maxPeersPerIP: -1, wantErr: true},
++		{name: "zero", wantErr: true},
++		{name: "positive", maxPeersPerIP: 1},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			err := validateMaxPeersPerIP(test.maxPeersPerIP)
++			if test.wantErr && err == nil {
++				t.Fatal("expected validation error")
++			}
++			if !test.wantErr && err != nil {
++				t.Fatalf("unexpected validation error: %v", err)
++			}
++		})
++	}
++}
++
+ var (
+ 	rpcuserRegexp = regexp.MustCompile("(?m)^rpcuser=.+$")
+ 	rpcpassRegexp = regexp.MustCompile("(?m)^rpcpass=.+$")
+diff --git a/btcd.go b/btcd.go
+index 1d9a1e5f..7e7a1be7 100644
+--- a/btcd.go
++++ b/btcd.go
+@@ -5,7 +5,9 @@
+ package main
+ 
+ import (
++	"errors"
+ 	"fmt"
++	"io"
+ 	"net"
+ 	"net/http"
+ 	_ "net/http/pprof"
+@@ -20,6 +22,8 @@ import (
+ 	"github.com/btcsuite/btcd/database"
+ 	"github.com/btcsuite/btcd/limits"
+ 	"github.com/btcsuite/btcd/ossec"
++	"github.com/syndtr/goleveldb/leveldb"
++	ldberrors "github.com/syndtr/goleveldb/leveldb/errors"
+ )
+ 
+ const (
+@@ -60,20 +64,20 @@ func btcdMain(serverChan chan<- *server) error {
+ 	// triggered either from an OS signal such as SIGINT (Ctrl+C) or from
+ 	// another subsystem such as the RPC server.
+ 	interrupt := interruptListener()
+-	defer btcdLog.Info("Shutdown complete")
++	defer iniLog.Info("Shutdown complete")
+ 
+ 	// Show version at startup.
+-	btcdLog.Infof("Version %s", version())
++	iniLog.Infof("Version %s", version())
+ 
+ 	// Enable http profiling server if requested.
+ 	if cfg.Profile != "" {
+ 		go func() {
+ 			listenAddr := net.JoinHostPort("", cfg.Profile)
+-			btcdLog.Infof("Profile server listening on %s", listenAddr)
++			iniLog.Infof("Profile server listening on %s", listenAddr)
+ 			profileRedirect := http.RedirectHandler("/debug/pprof",
+ 				http.StatusSeeOther)
+ 			http.Handle("/", profileRedirect)
+-			btcdLog.Errorf("%v", http.ListenAndServe(listenAddr, nil))
++			iniLog.Errorf("%v", http.ListenAndServe(listenAddr, nil))
+ 		}()
+ 	}
+ 
+@@ -81,7 +85,7 @@ func btcdMain(serverChan chan<- *server) error {
+ 	if cfg.CPUProfile != "" {
+ 		f, err := os.Create(cfg.CPUProfile)
+ 		if err != nil {
+-			btcdLog.Errorf("Unable to create cpu profile: %v", err)
++			iniLog.Errorf("Unable to create cpu profile: %v", err)
+ 			return err
+ 		}
+ 		pprof.StartCPUProfile(f)
+@@ -93,7 +97,7 @@ func btcdMain(serverChan chan<- *server) error {
+ 	if cfg.MemoryProfile != "" {
+ 		f, err := os.Create(cfg.MemoryProfile)
+ 		if err != nil {
+-			btcdLog.Errorf("Unable to create memory profile: %v", err)
++			iniLog.Errorf("Unable to create memory profile: %v", err)
+ 			return err
+ 		}
+ 		defer f.Close()
+@@ -105,7 +109,7 @@ func btcdMain(serverChan chan<- *server) error {
+ 	if cfg.TraceProfile != "" {
+ 		f, err := os.Create(cfg.TraceProfile)
+ 		if err != nil {
+-			btcdLog.Errorf("Unable to create execution trace: %v", err)
++			iniLog.Errorf("Unable to create execution trace: %v", err)
+ 			return err
+ 		}
+ 		trace.Start(f)
+@@ -115,7 +119,7 @@ func btcdMain(serverChan chan<- *server) error {
+ 
+ 	// Perform upgrades to btcd as new versions require it.
+ 	if err := doUpgrades(); err != nil {
+-		btcdLog.Errorf("%v", err)
++		iniLog.Errorf("%v", err)
+ 		return err
+ 	}
+ 
+@@ -127,12 +131,12 @@ func btcdMain(serverChan chan<- *server) error {
+ 	// Load the block database.
+ 	db, err := loadBlockDB()
+ 	if err != nil {
+-		btcdLog.Errorf("%v", err)
++		iniLog.Errorf("%v", err)
+ 		return err
+ 	}
+ 	defer func() {
+ 		// Ensure the database is sync'd and closed on shutdown.
+-		btcdLog.Infof("Gracefully shutting down the database...")
++		iniLog.Infof("Gracefully shutting down the database...")
+ 		db.Close()
+ 	}()
+ 
+@@ -147,7 +151,7 @@ func btcdMain(serverChan chan<- *server) error {
+ 	// drops the address index since it relies on it.
+ 	if cfg.DropAddrIndex {
+ 		if err := indexers.DropAddrIndex(db, interrupt); err != nil {
+-			btcdLog.Errorf("%v", err)
++			iniLog.Errorf("%v", err)
+ 			return err
+ 		}
+ 
+@@ -155,7 +159,7 @@ func btcdMain(serverChan chan<- *server) error {
+ 	}
+ 	if cfg.DropTxIndex {
+ 		if err := indexers.DropTxIndex(db, interrupt); err != nil {
+-			btcdLog.Errorf("%v", err)
++			iniLog.Errorf("%v", err)
+ 			return err
+ 		}
+ 
+@@ -163,7 +167,7 @@ func btcdMain(serverChan chan<- *server) error {
+ 	}
+ 	if cfg.DropCfIndex {
+ 		if err := indexers.DropCfIndex(db, interrupt); err != nil {
+-			btcdLog.Errorf("%v", err)
++			iniLog.Errorf("%v", err)
+ 			return err
+ 		}
+ 
+@@ -178,28 +182,28 @@ func btcdMain(serverChan chan<- *server) error {
+ 		return err
+ 	})
+ 	if err != nil {
+-		btcdLog.Errorf("%v", err)
++		iniLog.Errorf("%v", err)
+ 		return err
+ 	}
+ 	if beenPruned && cfg.Prune == 0 {
+ 		err = fmt.Errorf("--prune cannot be disabled as the node has been "+
+ 			"previously pruned. You must delete the files in the datadir: \"%s\" "+
+ 			"and sync from the beginning to disable pruning", cfg.DataDir)
+-		btcdLog.Errorf("%v", err)
++		iniLog.Errorf("%v", err)
+ 		return err
+ 	}
+ 	if beenPruned && cfg.TxIndex {
+ 		err = fmt.Errorf("--txindex cannot be enabled as the node has been "+
+ 			"previously pruned. You must delete the files in the datadir: \"%s\" "+
+ 			"and sync from the beginning to enable the desired index", cfg.DataDir)
+-		btcdLog.Errorf("%v", err)
++		iniLog.Errorf("%v", err)
+ 		return err
+ 	}
+ 	if beenPruned && cfg.AddrIndex {
+ 		err = fmt.Errorf("--addrindex cannot be enabled as the node has been "+
+ 			"previously pruned. You must delete the files in the datadir: \"%s\" "+
+ 			"and sync from the beginning to enable the desired index", cfg.DataDir)
+-		btcdLog.Errorf("%v", err)
++		iniLog.Errorf("%v", err)
+ 		return err
+ 	}
+ 	// If we've previously been pruned and the cfindex isn't present, it means that the
+@@ -211,7 +215,7 @@ func btcdMain(serverChan chan<- *server) error {
+ 			"and sync from the beginning to enable the desired index. You may "+
+ 			"use the --nocfilters flag to start the node up without the compact "+
+ 			"filters", cfg.DataDir)
+-		btcdLog.Errorf("%v", err)
++		iniLog.Errorf("%v", err)
+ 		return err
+ 	}
+ 	// If the user wants to disable the cfindex and is pruned or has enabled pruning, force
+@@ -226,7 +230,7 @@ func btcdMain(serverChan chan<- *server) error {
+ 			"index completely with the --dropcfindex flag and restart the node. " +
+ 			"To keep the compact filters, restart the node without the --nocfilters " +
+ 			"flag")
+-		btcdLog.Errorf("%v", err)
++		iniLog.Errorf("%v", err)
+ 		return err
+ 	}
+ 
+@@ -241,14 +245,14 @@ func btcdMain(serverChan chan<- *server) error {
+ 		err = fmt.Errorf("--prune flag may not be given when the address index " +
+ 			"has been initialized. Please drop the address index with the " +
+ 			"--dropaddrindex flag before enabling pruning")
+-		btcdLog.Errorf("%v", err)
++		iniLog.Errorf("%v", err)
+ 		return err
+ 	}
+ 	if cfg.Prune != 0 && indexers.TxIndexInitialized(db) {
+ 		err = fmt.Errorf("--prune flag may not be given when the transaction index " +
+ 			"has been initialized. Please drop the transaction index with the " +
+ 			"--droptxindex flag before enabling pruning")
+-		btcdLog.Errorf("%v", err)
++		iniLog.Errorf("%v", err)
+ 		return err
+ 	}
+ 
+@@ -266,13 +270,42 @@ func btcdMain(serverChan chan<- *server) error {
+ 	server, err := newServer(cfg.Listeners, cfg.AgentBlacklist,
+ 		cfg.AgentWhitelist, db, activeNetParams.Params, interrupt)
+ 	if err != nil {
+-		// TODO: this logging could do with some beautifying.
+-		btcdLog.Errorf("Unable to start server on %v: %v",
+-			cfg.Listeners, err)
+-		return err
++		// If the failure looks like database corruption (e.g. the node
++		// was killed mid-write, leaving a torn WAL/manifest), attempt to
++		// recover the metadata LevelDB and retry startup once before
++		// giving up.
++		// 若启动失败疑似数据库损坏(如节点被强杀, WAL/manifest 未写完),
++		// 先自动恢复 metadata LevelDB 并重试启动一次, 避免被迫重新同步。
++		if isCorruptionError(err) {
++			iniLog.Errorf("Startup failed with database corruption error: %v; "+
++				"attempting automatic recovery...", err)
++			db.Close()
++			if rerr := recoverMetadataDB(); rerr != nil {
++				iniLog.Errorf("Automatic metadata recovery failed: %v", rerr)
++				iniLog.Errorf("Unable to start server on %v: %v",
++					cfg.Listeners, err)
++				return err
++			}
++			db, err = loadBlockDB()
++			if err != nil {
++				return err
++			}
++			server, err = newServer(cfg.Listeners, cfg.AgentBlacklist,
++				cfg.AgentWhitelist, db, activeNetParams.Params, interrupt)
++			if err != nil {
++				iniLog.Errorf("Unable to start server on %v: %v",
++					cfg.Listeners, err)
++				return err
++			}
++		} else {
++			// TODO: this logging could do with some beautifying.
++			iniLog.Errorf("Unable to start server on %v: %v",
++				cfg.Listeners, err)
++			return err
++		}
+ 	}
+ 	defer func() {
+-		btcdLog.Infof("Gracefully shutting down the server...")
++		iniLog.Infof("Gracefully shutting down the server...")
+ 		server.Stop()
+ 		server.WaitForShutdown()
+ 		srvrLog.Infof("Server shutdown complete")
+@@ -300,7 +333,7 @@ func removeRegressionDB(dbPath string) error {
+ 	// Remove the old regression test database if it already exists.
+ 	fi, err := os.Stat(dbPath)
+ 	if err == nil {
+-		btcdLog.Infof("Removing regression test database from '%s'", dbPath)
++		iniLog.Infof("Removing regression test database from '%s'", dbPath)
+ 		if fi.IsDir() {
+ 			err := os.RemoveAll(dbPath)
+ 			if err != nil {
+@@ -352,7 +385,7 @@ func warnMultipleDBs() {
+ 	// Warn if there are extra databases.
+ 	if len(duplicateDbPaths) > 0 {
+ 		selectedDbPath := blockDbPath(cfg.DbType)
+-		btcdLog.Warnf("WARNING: There are multiple block chain databases "+
++		iniLog.Warnf("WARNING: There are multiple block chain databases "+
+ 			"using different database types.\nYou probably don't "+
+ 			"want to waste disk space by having more than one.\n"+
+ 			"Your current database is located at [%v].\nThe "+
+@@ -361,6 +394,44 @@ func warnMultipleDBs() {
+ 	}
+ }
+ 
++// isCorruptionError returns true when the given error indicates database
++// corruption, e.g. a torn WAL or manifest left behind by a killed node.
++// 判断错误是否为数据库损坏特征(如强杀后 WAL/manifest 未写完)。
++func isCorruptionError(err error) bool {
++	if err == nil {
++		return false
++	}
++	// Explicit database corruption error (checksum failure, etc).
++	var dbErr database.Error
++	if errors.As(err, &dbErr) && dbErr.ErrorCode == database.ErrCorruption {
++		return true
++	}
++	// LevelDB corruption error.
++	if ldberrors.IsCorrupted(err) {
++		return true
++	}
++	// A raw EOF while reading the block index is the classic symptom of a
++	// torn read after a crash.
++	return errors.Is(err, io.EOF)
++}
++
++// recoverMetadataDB attempts to repair the metadata LevelDB (block index)
++// using goleveldb's RecoverFile, which rebuilds the manifest and recovers as
++// much data as possible.  It is only invoked when startup failed with a
++// corruption error, as a last resort before forcing a full resync.
++// 用 goleveldb.RecoverFile 重建损坏的 metadata LevelDB(block index)。
++func recoverMetadataDB() error {
++	dbPath := blockDbPath(cfg.DbType)
++	metadataDbPath := filepath.Join(dbPath, "metadata")
++	iniLog.Infof("Attempting automatic recovery of metadata database at %q", metadataDbPath)
++	ldb, err := leveldb.RecoverFile(metadataDbPath, nil)
++	if err != nil {
++		return err
++	}
++	iniLog.Infof("Metadata database recovered successfully")
++	return ldb.Close()
++}
++
+ // loadBlockDB loads (or creates when needed) the block database taking into
+ // account the selected database backend and returns a handle to it.  It also
+ // contains additional logic such warning the user if there are multiple
+@@ -371,7 +442,7 @@ func loadBlockDB() (database.DB, error) {
+ 	// handle it uniquely.  We also don't want to worry about the multiple
+ 	// database type warnings when running with the memory database.
+ 	if cfg.DbType == "memdb" {
+-		btcdLog.Infof("Creating block database in memory.")
++		iniLog.Infof("Creating block database in memory.")
+ 		db, err := database.Create(cfg.DbType)
+ 		if err != nil {
+ 			return nil, err
+@@ -388,7 +459,7 @@ func loadBlockDB() (database.DB, error) {
+ 	// each run, so remove it now if it already exists.
+ 	removeRegressionDB(dbPath)
+ 
+-	btcdLog.Infof("Loading block database from '%s'", dbPath)
++	iniLog.Infof("Loading block database from '%s'", dbPath)
+ 	db, err := database.Open(cfg.DbType, dbPath, activeNetParams.Net)
+ 	if err != nil {
+ 		// Return the error if it's not because the database doesn't
+@@ -410,7 +481,7 @@ func loadBlockDB() (database.DB, error) {
+ 		}
+ 	}
+ 
+-	btcdLog.Info("Block database loaded")
++	iniLog.Info("Block database loaded")
+ 	return db, nil
+ }
+ 
+@@ -437,11 +508,17 @@ func init() {
+ func main() {
+ 	// If GOGC is not explicitly set, override GC percent.
+ 	if os.Getenv("GOGC") == "" {
+-		// Block and transaction processing can cause bursty allocations.  This
+-		// limits the garbage collector from excessively overallocating during
+-		// bursts.  This value was arrived at with the help of profiling live
+-		// usage.
+-		debug.SetGCPercent(10)
++		// Block and transaction processing can cause bursty allocations.  A
++		// GOGC of 10 (heap may grow only 10% before collection) forced a
++		// collection roughly once a second during initial sync (~0.94 GC/s,
++		// 673 collections in 12 minutes, TotalAlloc ~31.7 MB/s), wasting CPU
++		// on stop-the-world pauses.  60 is a middle ground between the
++		// aggressive 10 and the Go default 100: GC still runs frequently
++		// enough to bound peak heap during the bursty block processing, but
++		// about six times less often than 10, freeing CPU for sync.  The
++		// freeOSMemory hook after each batched flush still returns the heap
++		// arena to the OS, so peak RSS stays in check.
++		debug.SetGCPercent(60)
+ 	}
+ 
+ 	// Up some limits.
+diff --git a/rpcserver.go b/rpcserver.go
+index dcc97fc9..f9c52939 100644
+--- a/rpcserver.go
++++ b/rpcserver.go
+@@ -38,7 +38,9 @@ import (
+ 	"github.com/btcsuite/btcd/mempool"
+ 	"github.com/btcsuite/btcd/mining"
+ 	"github.com/btcsuite/btcd/mining/cpuminer"
++	"github.com/btcsuite/btcd/netsync"
+ 	"github.com/btcsuite/btcd/peer"
++	"github.com/btcsuite/btcd/sugarindex"
+ 	"github.com/btcsuite/btcd/txscript/v2"
+ 	"github.com/btcsuite/btcd/wire/v2"
+ 	"github.com/btcsuite/websocket"
+@@ -149,6 +151,7 @@ var rpcHandlersBeforeInit = map[string]commandHandler{
+ 	"getblockcount":          handleGetBlockCount,
+ 	"getblockhash":           handleGetBlockHash,
+ 	"getblockheader":         handleGetBlockHeader,
++	"getblocksyncstatus":     handleGetBlockSyncStatus,
+ 	"getblocktemplate":       handleGetBlockTemplate,
+ 	"getchaintips":           handleGetChainTips,
+ 	"getcfilter":             handleGetCFilter,
+@@ -187,6 +190,14 @@ var rpcHandlersBeforeInit = map[string]commandHandler{
+ 	"version":                handleVersion,
+ 	"testmempoolaccept":      handleTestMempoolAccept,
+ 	"gettxspendingprevout":   handleGetTxSpendingPrevOut,
++	"getaddressbalance":      handleGetAddressBalance,
++	"getaddressesbalance":     handleGetAddressesBalance,
++	"getaddressutxos":        handleGetAddressUtxos,
++	"getaddressdeltas":       handleGetAddressDeltas,
++	"getaddresstxids":        handleGetAddressTxids,
++	"getaddressmempool":      handleGetAddressMempool,
++	"getblockhashes":         handleGetBlockHashes,
++	"getspentinfo":           handleGetSpentInfo,
+ }
+ 
+ // list of commands that we recognize, but for which btcd has no support because
+@@ -637,6 +648,11 @@ func handleDebugLevel(s *rpcServer, cmd interface{}, closeChan <-chan struct{})
+ 			supportedSubsystems()), nil
+ 	}
+ 
++	// Special get command to report the current log level.
++	if c.LevelSpec == "get" {
++		return currentLogLevel(), nil
++	}
++
+ 	err := parseAndSetDebugLevels(c.LevelSpec)
+ 	if err != nil {
+ 		return nil, &btcjson.RPCError{
+@@ -2616,6 +2632,56 @@ func handleGetPeerInfo(s *rpcServer, cmd interface{}, closeChan <-chan struct{})
+ 	return infos, nil
+ }
+ 
++// handleGetBlockSyncStatus implements the getblocksyncstatus command.  It
++// returns an immutable snapshot of the sync manager's parallel initial
++// download state, exposing the header range and block slice currently assigned
++// to each participating peer so an operator can watch per-node progress.
++func handleGetBlockSyncStatus(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (interface{}, error) {
++	st := s.cfg.SyncMgr.SyncStatus()
++	result := &btcjson.GetBlockSyncStatusResult{
++		Current:          st.Current,
++		IBD:              st.IBD,
++		BestChainHeight:  st.BestChainHeight,
++		HeaderTip:        st.HeaderTip,
++		HeaderTarget:     st.HeaderTarget,
++		HeaderNextAssign: st.HeaderNextAssign,
++		BlockTarget:      st.BlockTarget,
++		BlockNextAssign:  st.BlockNextAssign,
++		BlockWindow:      st.BlockWindow,
++		HeaderSliceLen:   st.HeaderSliceLen,
++		HeaderRecentRanges: make([]btcjson.HeaderRecentRangeResult, 0, len(st.HeaderRecentRanges)),
++		Peers:            make([]btcjson.PeerSyncStatusResult, 0, len(st.Peers)),
++	}
++	for _, w := range st.HeaderRecentRanges {
++		result.HeaderRecentRanges = append(result.HeaderRecentRanges, btcjson.HeaderRecentRangeResult{
++			Start:      w.Start,
++			End:        w.End,
++			Peer:       w.Peer,
++			AssignedAt: w.AssignedAt.Unix(),
++		})
++	}
++	for _, p := range st.Peers {
++		result.Peers = append(result.Peers, btcjson.PeerSyncStatusResult{
++			ID:                     p.ID,
++			Addr:                   p.Addr,
++			SyncNode:               p.SyncNode,
++			SyncCandidate:          p.SyncCandidate,
++			CurrentHeight:          p.CurrentHeight,
++			SliceStart:             p.SliceStart,
++			SliceEnd:               p.SliceEnd,
++			SliceAssignedAt:        p.SliceAssignedAt,
++			SliceReceived:          p.SliceReceived,
++			HeaderRangeStart:       p.HeaderRangeStart,
++			HeaderRangeEnd:         p.HeaderRangeEnd,
++			HeaderRangeReceived:    p.HeaderRangeReceived,
++			HeaderRangeAssignedAt:  p.HeaderRangeAssignedAt,
++			InFlightBlocks:         p.InFlightBlocks,
++			LastBlockAt:            p.LastBlockAt,
++		})
++	}
++	return result, nil
++}
++
+ // handleGetRawMempool implements the getrawmempool command.
+ func handleGetRawMempool(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (interface{}, error) {
+ 	c := cmd.(*btcjson.GetRawMempoolCmd)
+@@ -2658,6 +2724,40 @@ func handleGetRawTransaction(s *rpcServer, cmd interface{}, closeChan <-chan str
+ 	var blkHeight int32
+ 	tx, err := s.cfg.TxMemPool.FetchTransaction(txHash)
+ 	if err != nil {
++		// Plan A: resolve historical transactions via the sugar index
++		// txid table (no native txindex needed).  Handled inline so the
++		// existing TxIndex path below stays untouched.
++		// 方案 A:通过 sugar index 的 txid 表解析历史交易(无需原生 txindex)。
++		// 内联处理,不动下方原有 TxIndex 路径。
++		if s.cfg.SugarIndex != nil {
++			if smtx, smHeight, gErr := s.cfg.SugarIndex.GetTxByHash(txHash); gErr == nil && smtx != nil {
++				if !verbose {
++					hexStr, hexErr := messageToHex(smtx)
++					if hexErr != nil {
++						return nil, hexErr
++					}
++					return hexStr, nil
++				}
++				blkHash, hErr := s.cfg.Chain.BlockHashByHeight(smHeight)
++				if hErr != nil {
++					return nil, internalRPCError(hErr.Error(),
++						"Failed to retrieve block hash")
++				}
++				header, hErr := s.cfg.Chain.HeaderByHash(blkHash)
++				if hErr != nil {
++					return nil, internalRPCError(hErr.Error(),
++						"Failed to fetch block header")
++				}
++				chainHeight := s.cfg.Chain.BestSnapshot().Height
++				rawTxn, rErr := createTxRawResult(s.cfg.ChainParams, smtx,
++					txHash.String(), &header, blkHash.String(), smHeight,
++					chainHeight)
++				if rErr != nil {
++					return nil, rErr
++				}
++				return *rawTxn, nil
++			}
++		}
+ 		if s.cfg.TxIndex == nil {
+ 			return nil, &btcjson.RPCError{
+ 				Code: btcjson.ErrRPCNoTxInfo,
+@@ -3652,7 +3752,11 @@ func handleSubmitBlock(s *rpcServer, cmd interface{}, closeChan <-chan struct{})
+ 
+ 	// Process this block using the same rules as blocks coming from other
+ 	// nodes.  This will in turn relay it to the network like normal.
+-	_, err = s.cfg.SyncMgr.SubmitBlock(block, blockchain.BFNone)
++	// TEMP DEBUG: trace submitblock lifecycle / 临时调试:追踪 submitblock 生命周期
++	hdr := block.MsgBlock().Header
++	rpcsLog.Warnf("TEMP-DBG submitblock received hash=%s prev=%s time=%d bits=%08x", block.Hash(), hdr.PrevBlock, hdr.Timestamp.Unix(), hdr.Bits)
++	isOrphan, err := s.cfg.SyncMgr.SubmitBlock(block, blockchain.BFMinerSubmit)
++	rpcsLog.Warnf("TEMP-DBG submitblock processed hash=%s orphan=%v err=%v", block.Hash(), isOrphan, err)
+ 	if err != nil {
+ 		return fmt.Sprintf("rejected: %s", err.Error()), nil
+ 	}
+@@ -4270,6 +4374,11 @@ func parseCmd(request *btcjson.Request) *parsedRPCCmd {
+ // createMarshalledReply returns a new marshalled JSON-RPC response given the
+ // passed parameters.  It will automatically convert errors that are not of
+ // the type *btcjson.RPCError to the appropriate type as needed.
++//
++// Requests that omit the JSON-RPC version field (common among Bitcoin Core
++// compatible clients such as sugarmaker, which sends no "jsonrpc" member)
++// default to JSON-RPC 1.0 instead of failing to marshal the response and
++// returning an empty body that clients cannot parse.
+ func createMarshalledReply(rpcVersion btcjson.RPCVersion, id interface{}, result interface{}, replyErr error) ([]byte, error) {
+ 	var jsonErr *btcjson.RPCError
+ 	if replyErr != nil {
+@@ -4280,6 +4389,12 @@ func createMarshalledReply(rpcVersion btcjson.RPCVersion, id interface{}, result
+ 		}
+ 	}
+ 
++	// Match the behavior of btcjson.NewRequest, which defaults to
++	// JSON-RPC 1.0 when no version is specified.
++	if !rpcVersion.IsValid() {
++		rpcVersion = btcjson.RpcVersion1
++	}
++
+ 	return btcjson.MarshalResponse(rpcVersion, id, result, jsonErr)
+ }
+ 
+@@ -4796,6 +4911,10 @@ type rpcserverSyncManager interface {
+ 	// used to sync from or 0 if there is none.
+ 	SyncPeerID() int32
+ 
++	// SyncStatus returns an immutable snapshot of the parallel initial
++	// download state (per-peer header ranges and block slices).
++	SyncStatus() *netsync.SyncStatus
++
+ 	// LocateHeaders returns the headers of the blocks after the first known
+ 	// block in the provided locators until the provided stop hash or the
+ 	// current tip is reached, up to a max of wire.MaxBlockHeadersPerMsg
+@@ -4848,6 +4967,11 @@ type rpcserverConfig struct {
+ 	AddrIndex *indexers.AddrIndex
+ 	CfIndex   *indexers.CfIndex
+ 
++	// SugarIndex is the umami-byte-compatible address/spent/timestamp index
++	// backing the getaddress* family of RPCs.  It may be nil when the
++	// --sugarindex flag is not set.
++	SugarIndex *sugarindex.Manager
++
+ 	// The fee estimator keeps track of how long transactions are left in
+ 	// the mempool before they are mined into blocks.
+ 	FeeEstimator *mempool.FeeEstimator
+diff --git a/rpcserver_test.go b/rpcserver_test.go
+index d3e9da06..fc9d4c44 100644
+--- a/rpcserver_test.go
++++ b/rpcserver_test.go
+@@ -3,6 +3,7 @@ package main
+ import (
+ 	"bytes"
+ 	"encoding/hex"
++	"encoding/json"
+ 	"errors"
+ 	"testing"
+ 
+@@ -666,3 +667,26 @@ func TestGetTxSpendingPrevOut(t *testing.T) {
+ 	require.NoError(err)
+ 	require.Equal(expectedResults, results)
+ }
++
++// TestCreateMarshalledReplyNoRpcVersion ensures a request that omits the
++// JSON-RPC version field (as sugarmaker does) still yields a valid response
++// instead of failing to marshal and producing an empty body that clients
++// cannot parse.
++func TestCreateMarshalledReplyNoRpcVersion(t *testing.T) {
++	require := require.New(t)
++
++	msg, err := createMarshalledReply("", 0, "ok", nil)
++	require.NoError(err)
++
++	var reply struct {
++		Jsonrpc string `json:"jsonrpc"`
++		Result  string `json:"result"`
++		Error   interface{} `json:"error"`
++		ID      int `json:"id"`
++	}
++	require.NoError(json.Unmarshal(msg, &reply))
++	require.Equal("1.0", reply.Jsonrpc)
++	require.Equal("ok", reply.Result)
++	require.Nil(reply.Error)
++	require.Equal(0, reply.ID)
++}
+diff --git a/rpcserverhelp.go b/rpcserverhelp.go
+index 34a6c74a..c3316f06 100644
+--- a/rpcserverhelp.go
++++ b/rpcserverhelp.go
+@@ -21,7 +21,7 @@ var helpDescsEnUS = map[string]string{
+ 		"The levelspec can either a debug level or of the form:\n" +
+ 		"<subsystem>=<level>,<subsystem2>=<level2>,...\n" +
+ 		"The valid debug levels are trace, debug, info, warn, error, and critical.\n" +
+-		"The valid subsystems are AMGR, ADXR, BCDB, BMGR, BTCD, CHAN, DISC, PEER, RPCS, SCRP, SRVR, and TXMP.\n" +
++		"The valid subsystems are AMGR, ADXR, BCDB, BMGR, INI, CHAN, DISC, PEER, RPCS, SCRP, SRVR, and TXMP.\n" +
+ 		"Finally the keyword 'show' will return a list of the available subsystems.",
+ 	"debuglevel-levelspec":   "The debug level(s) to use or the keyword 'show'",
+ 	"debuglevel--condition0": "levelspec!=show",
+@@ -506,6 +506,37 @@ var helpDescsEnUS = map[string]string{
+ 	// GetPeerInfoCmd help.
+ 	"getpeerinfo--synopsis": "Returns data about each connected network peer as an array of json objects.",
+ 
++	// GetBlockSyncStatusCmd help.
++	"getblocksyncstatus--synopsis": "Returns an immutable snapshot of the sync manager's parallel initial download state, including the header range and block slice assigned to each participating peer.",
++
++	// GetBlockSyncStatusResult help.
++	"getblocksyncstatusresult-current":            "Whether or not the node believes it is synced with the connected peers",
++	"getblocksyncstatusresult-ibd":                "Whether or not the node is in initial block download mode",
++	"getblocksyncstatusresult-best_chain_height":  "The height of the connected best chain",
++	"getblocksyncstatusresult-header_tip":         "The highest known header height",
++	"getblocksyncstatusresult-header_target":      "The height the parallel header download is driving toward (0 if none)",
++	"getblocksyncstatusresult-header_next_assign": "The next height the header download will hand to a peer (0 if none)",
++	"getblocksyncstatusresult-block_target":       "The height the parallel block download is driving toward (0 if none)",
++	"getblocksyncstatusresult-block_next_assign":  "The next height the block download will hand to a peer (0 if none)",
++	"getblocksyncstatusresult-block_window":       "The request horizon ahead of the connected chain the block download may prefetch",
++	"getblocksyncstatusresult-peers":              "Every connected peer with its sync role and assigned work",
++
++	// PeerSyncStatusResult help.
++	"peersyncstatusresult-id":                   "The peer's unique node ID",
++	"peersyncstatusresult-addr":                 "The ip address and port of the peer",
++	"peersyncstatusresult-sync_node":            "Whether or not the peer is the current sync peer",
++	"peersyncstatusresult-sync_candidate":       "Whether or not the peer is a candidate for downloading blocks",
++	"peersyncstatusresult-current_height":       "The latest block height known to the peer",
++	"peersyncstatusresult-slice_start":          "The start height of the block slice currently assigned to the peer (equals slice_end when none)",
++	"peersyncstatusresult-slice_end":            "The end height of the block slice currently assigned to the peer (exclusive)",
++	"peersyncstatusresult-slice_assigned_at":    "Unix seconds when the current block slice was assigned",
++	"peersyncstatusresult-header_range_start":   "The start height of the header range currently assigned to the peer (equals header_range_end when none)",
++	"peersyncstatusresult-header_range_end":     "The end height of the header range currently assigned to the peer (exclusive)",
++	"peersyncstatusresult-header_range_received": "Whether or not the assigned header range has been received",
++	"peersyncstatusresult-header_range_assigned_at": "Unix seconds when the current header range was assigned",
++	"peersyncstatusresult-in_flight_blocks":     "The number of blocks requested from this peer that have not yet been delivered",
++	"peersyncstatusresult-last_block_at":        "Unix seconds the peer last delivered a block (0 if never)",
++
+ 	// GetRawMempoolVerboseResult help.
+ 	"getrawmempoolverboseresult-size":             "Transaction size in bytes",
+ 	"getrawmempoolverboseresult-fee":              "Transaction fee in bitcoins",
+@@ -777,6 +808,7 @@ var rpcResultTypes = map[string][]interface{}{
+ 	"getblockheader":         {(*string)(nil), (*btcjson.GetBlockHeaderVerboseResult)(nil)},
+ 	"getblocktemplate":       {(*btcjson.GetBlockTemplateResult)(nil), (*string)(nil), nil},
+ 	"getblockchaininfo":      {(*btcjson.GetBlockChainInfoResult)(nil)},
++	"getblocksyncstatus":     {(*btcjson.GetBlockSyncStatusResult)(nil)},
+ 	"getchaintips":           {(*[]btcjson.GetChainTipsResult)(nil)},
+ 	"getcfilter":             {(*string)(nil)},
+ 	"getcfilterheader":       {(*string)(nil)},
+diff --git a/rpcadapters.go b/rpcadapters.go
+index 602c6c95..70f6f480 100644
+--- a/rpcadapters.go
++++ b/rpcadapters.go
+@@ -277,6 +277,15 @@ func (b *rpcSyncMgr) SyncPeerID() int32 {
+ 	return b.syncMgr.SyncPeerID()
+ }
+ 
++// SyncStatus returns an immutable snapshot of the parallel initial download
++// state (per-peer header ranges and block slices).
++//
++// This function is safe for concurrent access and is part of the
++// rpcserverSyncManager interface implementation.
++func (b *rpcSyncMgr) SyncStatus() *netsync.SyncStatus {
++	return b.syncMgr.SyncStatus()
++}
++
+ // LocateHeaders returns the hashes of the blocks after the first known block in
+ // the provided locators until the provided stop hash or the current tip is
+ // reached, up to a max of wire.MaxBlockHeadersPerMsg hashes.
+diff --git a/log.go b/log.go
+index 54dcb9f1..1cba217d 100644
+--- a/log.go
++++ b/log.go
+@@ -60,7 +60,7 @@ var (
+ 	amgrLog = backendLog.Logger("AMGR")
+ 	cmgrLog = backendLog.Logger("CMGR")
+ 	bcdbLog = backendLog.Logger("BCDB")
+-	btcdLog = backendLog.Logger("BTCD")
++	iniLog = backendLog.Logger("INI")
+ 	chanLog = backendLog.Logger("CHAN")
+ 	discLog = backendLog.Logger("DISC")
+ 	indxLog = backendLog.Logger("INDX")
+@@ -97,7 +97,7 @@ var subsystemLoggers = map[string]btclog.Logger{
+ 	"AMGR":                amgrLog,
+ 	"CMGR":                cmgrLog,
+ 	"BCDB":                bcdbLog,
+-	"BTCD":                btcdLog,
++	"INI":                 iniLog,
+ 	"CHAN":                chanLog,
+ 	"DISC":                discLog,
+ 	"INDX":                indxLog,
+@@ -156,6 +156,23 @@ func setLogLevels(logLevel string) {
+ 	}
+ }
+ 
++// currentLogLevel returns the current log level of all subsystems as a
++// string.  When every subsystem is set to the same level, that single level
++// is returned; otherwise the level of the main INI subsystem is returned as
++// a representative value (frontends consume a single dropdown value).
++func currentLogLevel() string {
++	rep := subsystemLoggers["INI"].Level()
++	for id, logger := range subsystemLoggers {
++		if id == "INI" {
++			continue
++		}
++		if logger.Level() != rep {
++			return rep.String()
++		}
++	}
++	return rep.String()
++}
++
+ // directionString is a helper function that returns a string that represents
+ // the direction of a connection (inbound or outbound).
+ func directionString(inbound bool) string {
+diff --git a/signal.go b/signal.go
+index 5e60783e..9e058888 100644
+--- a/signal.go
++++ b/signal.go
+@@ -30,11 +30,11 @@ func interruptListener() <-chan struct{} {
+ 		// channel to notify the caller.
+ 		select {
+ 		case sig := <-interruptChannel:
+-			btcdLog.Infof("Received signal (%s).  Shutting down...",
++			iniLog.Infof("Received signal (%s).  Shutting down...",
+ 				sig)
+ 
+ 		case <-shutdownRequestChannel:
+-			btcdLog.Info("Shutdown requested.  Shutting down...")
++			iniLog.Info("Shutdown requested.  Shutting down...")
+ 		}
+ 		close(c)
+ 
+@@ -44,11 +44,11 @@ func interruptListener() <-chan struct{} {
+ 		for {
+ 			select {
+ 			case sig := <-interruptChannel:
+-				btcdLog.Infof("Received signal (%s).  Already "+
++				iniLog.Infof("Received signal (%s).  Already "+
+ 					"shutting down...", sig)
+ 
+ 			case <-shutdownRequestChannel:
+-				btcdLog.Info("Shutdown requested.  Already " +
++				iniLog.Info("Shutdown requested.  Already " +
+ 					"shutting down...")
+ 			}
+ 		}
+diff --git a/service_windows.go b/service_windows.go
+index 01edf3db..81bcb8b3 100644
+--- a/service_windows.go
++++ b/service_windows.go
+@@ -16,16 +16,16 @@ import (
+ )
+ 
+ const (
+-	// svcName is the name of btcd service.
+-	svcName = "btcdsvc"
++	// svcName is the name of ini service.
++	svcName = "inisvc"
+ 
+ 	// svcDisplayName is the service name that will be shown in the windows
+ 	// services list.  Not the svcName is the "real" name which is used
+ 	// to control the service.  This is only for display purposes.
+-	svcDisplayName = "Btcd Service"
++	svcDisplayName = "Ini Service"
+ 
+ 	// svcDesc is the description of the service.
+-	svcDesc = "Downloads and stays synchronized with the bitcoin block " +
++	svcDesc = "Downloads and stays synchronized with the sugarchain block " +
+ 		"chain and provides chain services to applications."
+ )
+ 
+diff --git a/upgrade.go b/upgrade.go
+index 5dec8d4c..34ea9871 100644
+--- a/upgrade.go
++++ b/upgrade.go
+@@ -117,7 +117,7 @@ func upgradeDataPaths() error {
+ 	// Only migrate if the old path exists and the new one doesn't.
+ 	if fileExists(oldHomePath) && !fileExists(newHomePath) {
+ 		// Create the new path.
+-		btcdLog.Infof("Migrating application home path from '%s' to '%s'",
++		iniLog.Infof("Migrating application home path from '%s' to '%s'",
+ 			oldHomePath, newHomePath)
+ 		err := os.MkdirAll(newHomePath, 0700)
+ 		if err != nil {
+@@ -155,7 +155,7 @@ func upgradeDataPaths() error {
+ 				return err
+ 			}
+ 		} else {
+-			btcdLog.Warnf("Not removing '%s' since it contains files "+
++			iniLog.Warnf("Not removing '%s' since it contains files "+
+ 				"not created by this application.  You may "+
+ 				"want to manually move them or delete them.",
+ 				oldHomePath)
+diff --git a/version.go b/version.go
+index 58d1b0d5..f7a60702 100644
+--- a/version.go
++++ b/version.go
+@@ -17,12 +17,12 @@ const semanticAlphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqr
+ // versioning 2.0.0 spec (http://semver.org/).
+ const (
+ 	appMajor uint = 0
+-	appMinor uint = 26
+-	appPatch uint = 2
++	appMinor uint = 0
++	appPatch uint = 1
+ 
+ 	// appPreRelease MUST only contain characters from semanticAlphabet
+ 	// per the semantic versioning spec.
+-	appPreRelease = "beta"
++	appPreRelease = "Test"
+ )
+ 
+ // appBuild is defined as a variable so it can be overridden during the build
+@@ -34,7 +34,7 @@ var appBuild string
+ // semantic versioning 2.0.0 spec (http://semver.org/).
+ func version() string {
+ 	// Start with the major, minor, and patch versions.
+-	version := fmt.Sprintf("%d.%d.%d", appMajor, appMinor, appPatch)
++	version := fmt.Sprintf("%02d.%02d.%02d", appMajor, appMinor, appPatch)
+ 
+ 	// Append pre-release version if there is one.  The hyphen called for
+ 	// by the semantic versioning spec is automatically appended and should
+diff --git a/cmd/btcctl/version.go b/cmd/btcctl/version.go
+index 8da196be..0ce2eab3 100644
+--- a/cmd/btcctl/version.go
++++ b/cmd/btcctl/version.go
+@@ -17,12 +17,12 @@ const semanticAlphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqr
+ // versioning 2.0.0 spec (http://semver.org/).
+ const (
+ 	appMajor uint = 0
+-	appMinor uint = 23
++	appMinor uint = 0
+ 	appPatch uint = 1
+ 
+ 	// appPreRelease MUST only contain characters from semanticAlphabet
+ 	// per the semantic versioning spec.
+-	appPreRelease = "beta"
++	appPreRelease = "Test"
+ )
+ 
+ // appBuild is defined as a variable so it can be overridden during the build
+@@ -34,7 +34,7 @@ var appBuild string
+ // semantic versioning 2.0.0 spec (http://semver.org/).
+ func version() string {
+ 	// Start with the major, minor, and patch versions.
+-	version := fmt.Sprintf("%d.%d.%d", appMajor, appMinor, appPatch)
++	version := fmt.Sprintf("%02d.%02d.%02d", appMajor, appMinor, appPatch)
+ 
+ 	// Append pre-release version if there is one.  The hyphen called for
+ 	// by the semantic versioning spec is automatically appended and should
+diff --git a/doc.go b/doc.go
+index 47e4e626..b8b3acfa 100644
+--- a/doc.go
++++ b/doc.go
+@@ -79,7 +79,9 @@ Application Options:
+ 	    --maxorphantx=          Max number of orphan transactions to keep in
+ 	                            memory (default: 100)
+ 	    --maxpeers=             Max number of inbound and outbound peers
+-	                            (default: 125)
++	                            (default: 32)
++	    --maxpeersperip=        Max number of inbound peers from a single IP
++	                            address (default: 8)
+ 	    --miningaddr=           Add the specified payment address to the list of
+ 	                            addresses to use for generated blocks -- At least
+ 	                            one address is required if the generate option is
