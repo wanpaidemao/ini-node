@@ -42,6 +42,7 @@ import (
 	"github.com/btcsuite/btcd/peer"
 	"github.com/btcsuite/btcd/sugarindex"
 	"github.com/btcsuite/btcd/txscript/v2"
+	"github.com/btcsuite/btcd/wallet"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/websocket"
 )
@@ -191,13 +192,20 @@ var rpcHandlersBeforeInit = map[string]commandHandler{
 	"testmempoolaccept":      handleTestMempoolAccept,
 	"gettxspendingprevout":   handleGetTxSpendingPrevOut,
 	"getaddressbalance":      handleGetAddressBalance,
-	"getaddressesbalance":     handleGetAddressesBalance,
+	"getaddressesbalance":    handleGetAddressesBalance,
 	"getaddressutxos":        handleGetAddressUtxos,
 	"getaddressdeltas":       handleGetAddressDeltas,
 	"getaddresstxids":        handleGetAddressTxids,
 	"getaddressmempool":      handleGetAddressMempool,
 	"getblockhashes":         handleGetBlockHashes,
 	"getspentinfo":           handleGetSpentInfo,
+	"createwallet":           handleCreateWallet,
+	"getnewaddress":          handleGetNewAddress,
+	"getwalletinfo":          handleGetWalletInfo,
+	"listtransactions":       handleListTransactions,
+	"listunspent":            handleListUnspent,
+	"walletlock":             handleWalletLock,
+	"walletpassphrase":       handleWalletPassphrase,
 }
 
 // list of commands that we recognize, but for which btcd has no support because
@@ -2639,18 +2647,18 @@ func handleGetPeerInfo(s *rpcServer, cmd interface{}, closeChan <-chan struct{})
 func handleGetBlockSyncStatus(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (interface{}, error) {
 	st := s.cfg.SyncMgr.SyncStatus()
 	result := &btcjson.GetBlockSyncStatusResult{
-		Current:          st.Current,
-		IBD:              st.IBD,
-		BestChainHeight:  st.BestChainHeight,
-		HeaderTip:        st.HeaderTip,
-		HeaderTarget:     st.HeaderTarget,
-		HeaderNextAssign: st.HeaderNextAssign,
-		BlockTarget:      st.BlockTarget,
-		BlockNextAssign:  st.BlockNextAssign,
-		BlockWindow:      st.BlockWindow,
-		HeaderSliceLen:   st.HeaderSliceLen,
+		Current:            st.Current,
+		IBD:                st.IBD,
+		BestChainHeight:    st.BestChainHeight,
+		HeaderTip:          st.HeaderTip,
+		HeaderTarget:       st.HeaderTarget,
+		HeaderNextAssign:   st.HeaderNextAssign,
+		BlockTarget:        st.BlockTarget,
+		BlockNextAssign:    st.BlockNextAssign,
+		BlockWindow:        st.BlockWindow,
+		HeaderSliceLen:     st.HeaderSliceLen,
 		HeaderRecentRanges: make([]btcjson.HeaderRecentRangeResult, 0, len(st.HeaderRecentRanges)),
-		Peers:            make([]btcjson.PeerSyncStatusResult, 0, len(st.Peers)),
+		Peers:              make([]btcjson.PeerSyncStatusResult, 0, len(st.Peers)),
 	}
 	for _, w := range st.HeaderRecentRanges {
 		result.HeaderRecentRanges = append(result.HeaderRecentRanges, btcjson.HeaderRecentRangeResult{
@@ -2662,21 +2670,21 @@ func handleGetBlockSyncStatus(s *rpcServer, cmd interface{}, closeChan <-chan st
 	}
 	for _, p := range st.Peers {
 		result.Peers = append(result.Peers, btcjson.PeerSyncStatusResult{
-			ID:                     p.ID,
-			Addr:                   p.Addr,
-			SyncNode:               p.SyncNode,
-			SyncCandidate:          p.SyncCandidate,
-			CurrentHeight:          p.CurrentHeight,
-			SliceStart:             p.SliceStart,
-			SliceEnd:               p.SliceEnd,
-			SliceAssignedAt:        p.SliceAssignedAt,
-			SliceReceived:          p.SliceReceived,
-			HeaderRangeStart:       p.HeaderRangeStart,
-			HeaderRangeEnd:         p.HeaderRangeEnd,
-			HeaderRangeReceived:    p.HeaderRangeReceived,
-			HeaderRangeAssignedAt:  p.HeaderRangeAssignedAt,
-			InFlightBlocks:         p.InFlightBlocks,
-			LastBlockAt:            p.LastBlockAt,
+			ID:                    p.ID,
+			Addr:                  p.Addr,
+			SyncNode:              p.SyncNode,
+			SyncCandidate:         p.SyncCandidate,
+			CurrentHeight:         p.CurrentHeight,
+			SliceStart:            p.SliceStart,
+			SliceEnd:              p.SliceEnd,
+			SliceAssignedAt:       p.SliceAssignedAt,
+			SliceReceived:         p.SliceReceived,
+			HeaderRangeStart:      p.HeaderRangeStart,
+			HeaderRangeEnd:        p.HeaderRangeEnd,
+			HeaderRangeReceived:   p.HeaderRangeReceived,
+			HeaderRangeAssignedAt: p.HeaderRangeAssignedAt,
+			InFlightBlocks:        p.InFlightBlocks,
+			LastBlockAt:           p.LastBlockAt,
 		})
 	}
 	return result, nil
@@ -4971,6 +4979,12 @@ type rpcserverConfig struct {
 	// backing the getaddress* family of RPCs.  It may be nil when the
 	// --sugarindex flag is not set.
 	SugarIndex *sugarindex.Manager
+
+	// Wallet is the built-in HD wallet manager.  It is always present, but its
+	// query RPCs (getwalletinfo / listtransactions / listunspent) require the
+	// sugar index to be enabled.
+	// Wallet 为内置 HD 钱包管理器，始终存在；其查询类 RPC 需要启用 sugar 索引。
+	Wallet *wallet.Manager
 
 	// The fee estimator keeps track of how long transactions are left in
 	// the mempool before they are mined into blocks.

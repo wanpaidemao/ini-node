@@ -41,6 +41,7 @@ import (
 	"github.com/btcsuite/btcd/peer"
 	"github.com/btcsuite/btcd/sugarindex"
 	"github.com/btcsuite/btcd/txscript/v2"
+	"github.com/btcsuite/btcd/wallet"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/decred/dcrd/lru"
 	"github.com/syndtr/goleveldb/leveldb"
@@ -348,6 +349,13 @@ type server struct {
 	// sugarIndex is the umami-byte-compatible address/spent/timestamp index
 	// (raw LevelDB under <datadir>/index).  It powers the getaddress* RPCs.
 	sugarIndex *sugarindex.Manager
+
+	// walletMgr is the built-in HD wallet manager.  It manages the encrypted
+	// wallet file under <datadir>/wallet.db and is always created (independent
+	// of the optional indexes); its query RPCs additionally require sugarIndex.
+	// walletMgr 为内置 HD 钱包管理器，管理 <datadir>/wallet.db 加密钱包文件，
+	// 始终创建（独立于可选索引）；其查询类 RPC 还需依赖 sugarIndex。
+	walletMgr *wallet.Manager
 
 	// The fee estimator keeps track of how long transactions are left in
 	// the mempool before they are mined into blocks.
@@ -3243,6 +3251,14 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 		checkpoints = mergeCheckpoints(s.chainParams.Checkpoints, cfg.addCheckpoints)
 	}
 
+	// The built-in wallet manager is always created (independent of the
+	// optional indexes). Its query RPCs additionally require the sugar index
+	// to be enabled; see walletrpcserver.go.
+	// 内置钱包管理器始终创建（独立于可选索引）；其查询类 RPC 还需 sugar 索引
+	// 已启用，详见 walletrpcserver.go。
+	s.walletMgr = wallet.NewManager(
+		filepath.Join(cfg.DataDir, wallet.DefaultWalletName), chainParams)
+
 	// Log that the node is pruned.
 	if cfg.Prune != 0 {
 		iniLog.Infof("Prune set to %d MiB", cfg.Prune)
@@ -3552,6 +3568,7 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 			CfIndex:      s.cfIndex,
 			FeeEstimator: s.feeEstimator,
 			SugarIndex:   s.sugarIndex,
+			Wallet:       s.walletMgr,
 		})
 		if err != nil {
 			return nil, err
