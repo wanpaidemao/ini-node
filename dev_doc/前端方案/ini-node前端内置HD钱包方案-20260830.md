@@ -106,7 +106,7 @@ backend (btcd fork)
 |---|---|---|
 | **Step 1** ✅ | `backend/wallet/` 包：HD 主钥/派生/BIP39 助记词/地址 + 单测 | ✅ `d9ba99f4`，`go test` 6 例全绿 |
 | **Step 2** ✅ | 加密存储 db + walletpassphrase/walletlock | ✅ `450228df`：SaveWallet/UnlockWallet（scrypt+AES-GCM），Lock 清空密钥；建→锁→解锁→地址一致（11 单测全绿） |
-| **Step 3** | 查询 RPC（walletinfo/getnewaddress/listtransactions/listunspent） | btcctl 调通 |
+| **Step 3** ✅ | 查询 RPC（getwalletinfo/getnewaddress/listtransactions/listunspent + 生命周期） | ✅ `542f7a71`：7 命令实现；查询依赖 sugarindex（未启用明确报错）；待节点验证 |
 | **Step 4** | 发送 RPC（buildpsbt/signrawtransaction/sendtoaddress）+ 联调 | 真实转账上链 |
 | **Step 5** | 前端接线 + UI 联调 | 前端真实余额/历史/发送 |
 
