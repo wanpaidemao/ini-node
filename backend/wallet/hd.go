@@ -41,9 +41,11 @@ const (
 // Wallet 是基于 BIP39 种子的 BIP44 分层确定性钱包。
 type Wallet struct {
 	net       *chaincfg.Params        // network parameters / 网络参数
-	masterKey *hdkeychain.ExtendedKey // BIP32 master key / BIP32 主密钥
+	masterKey *hdkeychain.ExtendedKey // BIP32 master key (nil while locked) / BIP32 主密钥（锁定时为 nil）
 	coinType  uint32                  // hardened coin type / 硬化币种类型
 	account   uint32                  // hardened account / 硬化账户
+	seed      []byte                  // BIP39 seed, cleared on lock / BIP39 种子（锁定时清空）
+	nextIndex uint32                  // next external address index / 下一个外部地址索引
 }
 
 // NewFromSeed creates a Wallet from a BIP39-derived seed using the default
@@ -63,12 +65,58 @@ func NewFromSeedPath(seed []byte, net *chaincfg.Params, coinType, account uint32
 	if err != nil {
 		return nil, fmt.Errorf("new master key / 创建主密钥: %w", err)
 	}
-	return &Wallet{net: net, masterKey: master, coinType: coinType, account: account}, nil
+	return &Wallet{
+		net:       net,
+		masterKey: master,
+		coinType:  coinType,
+		account:   account,
+		seed:      append([]byte(nil), seed...),
+	}, nil
+}
+
+// Lock zeroes the in-memory key material (seed and master key), leaving the
+// wallet unable to derive addresses until unlocked again via UnlockWallet.
+// Lock 清空内存中的密钥材料（种子与主密钥），钱包进入锁定态，需重新解锁后才能派生地址。
+func (w *Wallet) Lock() {
+	if w.masterKey != nil {
+		w.masterKey.Zero()
+	}
+	if w.seed != nil {
+		for i := range w.seed {
+			w.seed[i] = 0
+		}
+		w.seed = nil
+	}
+	w.masterKey = nil
+}
+
+// locked returns a descriptive error when the wallet is locked.
+// locked 在钱包锁定状态下返回描述性错误。
+func (w *Wallet) locked() error {
+	if w.masterKey == nil {
+		return fmt.Errorf("wallet is locked / 钱包已锁定")
+	}
+	return nil
+}
+
+// NextIndex returns the next external address index to hand out.
+// NextIndex 返回下一个待分配的外部地址索引。
+func (w *Wallet) NextIndex() uint32 {
+	return w.nextIndex
+}
+
+// SetNextIndex advances the next address index (persisted on save).
+// SetNextIndex 推进下一个地址索引（保存时持久化）。
+func (w *Wallet) SetNextIndex(i uint32) {
+	w.nextIndex = i
 }
 
 // childKey derives the extended key at path m/44'/coinType'/account'/chain/index.
 // childKey 派生路径 m/44'/coinType'/account'/chain/index 的扩展密钥。
 func (w *Wallet) childKey(chain, index uint32) (*hdkeychain.ExtendedKey, error) {
+	if err := w.locked(); err != nil {
+		return nil, err
+	}
 	purposeKey, err := w.masterKey.Derive(uint32(Purpose) + hdkeychain.HardenedKeyStart) // 44'
 	if err != nil {
 		return nil, err
