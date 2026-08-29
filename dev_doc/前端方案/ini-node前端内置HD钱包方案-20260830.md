@@ -104,7 +104,7 @@ backend (btcd fork)
 
 | 步骤 | 内容 | 验收 |
 |---|---|---|
-| **Step 1** | `backend/wallet/` 包：HD 主钥/派生/BIP39 助记词/地址 + 单测 | `go test` 全绿（助记词回环、BIP44 派生、地址一致） |
+| **Step 1** ✅ | `backend/wallet/` 包：HD 主钥/派生/BIP39 助记词/地址 + 单测 | ✅ `d9ba99f4`，`go test` 6 例全绿 |
 | **Step 2** | 加密存储 db + walletpassphrase/walletlock | 建→锁→解锁→地址一致 |
 | **Step 3** | 查询 RPC（walletinfo/getnewaddress/listtransactions/listunspent） | btcctl 调通 |
 | **Step 4** | 发送 RPC（buildpsbt/signrawtransaction/sendtoaddress）+ 联调 | 真实转账上链 |
