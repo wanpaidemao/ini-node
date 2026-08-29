@@ -1,7 +1,9 @@
 # btcd 共识 override 化（注入点）设计方案 / Consensus Override via Injection Points
 
 > 设计日期：2026-08-29
-> 决策背景：已选择"方案 3（注入点/真 override）"，目标是让 btcd 本体保持上游原版，
+> **状态：备选方案（standby）**。因上游同步节奏为"1-2 年一次"（见 btcd上游同步迁移方案 v3），
+> 当前主方案为"保留 fork + patch-queue 补丁化管理"；本设计仅在冲突爆炸或同步需求变频繁时启用。
+> 决策背景：本设计原为"方案 3（注入点/真 override）"，目标是让 btcd 本体保持上游原版，
 > Sugarchain 共识差异通过注入点接入，升级 btcd = 换版本号 + 重放钩子层，彻底告别 9000 行 merge 痛苦。
 > 前置依赖：dev_doc/btcd上游同步迁移方案-20260829.md（分叉面收敛清单）
 
