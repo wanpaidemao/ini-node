@@ -101,12 +101,15 @@ backend (btcd fork)
 - 种子/私钥仅密文落盘；解锁口令不入前端、私钥不进前端
 - RPC 沿用 btcd-runtime.ini 认证；钱包 RPC 可加"仅本机回环"约束
 
-### 5.7 邮箱密码登录（Legacy KDF，新增）
-- **移植**：web-wallet `internal/wallet/kdf.go` 的 `LegacyRegularSeed` → `backend/wallet/kdf.go`（含 JS UTF-16 长度对齐，中文/emoji 不串；52 轮 SHA-256，确定性）
+### 5.7 邮箱密码登录（Legacy KDF，新增 · 优化版）
+- **移植**：web-wallet `internal/wallet/kdf.go` 的 `LegacyRegularSeed` → `backend/wallet/kdf.go`
+  （含 JS UTF-16 长度对齐，中文/emoji 不串；52 轮 SHA-256，确定性；**纯 stdlib 无新依赖**）
 - **接入**：`NewFromLegacy(email, password, net)` = `LegacyRegularSeed(email,password)` → 32B 种子 → 复用 `NewFromSeed`（同一 BIP44 派生）
-- **RPC**：`walletlogin "email" "password"` → 派生 → 加密落盘 `wallet.db`（与 BIP39 二选一，同文件）→ 解锁
+- **RPC**：`walletlogin "email" "password"` → 派生 → **纯内存解锁（不落盘）**，与 BIP39 的 `wallet.db` **完全隔离、互不覆盖**
+  - 理由（优化）：legacy 确定性派生、登录即恢复，无需加密落盘；**去掉"与 BIP39 二选一共用 wallet.db"的耦合**，两种登录方式天然隔离
+  - nextIndex 防地址复用：复用旁车文件（wallet.db.meta）持久化
 - **特点**：确定性登录即恢复，**无需助记词备份**；兼容原 web-wallet / 原 HTML 钱包（同算法）
-- **前端**：Create/登录页提供"助记词"与"邮箱密码"两种方式（二选一使用）
+- **前端**：登录页（邮箱+密码）与创建页（BIP39 助记词）两个独立入口
 
 ### 5.8 代币层接入（REST 代理，新增）
 - **背景**：代币 = OP_RETURN + 链外记账，账本在 `https://tokenstest.sugar.wtf`（web-wallet TokenClient 已验证，见其 `internal/api/token.go`）；umami/ini-node 节点本身都无代币逻辑
@@ -115,11 +118,18 @@ backend (btcd fork)
   - `tokeninfo <ticker>` → `GET /layer/token/{ticker}`
   - `tokenparams` → `GET /layer/params`
   - `tokenbuild <type> <args>` → `POST /message/{create|issue|transfer|burn}` 构造 OP_RETURN 负载（配合 sendtoaddress 发送）
+- **代码形态（对齐同步方案 v3）**：`tokenapi/` 包 + `tokenrpcserver.go` 均为**新增文件**，不碰共识/blockchain，**上游同步零冲突**（对应 v3 处置清单"新增（应用层）"类）
 - **配置**：baseURL 可配（测试网 tokenstest；主网待确认）；外网可达性依赖网络代理
 - **边界**：若外网服务不可达或需自建，才是真正的大工程（复刻 OP_RETURN 解析记账），本方案默认不涉及
 
-### 5.9 umami 转账参考（Step 4 对齐）
-umami（C++）`sendtoaddress` 流程（`src/wallet/spend.cpp`）：**选币 → 建交易（输出+找零）→ 签名（P2WPKH）→ 广播**。ini-node Step 4 以 `listunspent`（选币）+ 移植 web-wallet `tx.BuildAndSign`（建交易+签名）+ `sendrawtransaction`（广播）对齐实现。
+### 5.9 umami 转账参考（Step 5 对齐）
+umami（C++）`sendtoaddress` 流程（`src/wallet/spend.cpp`）：**选币 → 建交易（输出+找零）→ 签名（P2WPKH）→ 广播**。ini-node Step 5 以 `listunspent`（选币）+ 移植 web-wallet `tx.BuildAndSign`（建交易+签名）+ `sendrawtransaction`（广播）对齐实现。
+
+### 5.10 对齐开发规范（优化说明）
+- **UI 先行**：Step 7 前端接线前**先设计界面**（开发流程第 2 条）：登录页 / 创建页（助记词）/ Wallet（余额·历史·代币）/ Send
+- **新增为主 / 零冲突**：钱包与代币代码全部为**新增文件**（`wallet/`、`walletrpcserver.go`、`tokenapi/`、`tokenrpcserver.go`），不改 btcd 共识/blockchain；rpcserver/server 仅做"新增为主"的薄 fork（加 map/config 字段），**上游同步零冲突**（对齐 v3 处置清单）
+- **文档同步**：新增钱包/代币 RPC 后**同步更新 `backend/doc/md/` RPC 文档并标注核对日期**（Checklist 第 6 条）
+- **依赖**：仅 `go-bip39`（已在 D 盘缓存）；Legacy KDF 纯 stdlib；代币 REST 用 `net/http`
 
 ---
 
@@ -130,10 +140,10 @@ umami（C++）`sendtoaddress` 流程（`src/wallet/spend.cpp`）：**选币 → 
 | **Step 1** ✅ | `backend/wallet/` 包：HD 主钥/派生/BIP39 助记词/地址 + 单测 | ✅ `d9ba99f4`，`go test` 6 例全绿 |
 | **Step 2** ✅ | 加密存储 db + walletpassphrase/walletlock | ✅ `450228df`：SaveWallet/UnlockWallet（scrypt+AES-GCM），Lock 清空密钥；建→锁→解锁→地址一致（11 单测全绿） |
 | **Step 3** ✅ | 查询 RPC（getwalletinfo/getnewaddress/listtransactions/listunspent + 生命周期） | ✅ `542f7a71`：7 命令实现；查询依赖 sugarindex（未启用明确报错）；待节点验证 |
-| **Step 4** | 邮箱密码登录（Legacy KDF）：移植 kdf.go + NewFromLegacy + walletlogin RPC + 单测 | 与 web-wallet 同邮箱密码派生出相同地址（交叉验证） |
+| **Step 4** | 邮箱密码登录（Legacy KDF）：移植 kdf.go + NewFromLegacy + walletlogin RPC（纯内存解锁，不落盘）+ 单测 | 与 web-wallet 同邮箱密码派生出相同地址（交叉验证） |
 | **Step 5** | 发送 RPC：sendtoaddress（选币+建交易+签名+广播）+ signrawtransaction | 真实转账上链（对齐 umami 流程） |
-| **Step 6** | 代币接入：tokenapi 包 + token 代理 RPC | tokenbalance/info/params/build 调通 tokenstest |
-| **Step 7** | 前端接线：登录/创建页 + services.ts 去 mock + Wallet/Create/Send/Tokens 真实数据 | 前端真实余额/历史/发送/代币 |
+| **Step 6** | 代币接入：tokenapi 包（新增）+ token 代理 RPC（新增） | tokenbalance/info/params/build 调通 tokenstest |
+| **Step 7** | **UI 先行**：设计登录/创建/Wallet/Send/Tokens 界面 → services.ts 去 mock 接线 → 同步 backend/doc/md RPC 文档 | 前端真实余额/历史/发送/代币 |
 
 > 每步遵循 `dev_doc/开发流程与提交规范.md`：读现状→方案→分步→双语注释→gofmt/vet/test→同步文档→提交。
 
@@ -142,7 +152,7 @@ umami（C++）`sendtoaddress` 流程（`src/wallet/spend.cpp`）：**选币 → 
 ## 七、边界与后续 / Boundaries
 - 多地址已由 BIP44 覆盖；HD 路径/coinType 可配置
 - 查任意历史需 `txindex=1`（待办 #2）；getaddressdeltas 不依赖
-- **BIP39 与邮箱密码二选一使用**（同一 wallet.db 文件）；邮箱密码登录确定性恢复、无备份负担
+- **BIP39（wallet.db 落盘）与邮箱密码（纯内存派生）天然隔离**，可同时支持，互不覆盖；邮箱密码确定性恢复、无备份负担
 - **代币走 tokenstest REST 代理**，节点不实现代币协议；主网 token 服务地址待确认；外网不可达则代币功能暂不可用
 - web-wallet 保留 rpcclient 直连（待办 #3）
 - 未来：钱包核心抽共享 go module，两端同源
