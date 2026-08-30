@@ -134,6 +134,31 @@ umami（C++）`sendtoaddress` 流程（`src/wallet/spend.cpp`）：**选币 → 
 - **文档同步**：新增钱包/代币 RPC 后**同步更新 `backend/doc/md/` RPC 文档并标注核对日期**（Checklist 第 6 条）
 - **依赖**：仅 `go-bip39`（已在 D 盘缓存）；Legacy KDF 纯 stdlib；代币 REST 用 `net/http`
 
+### 5.11 发送链路（P0 · 新增 2026-08-31，对齐 web-wallet `SendTransactionMulti`）
+
+**架构决策**：发送走 **Wails binding（进程内）**，不走节点 RPC——与 Step 7 已确立的钱包架构一致；UTXO 查询走"本节点 listunspent → 外部 REST `/unspent/{addr}` 降级"两级链（复用 chainSource 设置）。
+
+**后端（frontend/gosend.go 新增 `SendService`）**：
+- 移植 web-wallet `internal/tx` 的 `BuildAndSign`（P2WPKH 签名）+ `Input/Output` 结构（来源：web-wallet/sugar-wallet/internal/tx/）
+- Bindings：`Send(outputs, fee)`（单/多输出统一，对齐 `SendTransactionMulti`：UTXO 覆盖 total+fee、找零回自身地址、广播失败仍返回 rawHex）、`BroadcastRaw(hex)`（重试路径）、`EstimateFee()`（REST `/fee` 降级链）、`UTXOs()`（Coin Control）
+- web 邮箱钱包（单密钥）与 HD（index 0）统一用当前地址签名/找零
+
+**前端**：
+- Send 页：多输出行动态增删（≤10）、费用估算按钮、确认 modal（输入数/总额/找零）、结果卡（txid+rawHex+重试按钮）、近期收款人下拉（localStorage）
+- Wallet 页 history txid 内链 → 交易详情（依赖 Step 10 Explorer，先做外链）
+
+### 5.12 地址三型切换（P1 · 新增 2026-08-31，对齐 web-wallet `GetAddress`/`RefreshWallet`）
+
+- 移植 web-wallet `internal/address`（`DeriveAll(pubKey, params)`：同公钥派生 bech32/segwit/legacy 三型）
+- `WalletService.AddressFor(type)` binding；钱包设置新增"地址类型"（立即生效，钱包页地址/QR/余额/历史全刷新，对齐 web 版 `RefreshWallet` 行为）
+- 动机：web 版老用户 segwit/legacy 地址可能有历史余额；切换即可查（本节点 sugarindex 支持任意地址查询）
+
+### 5.13 Explorer 三级页（P2 · 新增 2026-08-31，对齐 web-wallet Explorer）
+
+- 路由：`#/explorer`（链统计+最新区块列表）、`#/explorer/block/<hash>`、`#/explorer/tx/<txid>`
+- 数据全走本节点 RPC（getblockchaininfo/getblockhash/getblock/getrawtransaction）——**桌面前端独有优势**（web 版要靠外部 REST）
+- 依赖：交易详情需节点 `txindex=1`（未开启时区块内交易只显示 txid 列表）
+
 ---
 
 ## 六、分步实施 / Steps（按开发规范流程）
@@ -146,7 +171,12 @@ umami（C++）`sendtoaddress` 流程（`src/wallet/spend.cpp`）：**选币 → 
 | **Step 4** ✅ | 邮箱密码登录（Legacy KDF）：移植 kdf.go + NewFromLegacy + walletlogin RPC（纯内存解锁，不落盘）+ 单测 | ✅ `68623664`：混合模式交叉验证通过（index 0 = web-wallet 地址，外部测试向量）；8 单测全绿 |
 | **Step 5** | 发送 RPC：sendtoaddress（选币+建交易+签名+广播）+ signrawtransaction | 真实转账上链（对齐 umami 流程） |
 | **Step 6** | 代币接入：tokenapi 包（新增）+ token 代理 RPC（新增） | tokenbalance/info/params/build 调通 tokenstest |
-| **Step 7** 🔶 | **UI 先行**：设计登录/创建/Wallet/Send/Tokens 界面 → services.ts 去 mock 接线 → 同步 backend/doc/md RPC 文档 | 🔶（2026-08-30）UI 先行部分完成：登录/创建/Wallet/Send 三页改造 + services.ts 钱包查询去 mock + i18n×9；余额/历史已通真实 RPC；🔶（2026-08-30）新增钱包设置二级页面（`wallet-settings` 路由：自动锁定/隐藏余额/历史条数，localStorage 持久化 + 自动锁定接 walletlock RPC）；发送待 Step 5、代币待 Step 6 |
+| **Step 6b** | **代币四操作对齐**（§ 功能差距清单 P1）：移植 web-wallet `internal/api/token.go` + `TokenTransfer/Create/Issue/Burn` bindings → Tokens tab 真实 UI | 钱包页 Tokens tab 可查余额/转账/创建/增发/销毁（tokenstest 联调） |
+| **Step 7** 🔶 | **UI 先行**：设计登录/创建/Wallet/Send/Tokens 界面 → services.ts 去 mock 接线 → 同步 backend/doc/md RPC 文档 | 🔶（2026-08-30）UI 先行部分完成：登录/创建/Wallet/Send 三页改造 + services.ts 钱包查询去 mock + i18n×9；余额/历史已通真实 RPC；🔶（2026-08-30）新增钱包设置二级页面（`wallet-settings` 路由：自动锁定/隐藏余额/历史条数，localStorage 持久化 + 自动锁定接 walletlock RPC）；发送待 Step 8、代币待 Step 6 |
+| **Step 8** | **发送链路（P0）**：§5.11——gosend.go 移植 BuildAndSign + Send/BroadcastRaw/EstimateFee/UTXOs bindings → Send 页多输出+确认 modal+近期收款人 | regtest/主网真实转账上链；广播失败可 rawHex 重试 |
+| **Step 9** | **地址三型切换（P1）**：§5.12——移植 internal/address 三型派生 + AddressFor binding + 设置项即时生效 | 同一密钥三型地址可查余额/历史（sugarindex 验证） |
+| **Step 10** | **Explorer（P2）**：§5.13——三级路由 + 本节点 RPC 数据 + 历史 txid 内链 | 链统计/区块列表/区块详情/交易详情四视图可用 |
+| **Step 11** | P3 收尾：WIF 导入（OpenWalletKey 对应 binding）+ Broadcast 并入控制台 | 旧钱包可导入 |
 
 > 每步遵循 `dev_doc/开发流程与提交规范.md`：读现状→方案→分步→双语注释→gofmt/vet/test→同步文档→提交。
 
