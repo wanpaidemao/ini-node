@@ -533,26 +533,122 @@ export const Services = {
     }
   },
 
-  // ── Wallet (mock until Go wallet layer exists) ────────────────
+  // ── Wallet (real RPCs backed by the built-in HD wallet) ────────
+  // Lifecycle/key commands always work; balance & history additionally
+  // require --sugarindex on the node (they degrade gracefully here).
+  // 钱包服务(真实 RPC,由内置 HD 钱包提供):生命周期/密钥命令始终可用;
+  // 余额与历史另需节点启用 --sugarindex(此处优雅降级)。
+
+  // getwalletinfo → WalletState; a locked/not-created wallet maps to the
+  // locked shell so the page can show the unlock form.
+  // getwalletinfo → WalletState;锁定/未创建的钱包映射为锁定外壳状态,
+  // 以便页面展示解锁表单。
   async getWallet(): Promise<WalletState> {
-    return {
-      locked: false,
-      total: 0,
-      confirmed: 0,
-      pending: 0,
-      immature: 0,
-      watchOnly: 0,
-      address: null,
-      defaultWalletName: "main",
-    };
+    try {
+      const r = await rpc<{
+        locked: boolean;
+        walletname: string;
+        address: string;
+        total: number;
+        confirmed: number;
+        pending: number;
+        immature: number;
+        watchonly: number;
+      }>("getwalletinfo");
+      return {
+        locked: false,
+        total: r.total,
+        confirmed: r.confirmed,
+        pending: r.pending,
+        immature: r.immature,
+        watchOnly: r.watchonly,
+        address: r.address,
+        defaultWalletName: r.walletname,
+      };
+    } catch (e) {
+      const msg = String(e);
+      // Locked / not created / manager unavailable → locked shell state.
+      // 锁定/未创建/管理器不可用 → 锁定外壳状态。
+      if (msg.includes("locked") || msg.includes("not created") || msg.includes("not available")) {
+        return {
+          locked: true,
+          total: 0,
+          confirmed: 0,
+          pending: 0,
+          immature: 0,
+          watchOnly: 0,
+          address: null,
+          defaultWalletName: "main",
+        };
+      }
+      throw e;
+    }
   },
 
-  async unlock(_pass: string): Promise<boolean> {
-    return true;
+  // walletpassphrase <pass> 0 → unlock the BIP39 wallet.db.
+  // walletpassphrase <pass> 0 → 解锁 BIP39 wallet.db。
+  async unlock(pass: string): Promise<boolean> {
+    try {
+      await rpc("walletpassphrase", pass, 0);
+      return true;
+    } catch {
+      return false;
+    }
   },
 
+  // walletlogin <email> <pass> → legacy in-memory login; returns the primary
+  // (web-wallet compatible) address. / 邮箱密码登录(纯内存),返回主地址。
+  async login(email: string, password: string): Promise<{ address: string }> {
+    return rpc<{ address: string }>("walletlogin", email, password);
+  },
+
+  // createwallet → fresh BIP39 wallet; the mnemonic is returned once.
+  // createwallet → 全新 BIP39 钱包;助记词仅返回一次。
+  async createWallet(pass: string): Promise<{
+    name: string;
+    mnemonic: string;
+    address: string;
+  }> {
+    return rpc("createwallet", "default", false, false, pass, false);
+  },
+
+  // walletlock → drop in-memory key material. / walletlock → 丢弃内存密钥。
+  async lockWallet(): Promise<void> {
+    await rpc("walletlock");
+  },
+
+  // getnewaddress → next derived address (advances the persisted index).
+  // getnewaddress → 下一个派生地址(推进持久化索引)。
+  async getNewAddress(): Promise<string> {
+    return rpc<string>("getnewaddress");
+  },
+
+  // listtransactions → recent wallet history mapped to the frontend Tx shape.
+  // Degrades to [] when the sugar index is disabled so the page stays usable.
+  // listtransactions → 映射为前端 Tx 形态的近期历史;sugar 索引未启用时降级为
+  // 空数组,页面保持可用。
   async getHistory(): Promise<Tx[]> {
-    return [];
+    try {
+      const rs = await rpc<
+        Array<{
+          category: "send" | "receive";
+          address?: string;
+          amount: number;
+          txid: string;
+          blocktime: number;
+          confirmations: number;
+        }>
+      >("listtransactions", "*", 25);
+      return rs.map((r) => ({
+        time: r.blocktime,
+        dir: r.category === "send" ? "out" : "in",
+        amount: r.amount,
+        status: r.confirmations > 0 ? "confirmed" : "pending",
+        hash: r.txid,
+      }));
+    } catch {
+      return []; // sugarindex off / wallet locked → empty history / 索引未启用或锁定 → 空历史
+    }
   },
 
   // ── Config ────────────────────────────────────────────────────

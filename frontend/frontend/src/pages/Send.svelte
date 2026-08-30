@@ -1,7 +1,10 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { t } from "../lib/i18n";
   import { Services } from "../lib/services";
 
+  // Form state (unchanged fields) + real balance wiring.
+  // 表单状态(字段不变)+ 真实余额接线。
   let to = $state("");
   let amount = $state("0.50000000");
   let fee = $state("0.00000100");
@@ -14,7 +17,23 @@
   let sending = $state(false);
   let txid = $state<string | null>(null);
   let broadcastErr = $state<string | null>(null);
-  let available = 1234.0;
+  let previewErr = $state<string | null>(null);
+  let hexCopied = $state(false);
+
+  // available: real confirmed balance from getwalletinfo (was hardcoded).
+  // available: 来自 getwalletinfo 的真实已确认余额(原先为硬编码)。
+  let available = $state(0);
+  let walletLocked = $state(false);
+
+  onMount(async () => {
+    try {
+      const w = await Services.getWallet();
+      walletLocked = w.locked;
+      if (!w.locked) available = w.confirmed;
+    } catch {
+      /* node offline → available stays 0 / 节点离线 → 余额保持 0 */
+    }
+  });
 
   const amountS = () => parseFloat(amount) || 0;
   const feeS = () => parseFloat(fee) || 0;
@@ -37,11 +56,30 @@
     return amountS() <= 0 || amountS() > available || feeS() >= amountS() || !validAddr() || to.trim() === "";
   }
 
+  // pasteTo: read the clipboard into the address field.
+  // pasteTo: 从剪贴板读取地址。
+  async function pasteTo() {
+    try {
+      to = (await navigator.clipboard.readText()).trim();
+    } catch {
+      /* clipboard permission denied → ignore / 剪贴板无权限 → 忽略 */
+    }
+  }
+
   async function buildPreview() {
-    const r = await Services.buildPsbt(to.trim(), amountS(), feeS());
-    psbt = r;
-    txid = null;
-    broadcastErr = null;
+    previewErr = null;
+    try {
+      const r = await Services.buildPsbt(to.trim(), amountS(), feeS());
+      psbt = r;
+      txid = null;
+      broadcastErr = null;
+    } catch (e) {
+      // Step 5 (sendtoaddress RPC) pending: surface the reason clearly
+      // instead of an unhandled rejection.
+      // Step 5(sendtoaddress RPC)未完成:清晰呈现原因而非未处理异常。
+      previewErr = String(e).replace(/^Error:\s*/, "");
+      psbt = null;
+    }
   }
 
   async function broadcast() {
@@ -56,6 +94,14 @@
       sending = false;
     }
   }
+
+  function copyHex() {
+    const hex = psbt?.hex ?? raw;
+    if (!hex) return;
+    navigator.clipboard?.writeText(hex);
+    hexCopied = true;
+    setTimeout(() => (hexCopied = false), 1500);
+  }
 </script>
 
 <section class="send">
@@ -66,6 +112,12 @@
     </div>
     <span class="chip"><span class="dot mint" aria-hidden="true"></span> {t("send.target_mainnet")}</span>
   </div>
+
+  {#if walletLocked}
+    <div class="card locked-note">
+      <p class="note">{t("send.locked_note")}</p>
+    </div>
+  {/if}
 
   <div class="card form">
     <div class="field">
@@ -80,7 +132,7 @@
           spellcheck="false"
           aria-describedby="to-hint"
         />
-        <button class="btn" type="button">{t("g.paste")}</button>
+        <button class="btn" type="button" onclick={pasteTo}>{t("g.paste")}</button>
       </div>
       {#if !validAddr() && to !== ""}
         <p class="err" id="to-hint"><span class="dot" aria-hidden="true"></span> invalid address</p>
@@ -145,8 +197,14 @@
 
     <div class="submit-row">
       <button class="btn btn-ghost" type="button" onclick={buildPreview}>{t("send.preview")}</button>
-      <button class="btn btn-primary" type="button" disabled={blocked() || !txid && false} onclick={broadcast}>{t("send.broadcast")}</button>
+      <button class="btn btn-primary" type="button" disabled={blocked()} onclick={broadcast}>{t("send.broadcast")}</button>
     </div>
+
+    {#if previewErr}
+      <div class="errbox" role="alert">
+        <span>{previewErr}</span>
+      </div>
+    {/if}
   </div>
 
   {#if psbt || txid}
@@ -175,7 +233,7 @@
           {#if sending}<span class="spin" aria-hidden="true"></span>{/if}
           {t("send.broadcast")}
         </button>
-        <button class="btn btn-ghost">{t("send.copy_hex")}</button>
+        <button class="btn btn-ghost" onclick={copyHex}>{hexCopied ? "✓" : t("send.copy_hex")}</button>
       </div>
     </div>
   {/if}
@@ -196,6 +254,22 @@
     gap: 16px;
     max-width: 880px;
     margin: 0 auto;
+    animation: rise 0.28s ease both;
+  }
+  @keyframes rise {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .send {
+      animation: none;
+    }
   }
   .head {
     display: flex;
@@ -210,6 +284,15 @@
   }
   .dot.mint {
     background: var(--mint);
+  }
+  .locked-note {
+    border-color: var(--honey);
+    background: #fff;
+  }
+  .note {
+    margin: 0;
+    font-size: 12px;
+    color: var(--honey);
   }
   .form {
     display: flex;
@@ -248,14 +331,15 @@
     display: flex;
     align-items: center;
     gap: 6px;
-    color: var(--straw);
+    color: var(--honey);
     font-size: 12px;
     margin: 0;
   }
   .err .dot {
-    background: var(--straw);
+    background: var(--honey);
     width: 6px;
     height: 6px;
+    flex: none;
   }
   .hint {
     font-size: 11px;
@@ -269,7 +353,7 @@
   .coin {
     border: 1px solid var(--line);
     border-radius: var(--r-12);
-    background: #f0f0f0;
+    background: var(--violet);
   }
   .coin-sum {
     display: flex;
@@ -350,21 +434,25 @@
     display: flex;
     align-items: center;
     gap: 10px;
-    color: var(--straw);
+    color: var(--honey);
     font-size: 12px;
-    border: 1px solid var(--straw);
+    border: 1px solid var(--honey);
     border-radius: var(--r-8);
     padding: 8px 12px;
   }
+  .form .errbox {
+    margin-top: 0;
+  }
   .mini {
     background: none;
-    border: 1px solid var(--straw);
-    color: var(--straw);
+    border: 1px solid var(--honey);
+    color: var(--honey);
     border-radius: 6px;
     padding: 2px 8px;
     font-size: 11px;
     cursor: pointer;
     margin-left: auto;
+    flex: none;
   }
   .preview-actions {
     display: flex;

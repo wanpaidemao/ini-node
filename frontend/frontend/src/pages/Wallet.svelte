@@ -5,25 +5,59 @@
   import { navigate } from "../lib/store.svelte";
   import type { Tx, WalletState } from "../lib/types";
 
+  // Page state: w is the real getwalletinfo snapshot; locked mirrors
+  // w.locked so the unlock form replaces the old click-to-unlock mock.
+  // 页面状态:w 为真实 getwalletinfo 快照;locked 镜像 w.locked,
+  // 解锁表单取代原先"点一下即解锁"的 mock 行为。
   let w = $state<WalletState | null>(null);
   let txs = $state<Tx[]>([]);
   let tab = $state<"history" | "tokens" | "keys" | "consolidate">("history");
-  let locked = $state(true);
+  let loadErr = $state<string | null>(null);
+
+  // Unlock form state. / 解锁表单状态。
   let pass = $state("");
+  let unlockErr = $state<string | null>(null);
+  let busy = $state(false);
   let copyOk = $state(false);
 
-  onMount(async () => {
-    w = await Services.getWallet();
-    txs = await Services.getHistory();
-    locked = w?.locked ?? true;
-  });
-
-  async function unlock() {
-    const ok = await Services.unlock(pass);
-    if (ok) {
-      locked = false;
-      pass = "";
+  async function refresh() {
+    try {
+      w = await Services.getWallet();
+      loadErr = null;
+    } catch (e) {
+      loadErr = String(e);
+      w = null;
     }
+    if (w && !w.locked) txs = await Services.getHistory();
+  }
+
+  onMount(refresh);
+
+  // unlock: real walletpassphrase RPC; on success reload balance + history.
+  // unlock: 真实 walletpassphrase RPC;成功后重载余额与历史。
+  async function unlock() {
+    unlockErr = null;
+    busy = true;
+    try {
+      const ok = await Services.unlock(pass);
+      if (!ok) {
+        unlockErr = t("wal.unlock_failed");
+        return;
+      }
+      pass = "";
+      await refresh();
+    } catch {
+      unlockErr = t("wal.unlock_failed");
+    } finally {
+      busy = false;
+    }
+  }
+
+  // lock: walletlock RPC; drops the in-memory keys.
+  // lock: walletlock RPC;丢弃内存密钥。
+  async function lock() {
+    await Services.lockWallet().catch(() => {});
+    await refresh();
   }
 
   function copyAddr() {
@@ -44,127 +78,150 @@
 <section class="wal">
   <div class="head">
     <div>
-      <p class="eyebrow">wallet · main</p>
+      <p class="eyebrow">wallet · {w?.defaultWalletName ?? "main"}</p>
       <h1 class="h-page">{t("wal.title")}</h1>
     </div>
-    {#if locked}
-      <button class="chip" onclick={() => (locked = false)}>
-        <span class="dot lock" aria-hidden="true"></span> {t("wal.unlock")}
+    {#if w && !w.locked}
+      <button class="chip btn-chip" onclick={lock} title={t("wal.lock")}>
+        <span class="dot ok" aria-hidden="true"></span> {t("wal.lock")}
       </button>
-    {:else}
-      <span class="chip"><span class="dot ok" aria-hidden="true"></span> {t("wal.receive")} →</span>
     {/if}
   </div>
 
-  <div class="top-grid">
-    <!-- balance -->
-    <div class="card balance">
-      <p class="eyebrow">{t("wal.total")}</p>
-      {#if locked}
-        <p class="bal-locked">{t("wal.hidden_balance")}</p>
-      {:else}
-        <p class="bal mono" translate="no">{(w?.total ?? 0).toFixed(8)} <span class="unit">S</span></p>
-      {/if}
-      <p class="bal-sub">
-        {t("wal.confirmed", { n: ((w?.confirmed ?? 0).toFixed(4)) })} · {t("wal.pending", { n: ((w?.pending ?? 0).toFixed(4)) })}
-      </p>
-      <div class="bal-actions">
-        <button class="btn btn-primary" onclick={() => navigate("send")}>{t("wal.send")}</button>
-        <button class="btn">{t("wal.receive")}</button>
-      </div>
-      {#if (w?.watchOnly ?? 0) > 0}
-        <hr class="divider" />
-        <p class="watch">{t("wal.watch_only")}: <span class="mono" translate="no">{(w?.watchOnly ?? 0).toFixed(2)} S</span> <span class="dim">({t("wal.pending", { n: "0.1" })})</span></p>
-      {/if}
+  {#if loadErr}
+    <div class="card err-card" role="alert">
+      <p class="err"><span class="dot" aria-hidden="true"></span>{loadErr}</p>
     </div>
-
-    <!-- receive address -->
-    <div class="card receive">
-      <p class="eyebrow">{t("wal.receive_addr")}</p>
-      <div class="qr" aria-hidden="true">
-        <svg viewBox="0 0 21 21" width="92" height="92" aria-hidden="true">
-          <rect width="21" height="21" fill="#ffffff" />
-          <g fill="#1a1a1a" shape-rendering="crispEdges">
-            <!-- pseudo QR pattern -->
-            {#each [1,2,3,0,1,4,5,6,7,0,3,2,1,0,5,7,6,3,2,4,1,6,0,7,5,2,3,1,4,6,7,5,0,2,1,3,6,5,4] as c, i}
-              <rect x={(i % 7) + c} y={Math.floor(i / 7)} width="1" height="1" />
-            {/each}
-          </g>
-        </svg>
-      </div>
-      {#if locked}
-        <p class="addr-mask">{t("wal.hidden_balance")}</p>
-      {:else}
-        <p class="addr mono" translate="no">{w?.address}</p>
-      {/if}
-      <div class="addr-actions">
-        <button class="btn btn-ghost" aria-label={t("g.copy")} onclick={copyAddr}>
-          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
-          {copyOk ? "✓" : t("g.copy")}
+  {:else if w && w.locked}
+    <!-- ── locked: real unlock form (BIP39 passphrase) + login shortcut ── -->
+    <!-- ── 锁定:真实解锁表单(BIP39 口令)+ 登录入口 ── -->
+    <div class="card unlock-card">
+      <h2 class="h-card">{t("wal.unlock")}</h2>
+      <form class="unlock-form" onsubmit={(e) => { e.preventDefault(); unlock(); }}>
+        <input
+          type="password"
+          bind:value={pass}
+          placeholder={t("g.password")}
+          aria-label={t("g.password")}
+          autocomplete="off"
+        />
+        <button class="btn btn-primary" type="submit" disabled={busy}>
+          {#if busy}<span class="spin" aria-hidden="true"></span>{/if}
+          {t("wal.unlock")}
         </button>
-        <button class="btn btn-ghost">{t("dash.retry")}</button>
+      </form>
+      {#if unlockErr}
+        <p class="err" role="alert"><span class="dot" aria-hidden="true"></span>{unlockErr}</p>
+      {/if}
+      <p class="hint">{t("wal.login_hint")}</p>
+      <button class="btn btn-ghost" onclick={() => navigate("create")}>{t("wal.go_login")} →</button>
+    </div>
+  {:else if w}
+    <div class="top-grid">
+      <!-- ── balance card ── -->
+      <!-- ── 余额卡片 ── -->
+      <div class="card balance">
+        <p class="eyebrow">{t("wal.total")}</p>
+        <p class="bal mono" translate="no">{(w.total).toFixed(8)} <span class="unit">S</span></p>
+        <div class="bal-sub">
+          <span class="part"><span class="dot ok" aria-hidden="true"></span>{t("wal.confirmed", { n: w.confirmed.toFixed(4) })}</span>
+          {#if w.pending > 0}
+            <span class="part"><span class="dot wait" aria-hidden="true"></span>{t("wal.pending", { n: w.pending.toFixed(4) })}</span>
+          {/if}
+          {#if w.immature > 0}
+            <span class="part"><span class="dot lock" aria-hidden="true"></span>{t("wal.immature", { n: w.immature.toFixed(4) })}</span>
+          {/if}
+        </div>
+        <div class="bal-actions">
+          <button class="btn btn-primary" onclick={() => navigate("send")}>{t("wal.send")}</button>
+          <button class="btn btn-ghost" onclick={copyAddr}>{copyOk ? "✓" : t("wal.receive")}</button>
+        </div>
       </div>
-      {#if !locked}
+
+      <!-- ── receive address card ── -->
+      <!-- ── 收款地址卡片 ── -->
+      <div class="card receive">
+        <p class="eyebrow">{t("wal.receive_addr")}</p>
+        <div class="qr" aria-hidden="true">
+          <svg viewBox="0 0 21 21" width="92" height="92" aria-hidden="true">
+            <rect width="21" height="21" fill="#ffffff" />
+            <g fill="#1a1a1a" shape-rendering="crispEdges">
+              <!-- pseudo QR pattern -->
+              {#each [1,2,3,0,1,4,5,6,7,0,3,2,1,0,5,7,6,3,2,4,1,6,0,7,5,2,3,1,4,6,7,5,0,2,1,3,6,5,4] as c, i}
+                <rect x={(i % 7) + c} y={Math.floor(i / 7)} width="1" height="1" />
+              {/each}
+            </g>
+          </svg>
+        </div>
+        <p class="addr mono" translate="no">{w.address}</p>
+        <div class="addr-actions">
+          <button class="btn btn-ghost" aria-label={t("g.copy")} onclick={copyAddr}>
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+            {copyOk ? "✓" : t("g.copy")}
+          </button>
+          <button class="btn btn-ghost" aria-label={t("dash.retry")} onclick={refresh}>{t("dash.retry")}</button>
+        </div>
         <p class="reuse-warn mono">{t("wal.address_reuse_warning")}</p>
-      {/if}
-    </div>
-  </div>
-
-  <!-- tabs -->
-  <div class="card tabled-card">
-    <div class="tabs" role="tablist" aria-label={t("wal.title")}>
-      {#each tabs as tb}
-        <button
-          class="tab"
-          class:active={tab === tb.id}
-          role="tab"
-          aria-selected={tab === tb.id}
-          onclick={() => (tab = tb.id)}
-        >
-          {t(tb.label)}
-        </button>
-      {/each}
+      </div>
     </div>
 
-    {#if tab === "history"}
-      {#if txs.length === 0}
+    <!-- ── tabs ── -->
+    <!-- ── 标签页 ── -->
+    <div class="card tabled-card">
+      <div class="tabs" role="tablist" aria-label={t("wal.title")}>
+        {#each tabs as tb}
+          <button
+            class="tab"
+            class:active={tab === tb.id}
+            role="tab"
+            aria-selected={tab === tb.id}
+            onclick={() => (tab = tb.id)}
+          >
+            {t(tb.label)}
+          </button>
+        {/each}
+      </div>
+
+      {#if tab === "history"}
+        {#if txs.length === 0}
+          <p class="empty">{t("wal.empty")}</p>
+        {:else}
+          <table class="tx-table">
+            <thead>
+              <tr>
+                <th scope="col">{t("wal.col_time")}</th>
+                <th scope="col">{t("wal.col_dir")}</th>
+                <th scope="col">{t("wal.col_amount")}</th>
+                <th scope="col">{t("wal.col_status")}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each txs as x}
+                <tr>
+                  <td class="mono" translate="no">{fmtDateTime(x.time)}</td>
+                  <td>{x.dir === "out" ? t("wal.out") : t("wal.in")}</td>
+                  <td class={`mono amount ${x.dir}`} translate="no">{x.dir === "out" ? "−" : "+"}{(x.amount < 0 ? -x.amount : x.amount).toFixed(8)} S</td>
+                  <td>
+                    <span class={`st ${x.status}`}>
+                      <span class="dot" aria-hidden="true"></span>
+                      {x.status === "confirmed" ? t("wal.confirmed_status") : t("wal.pending_status")}
+                    </span>
+                    <span class="mono hash" translate="no">({x.hash})</span>
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        {/if}
+      {:else if tab === "tokens"}
+        <p class="empty">{t("wal.tab_tokens_hint")}</p>
+      {:else if tab === "keys"}
         <p class="empty">{t("wal.empty")}</p>
       {:else}
-        <table class="tx-table">
-          <thead>
-            <tr>
-              <th scope="col">{t("wal.col_time")}</th>
-              <th scope="col">{t("wal.col_dir")}</th>
-              <th scope="col">{t("wal.col_amount")}</th>
-              <th scope="col">{t("wal.col_status")}</th>
-            </tr>
-          </thead>
-          <tbody>
-            {#each txs as x}
-              <tr>
-                <td class="mono" translate="no">{fmtDateTime(x.time)}</td>
-                <td>{x.dir === "out" ? t("wal.out") : t("wal.in")}</td>
-                <td class={`mono amount ${x.dir}`} translate="no">{x.dir === "out" ? "−" : "+"}{(x.amount < 0 ? -x.amount : x.amount).toFixed(8)} S</td>
-                <td>
-                  <span class={`st ${x.status}`}>
-                    <span class="dot" aria-hidden="true"></span>
-                    {x.status === "confirmed" ? t("wal.confirmed_status") : t("wal.pending_status")}
-                  </span>
-                  <span class="mono hash" translate="no">({x.hash})</span>
-                </td>
-              </tr>
-            {/each}
-          </tbody>
-        </table>
+        <p class="empty">{t("wal.empty")}</p>
       {/if}
-    {:else if tab === "tokens"}
-      <p class="empty">{t("wal.empty")}</p>
-    {:else if tab === "keys"}
-      <p class="empty">{t("wal.empty")}</p>
-    {:else}
-      <p class="empty">{t("wal.empty")}</p>
-    {/if}
-  </div>
+    </div>
+  {/if}
 </section>
 
 <style>
@@ -174,6 +231,22 @@
     gap: 16px;
     max-width: 1080px;
     margin: 0 auto;
+    animation: rise 0.28s ease both;
+  }
+  @keyframes rise {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .wal {
+      animation: none;
+    }
   }
   .head {
     display: flex;
@@ -186,11 +259,66 @@
     font-size: 24px;
     margin: 2px 0 0;
   }
-  .dot.lock {
-    background: var(--honey);
+  .btn-chip {
+    cursor: pointer;
+  }
+  .btn-chip:hover {
+    background: var(--violet-2);
+    color: var(--ink-fg);
   }
   .dot.ok {
     background: var(--mint);
+  }
+  .dot.wait {
+    background: var(--honey);
+  }
+  .dot.lock {
+    background: var(--mist);
+  }
+
+  /* ── locked state: centered unlock form ── */
+  .unlock-card {
+    max-width: 440px;
+    margin: 12px auto 0;
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 18px;
+  }
+  .unlock-form {
+    display: flex;
+    gap: 8px;
+  }
+  .unlock-form input {
+    flex: 1;
+    min-width: 0;
+  }
+  .hint {
+    font-size: 11px;
+    color: var(--ink-dim);
+    margin: 0;
+    line-height: 1.45;
+  }
+  .err {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    color: var(--honey);
+    font-size: 12px;
+    margin: 0;
+  }
+  .err .dot {
+    background: var(--honey);
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex: none;
+  }
+  .err-card {
+    max-width: 640px;
+    margin: 12px auto 0;
+    width: 100%;
   }
 
   .top-grid {
@@ -208,38 +336,32 @@
     margin: 6px 0 0;
     letter-spacing: -0.5px;
   }
-  .bal-locked {
-    font-size: 30px;
-    margin: 6px 0 0;
-    letter-spacing: 2px;
-    color: var(--ink-dim);
-  }
   .unit {
     font-size: 18px;
     color: var(--straw);
     margin-left: 2px;
   }
   .bal-sub {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin: 6px 0 14px;
+  }
+  .part {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
     font-size: 12px;
     color: var(--ink-dim);
-    margin: 4px 0 14px;
+  }
+  .part .dot {
+    width: 6px;
+    height: 6px;
   }
   .bal-actions {
     display: flex;
     gap: 8px;
-  }
-  .divider {
-    border: none;
-    border-top: 1px dashed var(--line);
-    margin: 14px 0 8px;
-  }
-  .watch {
-    font-size: 12px;
-    color: var(--ink-dim);
-    margin: 0;
-  }
-  .dim {
-    color: var(--mist);
+    margin-top: auto;
   }
 
   .receive {
@@ -261,11 +383,6 @@
     font-size: 12px;
     font-variant-numeric: tabular-nums;
     margin: 0;
-  }
-  .addr-mask {
-    margin: 0;
-    letter-spacing: 3px;
-    color: var(--ink-dim);
   }
   .addr-actions {
     display: flex;
@@ -300,7 +417,7 @@
   }
   .tab:hover {
     color: var(--ink-fg);
-    background: #eee;
+    background: var(--violet-2);
   }
   .tab.active {
     color: var(--straw);
