@@ -2,6 +2,7 @@
   import { t } from "../lib/i18n";
   import { navigate } from "../lib/store.svelte";
   import { setWalletSettings, walletSettings } from "../lib/wallet-settings.svelte";
+  import { chainSource, setChainSource } from "../lib/wallet-registry.svelte";
 
   // Wallet settings (secondary page of the wallet view): local UI preferences.
   // Every change is applied + persisted immediately; `saved` flashes as
@@ -15,6 +16,15 @@
   // apply() — 统一变更处理:持久化、重新武装自动锁定、闪现保存标记。
   function apply() {
     setWalletSettings({ ...walletSettings });
+    saved = true;
+    clearTimeout(savedTimer);
+    savedTimer = setTimeout(() => (saved = false), 1500);
+  }
+
+  // applySource() — persist the external chain-source patch (same flash).
+  // applySource() — 持久化外部链数据源补丁(同样闪现反馈)。
+  function applySource() {
+    setChainSource({ ...chainSource });
     saved = true;
     clearTimeout(savedTimer);
     savedTimer = setTimeout(() => (saved = false), 1500);
@@ -94,6 +104,45 @@
         {/each}
       </select>
     </div>
+  </div>
+
+  <!-- external chain source: balance fallback when the local node is down,
+       same idea as the original web-wallet's "wallet backend" setting -->
+  <!-- 外部链数据源:本节点不可用时的余额降级数据源,与原版 web 钱包的
+       "钱包接口"设置同思路 -->
+  <div class="card source-card">
+    <p class="card-title">{t("wal.set.source_title")}</p>
+
+    <div class="field">
+      <div class="field-text">
+        <label class="field-label" for="source-mode">{t("wal.set.source_mode")}</label>
+        <p class="field-hint">{t("wal.set.source_mode_hint")}</p>
+      </div>
+      <select id="source-mode" bind:value={chainSource.mode} onchange={applySource}>
+        <option value="local">{t("wal.set.source_local")}</option>
+        <option value="external">{t("wal.set.source_external")}</option>
+      </select>
+    </div>
+
+    {#if chainSource.mode === "external"}
+      <div class="divider" aria-hidden="true"></div>
+      <div class="field column">
+        <div class="field-text">
+          <label class="field-label" for="source-api">{t("wal.set.source_api")}</label>
+          <p class="field-hint">{t("wal.set.source_api_hint")}</p>
+        </div>
+        <input
+          id="source-api"
+          class="api-input"
+          type="url"
+          bind:value={chainSource.api}
+          onchange={applySource}
+          placeholder="https://api.sugar.wtf"
+          spellcheck="false"
+          translate="no"
+        />
+      </div>
+    {/if}
   </div>
 
   <p class="note">{t("wal.set.note")}</p>
@@ -196,6 +245,37 @@
   .divider {
     height: 1px;
     background: var(--line);
+  }
+
+  /* external chain-source card / 外部链数据源卡片 */
+  .source-card {
+    padding: 4px 18px 14px;
+  }
+  .card-title {
+    margin: 12px 0 4px;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--ink-dim);
+    font-weight: 700;
+  }
+  .field.column {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .api-input {
+    width: 100%;
+    background: var(--ink);
+    color: var(--ink-fg);
+    border: 1px solid var(--line);
+    border-radius: var(--r-8);
+    padding: 7px 10px;
+    font-size: 12px;
+    font-family: var(--font-mono);
+  }
+  .api-input:focus-visible {
+    outline: none;
+    box-shadow: var(--focus);
   }
 
   select {

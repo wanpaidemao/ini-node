@@ -214,6 +214,11 @@
             <span class="part"><span class="dot wait" aria-hidden="true"></span>{t("wal.offline_balance")}</span>
           {:else}
             <span class="part"><span class="dot ok" aria-hidden="true"></span>{t("wal.confirmed", { n: w.confirmed.toFixed(4) })}</span>
+            <!-- external REST source badge: figures not from the local node -->
+            <!-- 外部 REST 数据源徽章:数字并非来自本节点 -->
+            {#if w.chainExternal}
+              <span class="part ext"><span class="dot wait" aria-hidden="true"></span>{t("wal.ext_source")}</span>
+            {/if}
           {/if}
           {#if w.chainOnline && !walletSettings.hideBalance && w.pending > 0}
             <span class="part"><span class="dot wait" aria-hidden="true"></span>{t("wal.pending", { n: w.pending.toFixed(4) })}</span>
@@ -481,6 +486,9 @@
   .part .dot {
     width: 6px;
     height: 6px;
+  }
+  .part.ext {
+    color: var(--honey);
   }
   .bal-actions {
     display: flex;

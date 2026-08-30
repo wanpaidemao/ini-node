@@ -2,6 +2,7 @@
   import { t } from "../lib/i18n";
   import { navigate } from "../lib/store.svelte";
   import { Services } from "../lib/services";
+  import { registerWallet, removeWallet, walletRegistry } from "../lib/wallet-registry.svelte";
 
   // ── state ──────────────────────────────────────────────────────
   // Open-wallet tabs: legacy email/password login (in-memory) or BIP39
@@ -15,6 +16,25 @@
   let pass = $state("");
   let error = $state<string | null>(null);
   let busy = $state(false);
+
+  // Selected saved profile (one-click reopen): clicking a card fills the
+  // email field and switches to the matching tab so only the password
+  // remains to type. HD profiles switch to the passphrase tab.
+  // 选中的已保存档案(一键重开):点击卡片自动填充邮箱并切到对应标签页,
+  // 只剩密码需要输入。HD 档案则切到口令标签页。
+  let selectedId = $state<string | null>(null);
+
+  function pickProfile(id: string) {
+    selectedId = id;
+    const p = walletRegistry.find((w) => w.id === id);
+    if (!p) return;
+    if (p.type === "web" && p.email) {
+      openTab = "email";
+      email = p.email;
+    } else {
+      openTab = "pass";
+    }
+  }
 
   // Create panel (collapsed by default, like before).
   // 创建面板(默认折叠,与之前一致)。
@@ -63,6 +83,15 @@
         error = openTab === "email" ? t("login.fail") : t("create.bad_passphrase");
         return;
       }
+      // Register the opened wallet in the saved-profiles list (metadata
+      // only — password never stored). / 登记到已保存档案列表(仅元数据,
+      // 密码永不存储)。
+      const st = await Services.getWallet();
+      if (openTab === "email") {
+        registerWallet({ type: "web", email: email.trim(), address: st.address ?? undefined });
+      } else {
+        registerWallet({ type: "hd", address: st.address ?? undefined });
+      }
       navigate("wallet");
     } catch (e) {
       // Surface the real cause: "wallet is already unlocked", binding
@@ -90,6 +119,9 @@
       const r = await Services.createWallet(createPass);
       mnemonic = r.mnemonic.trim().split(/\s+/);
       newAddr = r.address;
+      // New HD wallet goes straight into the saved list. / 新建 HD 钱包
+      // 直接进入已保存列表。
+      registerWallet({ type: "hd", name: "HD wallet", address: r.address });
     } catch (e) {
       error = String(e).replace(/^Error:\s*/, "");
     } finally {
@@ -167,6 +199,36 @@
       {/if}
     </div>
   {:else}
+    <!-- ── saved wallet profiles: one-click reopen (metadata only) ── -->
+    <!-- ── 已保存钱包档案:一键重开(仅元数据,密码永不存储) ── -->
+    {#if walletRegistry.length > 0}
+      <div class="card profile-card" aria-label={t("create.saved_wallets")}>
+        <p class="profile-title">{t("create.saved_wallets")}</p>
+        <div class="profiles">
+          {#each walletRegistry as p (p.id)}
+            <button
+              class="profile"
+              class:selected={selectedId === p.id}
+              onclick={() => pickProfile(p.id)}
+              title={p.address ?? p.email ?? p.name}
+            >
+              <span class="badge" class:hd={p.type === "hd"}>{p.type === "web" ? "web" : "HD"}</span>
+              <span class="pname">{p.name}</span>
+              <span class="paddr mono" translate="no">{p.address ?? "—"}</span>
+              <span
+                class="del"
+                role="button"
+                tabindex="-1"
+                aria-label={t("create.forget")}
+                onclick={(e) => { e.stopPropagation(); removeWallet(p.id); if (selectedId === p.id) selectedId = null; }}
+                onkeydown={(e) => { if (e.key === "Enter") { e.stopPropagation(); removeWallet(p.id); } }}
+              >✕</span>
+            </button>
+          {/each}
+        </div>
+      </div>
+    {/if}
+
     <!-- ── open existing wallet ── -->
     <!-- ── 打开已有钱包 ── -->
     <div class="card auth-card">
@@ -252,6 +314,85 @@
     flex-direction: column;
     gap: 12px;
     padding: 18px;
+  }
+
+  /* Saved wallet profiles: compact rows, original web-wallet list style.
+     已保存钱包档案:紧凑行,原版 web 钱包列表风格。 */
+  .profile-card {
+    padding: 14px 16px;
+  }
+  .profile-title {
+    margin: 0 0 10px;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--ink-dim);
+    font-weight: 700;
+  }
+  .profiles {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .profile {
+    display: grid;
+    grid-template-columns: auto 1fr auto auto;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    text-align: left;
+    background: var(--violet);
+    border: 1px solid var(--line);
+    border-radius: var(--r-8);
+    padding: 8px 10px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  .profile:hover {
+    border-color: var(--straw);
+  }
+  .profile.selected {
+    border-color: var(--straw);
+    box-shadow: 0 0 0 1px var(--straw);
+  }
+  .badge {
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 2px 6px;
+    border-radius: 5px;
+    background: var(--straw);
+    color: #fff;
+    flex: none;
+  }
+  .badge.hd {
+    background: var(--honey);
+  }
+  .pname {
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .paddr {
+    color: var(--ink-dim);
+    font-size: 11px;
+    max-width: 130px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .del {
+    color: var(--ink-dim);
+    font-size: 11px;
+    padding: 2px 5px;
+    border-radius: 5px;
+    flex: none;
+  }
+  .del:hover {
+    color: var(--honey);
+    background: #fff;
   }
   .field {
     display: flex;

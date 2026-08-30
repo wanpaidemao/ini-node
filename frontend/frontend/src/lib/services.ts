@@ -24,6 +24,7 @@ import type {
 // 进程内钱包服务的 Wails bindings:钱包生命周期(创建/解锁/登录/锁定/新地址)
 // 在前端进程内运行,无需节点。链上数据仍走下方 RPC。
 import * as LocalWallet from "../../bindings/changeme/walletservice.js";
+import { chainSource } from "./wallet-registry.svelte";
 
 // ── low-level JSON-RPC client ───────────────────────────────────
 let seq = 1;
@@ -558,15 +559,23 @@ export const Services = {
   // 未启用时降级为占位显示。
 
   // Hybrid snapshot: local Status() is authoritative for locked/address/name
-  // (never fails); getwalletinfo RPC only enriches the balance figures. With
-  // the node down the wallet page still renders — balance shows "—".
+  // (never fails); the chain figures come from a two-step source chain —
+  // (1) the node's getwalletinfo RPC, (2) if that fails and an external REST
+  // source is configured (wallet settings), GET {api}/balance/{addr}
+  // (response {"result":{"balance":N}}, same protocol as the original
+  // web-wallet's backend). History/UTXO stay node-only (the REST explorer
+  // has no history endpoint — same as the original, which linked out to a
+  // block explorer).
   // 混合快照:本地 Status() 是 locked/address/name 的权威来源(永不失败);
-  // getwalletinfo RPC 仅补充余额数字。节点未启动时钱包页照常渲染——余额
-  // 显示 "—"。
+  // 链上数字走两级数据源——(1) 节点 getwalletinfo RPC;(2) 失败且配置了
+  // 外部 REST 源(钱包设置)时,GET {api}/balance/{addr}(响应
+  // {"result":{"balance":N}},与原版 web 钱包的后端接口同协议)。历史/UTXO
+  // 仅节点提供(REST 浏览器无历史端点——原版也是外链区块浏览器)。
   async getWallet(): Promise<WalletState> {
     const st = await LocalWallet.Status();
     let chain: { total: number; confirmed: number; pending: number; immature: number; watchonly: number } | null =
       null;
+    let external = false;
     if (st.unlocked) {
       try {
         chain = await rpc<{
@@ -577,8 +586,24 @@ export const Services = {
           watchonly: number;
         }>("getwalletinfo");
       } catch {
-        /* node offline or sugarindex disabled — figures stay unknown */
-        /* 节点离线或 sugarindex 未启用 — 数字保持未知 */
+        /* node offline or sugarindex disabled — try the external source */
+        /* 节点离线或 sugarindex 未启用 — 尝试外部数据源 */
+      }
+      if (!chain && chainSource.mode === "external" && st.address) {
+        try {
+          const r = await fetch(`${chainSource.api.replace(/\/+$/, "")}/balance/${st.address}`);
+          if (r.ok) {
+            const env = (await r.json()) as { result?: { balance?: number } };
+            const bal = toNum(env.result?.balance);
+            // REST explorer reports a single confirmed figure only.
+            // REST 浏览器仅提供单一确认余额数字。
+            chain = { total: bal, confirmed: bal, pending: 0, immature: 0, watchonly: 0 };
+            external = true;
+          }
+        } catch {
+          /* external source also unreachable — figures stay unknown */
+          /* 外部数据源也不可达 — 数字保持未知 */
+        }
       }
     }
     return {
@@ -591,6 +616,8 @@ export const Services = {
       address: st.address || null,
       defaultWalletName: st.name,
       chainOnline: chain !== null,
+      // mark the external source so the UI can badge it / 标记外部数据源供 UI 徽章展示
+      chainExternal: external,
     };
   },
 
@@ -638,7 +665,9 @@ export const Services = {
   // Keys 标签页的只读地址列表(index 0 .. next-1);不推进索引。
   // 纯本地,无需节点。
   async getAddresses(): Promise<{ index: number; address: string }[]> {
-    return LocalWallet.Addresses();
+    // binding signature is `[] | null`; normalize to always-array
+    // binding 签名为 `[] | null`;归一化为始终数组
+    return (await LocalWallet.Addresses()) ?? [];
   },
 
   // listtransactions → recent wallet history mapped to the frontend Tx shape.

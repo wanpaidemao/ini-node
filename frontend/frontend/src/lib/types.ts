@@ -132,6 +132,9 @@ export interface WalletState {
   /** false when the node RPC was unreachable — chain figures unknown (UI shows "—"), wallet itself still usable */
   /** 节点 RPC 不可达时为 false — 链上数字未知(UI 显示 "—"),钱包本身仍可用 */
   chainOnline: boolean;
+  /** true when figures came from the external REST source instead of the node (badge in UI) */
+  /** 数字来自外部 REST 数据源而非本节点时为 true(UI 徽章提示) */
+  chainExternal?: boolean;
 }
 
 export interface AppConfig {
