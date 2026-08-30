@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import QRCode from "qrcode";
   import { fmtDateTime, t } from "../lib/i18n";
   import { Services } from "../lib/services";
   import { navigate } from "../lib/store.svelte";
@@ -20,6 +21,28 @@
   let unlockErr = $state<string | null>(null);
   let busy = $state(false);
   let copyOk = $state(false);
+
+  // Real QR of the receive address (replaces the old decorative pseudo
+  // pattern): regenerated whenever the unlocked address changes. SVG output
+  // so it stays crisp at any size and needs no canvas.
+  // 收款地址的真实二维码(取代原先的装饰性假图案):解锁地址变化时重新
+  // 生成。输出 SVG,任意缩放都清晰且无需 canvas。
+  let qrSvg = $state("");
+  $effect(() => {
+    const addr = w?.address;
+    if (!addr) {
+      qrSvg = "";
+      return;
+    }
+    QRCode.toString(addr, {
+      type: "svg",
+      margin: 1,
+      width: 184,
+      color: { dark: "#1a1a1a", light: "#ffffff" },
+    })
+      .then((s) => (qrSvg = s))
+      .catch(() => (qrSvg = ""));
+  });
 
   async function refresh() {
     try {
@@ -189,17 +212,10 @@
       <!-- ── 收款地址卡片 ── -->
       <div class="card receive">
         <p class="eyebrow">{t("wal.receive_addr")}</p>
-        <div class="qr" aria-hidden="true">
-          <svg viewBox="0 0 21 21" width="92" height="92" aria-hidden="true">
-            <rect width="21" height="21" fill="#ffffff" />
-            <g fill="#1a1a1a" shape-rendering="crispEdges">
-              <!-- pseudo QR pattern -->
-              {#each [1,2,3,0,1,4,5,6,7,0,3,2,1,0,5,7,6,3,2,4,1,6,0,7,5,2,3,1,4,6,7,5,0,2,1,3,6,5,4] as c, i}
-                <rect x={(i % 7) + c} y={Math.floor(i / 7)} width="1" height="1" />
-              {/each}
-            </g>
-          </svg>
-        </div>
+        <!-- real QR encoding the receive address / 编码收款地址的真实二维码 -->
+        {#if qrSvg}
+          <div class="qr" aria-hidden="true">{@html qrSvg}</div>
+        {/if}
         <p class="addr mono" translate="no">{w.address}</p>
         <div class="addr-actions">
           <button class="btn btn-ghost" aria-label={t("g.copy")} onclick={copyAddr}>
@@ -431,6 +447,14 @@
     padding: 6px;
     background: #fff;
     border: 1px solid var(--line);
+    display: flex;
+    /* injected QR SVG fills the box regardless of its width attribute */
+    /* 注入的二维码 SVG 填满容器,无视其 width 属性 */
+  }
+  .qr :global(svg) {
+    display: block;
+    width: 184px;
+    height: auto;
   }
   .addr {
     max-width: 100%;
