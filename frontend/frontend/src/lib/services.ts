@@ -633,6 +633,14 @@ export const Services = {
     return LocalWallet.NextAddress();
   },
 
+  // Read-only list of derived addresses (index 0 .. next-1) for the Keys
+  // tab; does NOT advance the index. Local, node not required.
+  // Keys 标签页的只读地址列表(index 0 .. next-1);不推进索引。
+  // 纯本地,无需节点。
+  async getAddresses(): Promise<{ index: number; address: string }[]> {
+    return LocalWallet.Addresses();
+  },
+
   // listtransactions → recent wallet history mapped to the frontend Tx shape.
   // Degrades to [] when the sugar index is disabled so the page stays usable.
   // `n` is the row count requested (wallet settings → history rows).

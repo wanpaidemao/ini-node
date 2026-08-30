@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -135,4 +136,38 @@ func (s *WalletService) Lock() {
 // 旁车文件，避免地址复用）。
 func (s *WalletService) NextAddress() (string, error) {
 	return s.mgr.NextAddress()
+}
+
+// WalletAddress is one row of the Keys tab: the derivation index and its
+// bech32 address. / Keys 标签页的一行:派生索引与其 bech32 地址。
+type WalletAddress struct {
+	Index   uint32 `json:"index"`
+	Address string `json:"address"`
+}
+
+// Addresses lists the derived addresses WITHOUT advancing the index:
+// index 0 .. nextIndex-1 (index 0 is always listed — it is the primary
+// receive address even before any NextAddress call). Read-only, local,
+// works without the node. Errors when the wallet is locked.
+// Addresses 只读列出已派生地址,不推进索引:index 0 .. nextIndex-1
+// (index 0 始终列出——即使从未调用 NextAddress,它也是主收款地址)。
+// 纯本地读操作,无需节点。钱包锁定时报错。
+func (s *WalletService) Addresses() ([]WalletAddress, error) {
+	w := s.mgr.Wallet()
+	if w == nil {
+		return nil, errors.New("wallet is locked / 钱包已锁定")
+	}
+	n := w.NextIndex()
+	if n < 1 {
+		n = 1 // index 0 is the primary address / index 0 为主地址
+	}
+	out := make([]WalletAddress, 0, n)
+	for i := uint32(0); i < n; i++ {
+		a, err := w.Address(i)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, WalletAddress{Index: i, Address: a})
+	}
+	return out, nil
 }

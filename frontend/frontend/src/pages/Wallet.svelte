@@ -22,6 +22,26 @@
   let busy = $state(false);
   let copyOk = $state(false);
 
+  // Keys tab: read-only derived-address list (local binding, node not
+  // required). Loaded lazily on first tab visit, cached for the session.
+  // Keys 标签页:只读已派生地址列表(本地 binding,无需节点)。首次切到
+  // 该标签时懒加载,会话内缓存。
+  let addrs = $state<{ index: number; address: string }[] | null>(null);
+  let addrCopied = $state(-1);
+  $effect(() => {
+    if (tab === "keys" && addrs === null && w && !w.locked) {
+      Services.getAddresses()
+        .then((a) => (addrs = a))
+        .catch(() => (addrs = []));
+    }
+  });
+
+  function copyKeyAddr(i: number, a: string) {
+    navigator.clipboard?.writeText(a);
+    addrCopied = i;
+    setTimeout(() => (addrCopied = -1), 1500);
+  }
+
   // Real QR of the receive address (replaces the old decorative pseudo
   // pattern): regenerated whenever the unlocked address changes. SVG output
   // so it stays crisp at any size and needs no canvas.
@@ -271,7 +291,7 @@
                       <span class="dot" aria-hidden="true"></span>
                       {x.status === "confirmed" ? t("wal.confirmed_status") : t("wal.pending_status")}
                     </span>
-                    <span class="mono hash" translate="no">({x.hash})</span>
+                    <span class="mono hash" translate="no" title={x.hash}>({x.hash})</span>
                   </td>
                 </tr>
               {/each}
@@ -279,11 +299,44 @@
           </table>
         {/if}
       {:else if tab === "tokens"}
+        <!-- placeholder until the token REST proxy (Step 6) -->
+        <!-- 代币 REST 代理(Step 6)上线前的占位 -->
         <p class="empty">{t("wal.tab_tokens_hint")}</p>
       {:else if tab === "keys"}
-        <p class="empty">{t("wal.empty")}</p>
+        <!-- derived-address list: local, works without the node -->
+        <!-- 已派生地址列表:纯本地,无需节点 -->
+        {#if addrs === null}
+          <p class="empty">{t("wal.loading")}</p>
+        {:else if addrs.length === 0}
+          <p class="empty">{t("wal.tab_keys_hint")}</p>
+        {:else}
+          <table class="key-table">
+            <thead>
+              <tr>
+                <th scope="col">{t("wal.col_index")}</th>
+                <th scope="col">{t("con.col_addr")}</th>
+                <th scope="col">{t("con.col_action")}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each addrs as a}
+                <tr>
+                  <td class="mono" translate="no">#{a.index}</td>
+                  <td class="mono key-addr" translate="no" title={a.address}>{a.address}</td>
+                  <td>
+                    <button class="mini" onclick={() => copyKeyAddr(a.index, a.address)}>
+                      {addrCopied === a.index ? "✓" : t("g.copy")}
+                    </button>
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        {/if}
       {:else}
-        <p class="empty">{t("wal.empty")}</p>
+        <!-- consolidation: needs sending (Step 5), placeholder for now -->
+        <!-- 合并功能依赖发送(Step 5),暂为占位 -->
+        <p class="empty">{t("wal.tab_consolidate_hint")}</p>
       {/if}
     </div>
   {/if}
@@ -551,6 +604,59 @@
     color: var(--ink-dim);
     font-size: 11px;
     margin-left: 6px;
+    /* full txid is 64 chars — truncate to keep the table readable, full
+       value on hover via title / 完整 txid 64 字符——截断保持表格可读,
+       title 提供悬停全文 */
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    display: inline-block;
+    vertical-align: bottom;
+  }
+  .tx-table td .hash {
+    display: inline-block;
+  }
+
+  /* Keys tab address table / Keys 标签页地址表 */
+  .key-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+  .key-table th {
+    text-align: left;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--ink-dim);
+    padding: 10px 10px 8px;
+    border-bottom: 1px solid var(--line);
+  }
+  .key-table td {
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--violet);
+  }
+  .key-table tr:last-child td {
+    border-bottom: none;
+  }
+  .key-addr {
+    max-width: 340px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .mini {
+    background: none;
+    border: 1px solid var(--line);
+    color: var(--ink-fg);
+    border-radius: 6px;
+    padding: 3px 9px;
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .mini:hover {
+    border-color: var(--straw);
   }
   .empty {
     color: var(--ink-dim);
