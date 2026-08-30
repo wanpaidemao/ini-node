@@ -114,9 +114,22 @@ func (s *WalletService) Unlock(passphrase string) (string, error) {
 // Login derives a wallet from the legacy email/password KDF purely in
 // memory (web-wallet compatible address; never touches wallet.db) and
 // leaves it unlocked. Returns the primary address.
+//
+// If some wallet is already unlocked in this process, the session is
+// swapped: the old one is locked first. Legacy login is deterministic
+// derivation — there is no "wrong password" — so an existing session must
+// never dead-end the login; the user's intent (open with THESE
+// credentials) replaces it.
 // Login 用传统邮箱密码 KDF 纯内存派生钱包（web-wallet 兼容地址，不碰
-// wallet.db）并保持解锁。返回主地址。
+// wallet.db）并保持解锁，返回主地址。
+//
+// 若进程内已有解锁钱包，则换会话：先锁定旧的。传统登录是确定性派生——
+// 不存在"密码错误"——已有会话绝不能让登录陷入死胡同；用户意图（用这套
+// 凭据打开）直接替换旧会话。
 func (s *WalletService) Login(email, password string) (string, error) {
+	if s.mgr.Wallet() != nil {
+		s.mgr.Lock()
+	}
 	w, err := s.mgr.Login(email, password)
 	if err != nil {
 		return "", err

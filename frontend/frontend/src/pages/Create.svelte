@@ -28,14 +28,24 @@
   let mnemonicCopied = $state(false);
 
   // ── actions ────────────────────────────────────────────────────
-  // openWallet: dispatch by tab — walletlogin (legacy KDF, in-memory) or
-  // walletpassphrase (BIP39 wallet.db). Both navigate to the wallet page.
-  // openWallet: 按标签页分发——walletlogin(传统 KDF,纯内存)或
-  // walletpassphrase(BIP39 wallet.db)。成功后进入钱包页。
+  // openWallet: dispatch by tab — legacy KDF login (in-memory) or BIP39
+  // wallet.db passphrase unlock. Both navigate to the wallet page on success.
+  // NOTE: legacy login is deterministic derivation — any email/password
+  // derives a wallet, so there is no "wrong password" at the KDF level.
+  // Real failures (e.g. "already unlocked") are shown verbatim instead of
+  // the old misleading generic message.
+  // openWallet: 按标签页分发——传统 KDF 登录(纯内存)或 BIP39 wallet.db
+  // 口令解锁。成功后进入钱包页。注意:传统登录是确定性派生——任意邮箱
+  // 密码都能派生钱包,KDF 层面不存在"密码错误"。真实错误(如"已解锁")
+  // 原样展示,不再显示误导性的笼统文案。
   async function openWallet() {
     error = null;
+    // Only basic sanity here: the web wallet has NO minimum password
+    // length, so a short (but non-empty) password must not be rejected.
+    // 此处仅做基本检查:web 钱包没有密码最小长度限制,短(但非空)密码
+    // 不应被拒绝。
     if (openTab === "email") {
-      if (!email.includes("@") || emailPass.length < 10) {
+      if (!email.includes("@") || emailPass.length < 1) {
         error = t("login.fail");
         return;
       }
@@ -54,8 +64,12 @@
         return;
       }
       navigate("wallet");
-    } catch {
-      error = openTab === "email" ? t("login.fail") : t("create.bad_passphrase");
+    } catch (e) {
+      // Surface the real cause: "wallet is already unlocked", binding
+      // unavailable (plain browser instead of the Wails window), etc.
+      // 显示真实原因:"钱包已解锁"、binding 不可用(普通浏览器而非
+      // Wails 窗口)等。
+      error = String(e).replace(/^Error:\s*/, "");
     } finally {
       busy = false;
     }
