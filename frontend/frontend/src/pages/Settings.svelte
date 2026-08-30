@@ -1,10 +1,22 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { fmt, fmtBytes, LANG_NAMES, LANGS, setLang, t } from "../lib/i18n";
+  import { LANG_NAMES, LANGS, setLang, t } from "../lib/i18n";
   import { Services } from "../lib/services";
   import { app, setNavMode, type NavMode } from "../lib/store.svelte";
   import type { AppConfig } from "../lib/types";
 
+  // Settings page — every control now maps to a REAL backend: node ini keys
+  // (datadir/maxpeers/upnp/debuglevel) go through /api/node-config to
+  // btcd-runtime.ini and apply on the next node start; frontend-only keys
+  // (runnodeonstart) persist in frontend.ini; language/nav layout stay in
+  // localStorage. The old mock controls (fake addrType radio, fake migrate
+  // progress, unbound "open dir" button, a foreign machine's hardcoded
+  // datadir) are gone.
+  // 设置页——每个控件都对接真实后端:节点 ini 键(datadir/maxpeers/upnp/
+  // debuglevel)经 /api/node-config 写入 btcd-runtime.ini,节点下次启动
+  // 生效;前端专属键(runnodeonstart)存 frontend.ini;语言/导航布局存
+  // localStorage。旧版 mock 控件(假地址类型单选、假迁移进度、未绑事件的
+  // "打开目录"按钮、硬编码的他人机器 datadir)已全部移除。
   type Category = "connection" | "node" | "wallet" | "data" | "appearance";
 
   const categories: { id: Category; label: string }[] = [
@@ -20,19 +32,19 @@
   let cfg = $state<AppConfig | null>(null);
   let test = $state<{ ok: boolean; ms: number } | null>(null);
   let testing = $state(false);
-  let applied = $state(false);
-  let migratePct = $state<number | null>(null);
-  let migrateBusy = $state(false);
+  let saved = $state(false);
+  let savedTimer: ReturnType<typeof setTimeout> | undefined;
 
-  let connAddr = $state("—");
+  // flash() — "saved" feedback shared by all save actions.
+  // flash() — 所有保存动作共用的"已保存"反馈。
+  function flash() {
+    saved = true;
+    clearTimeout(savedTimer);
+    savedTimer = setTimeout(() => (saved = false), 1800);
+  }
 
   onMount(async () => {
     cfg = await Services.getConfig();
-    try {
-      connAddr = cfg.rpcEndpoint.replace(/^https?:\/\//, "");
-    } catch {
-      /* keep "—" */
-    }
   });
 
   function pickCat(c: Category) {
@@ -60,44 +72,84 @@
     }
   }
 
-  async function applyPeers() {
-    if (!cfg) return;
-    const n = await Services.setSyncPeers(cfg.parallelPeers);
-    cfg.parallelPeers = n;
-    applied = true;
-    setTimeout(() => (applied = false), 2000);
-  }
-
-  async function chooseDir() {
-    if (!cfg) return;
-    const dir = await Services.pickDataDir();
-    if (dir) cfg.dataDir = dir;
-  }
-
+  // ── connection save: rpc endpoint + credentials → runtime ini ──
+  // ── 连接保存:RPC 地址 + 凭据 → runtime ini ──
   let savingConn = $state(false);
 
   async function saveConnection() {
     if (!cfg || savingConn) return;
     savingConn = true;
     try {
-      await Services.saveConfig(cfg);
+      await Services.saveConfig({
+        rpcEndpoint: cfg.rpcEndpoint,
+        rpcUser: cfg.rpcUser,
+        ...(cfg.rpcPass ? { rpcPass: cfg.rpcPass } : {}),
+      });
+      flash();
     } finally {
       savingConn = false;
     }
   }
 
-  async function migrate() {
-    if (!cfg || migrateBusy) return;
-    migrateBusy = true;
-    migratePct = await Services.migrateDataDir(cfg.dataDir, cfg.dataDir + "-new");
-    migrateBusy = false;
-    setTimeout(() => (migratePct = null), 3000);
+  // ── node save: maxpeers/upnp/debuglevel → runtime ini (next start) ──
+  // debuglevel additionally applies live via the debuglevel RPC when the
+  // node is running, so log verbosity changes take effect immediately.
+  // ── 节点保存:maxpeers/upnp/debuglevel → runtime ini(下次启动生效)。
+  // 节点运行时 debuglevel 还会经 debuglevel RPC 即时生效,日志级别立刻改变。
+  let savingNode = $state(false);
+
+  async function saveNode() {
+    if (!cfg || savingNode) return;
+    savingNode = true;
+    try {
+      await Services.saveConfig({
+        maxPeers: cfg.maxPeers,
+        upnp: cfg.upnp,
+        ...(cfg.debugLevel ? { debugLevel: cfg.debugLevel } : {}),
+      });
+      if (cfg.debugLevel) {
+        await Services.setDebugLevel(cfg.debugLevel).catch(() => {
+          /* node not running — ini value applies at next start */
+          /* 节点未运行 — ini 值下次启动生效 */
+        });
+      }
+      flash();
+    } finally {
+      savingNode = false;
+    }
+  }
+
+  // runNodeOnStart lives in frontend.ini (not btcd options).
+  // runNodeOnStart 存 frontend.ini(不属于 btcd 选项)。
+  async function saveRunOnStart() {
+    if (!cfg) return;
+    await Services.saveConfig({ runNodeOnStart: cfg.runNodeOnStart });
+    flash();
+  }
+
+  // ── data dir: edit → runtime ini; open → OS file manager ──
+  // ── 数据目录:编辑 → runtime ini;打开 → 系统文件管理器 ──
+  let savingDir = $state(false);
+
+  async function saveDataDir() {
+    if (!cfg || savingDir) return;
+    savingDir = true;
+    try {
+      await Services.saveConfig({ dataDir: cfg.dataDir });
+      flash();
+    } finally {
+      savingDir = false;
+    }
+  }
+
+  async function openDir() {
+    if (!cfg?.dataDir) return;
+    await Services.openDataDir(cfg.dataDir);
   }
 
   function peerChange(ev: Event) {
     const v = parseInt((ev.target as HTMLSelectElement).value, 10);
-    if (cfg && v >= 4 && v <= 16) cfg.parallelPeers = v;
-    else if (cfg) cfg.parallelPeers = 8;
+    if (cfg && v >= 1 && v <= 125) cfg.maxPeers = v;
   }
 
   function pickLang(l: string) {
@@ -115,6 +167,9 @@
       <p class="eyebrow">configuration</p>
       <h1 class="h-page">{t("set.title")}</h1>
     </div>
+    {#if saved}
+      <span class="save-chip" role="status">✓ {t("wal.set.saved")}</span>
+    {/if}
   </div>
 
   <div class="cat-nav" role="tablist" aria-label={t("set.sections")}>
@@ -140,7 +195,6 @@
         <span class="conn-chip {connBadge().cls}" role="status">
           <span class="dot" aria-hidden="true"></span>
           <span>{t(connBadge().key)}</span>
-          <span class="conn-addr mono">{app.connected ? connAddr : "—"}</span>
         </span>
       </div>
       <div class="field">
@@ -180,15 +234,11 @@
       </div>
 
       <div class="field">
-        <label class="field-label" for="wapi">{t("set.wallet_api")}</label>
-        <input id="wapi" class="mono" bind:value={cfg.walletApi} autocomplete="off" spellcheck="false" />
-      </div>
-
-      <div class="field">
         <button class="btn btn-primary" onclick={saveConnection} disabled={savingConn}>
           {#if savingConn}<span class="spin" aria-hidden="true"></span>{/if}
           {t("g.apply")}
         </button>
+        <p class="hint">{t("set.ini_path")}: <span class="mono">{cfg.iniPath || "—"}</span></p>
       </div>
     </div>
     {/if}
@@ -199,9 +249,9 @@
       <h2 class="h-card">{t("set.sync")}</h2>
       <div class="field-row sync-row">
         <div class="field">
-          <label class="field-label" for="peers">{t("set.parallel_peers")}</label>
-          <select id="peers" value={cfg.parallelPeers} onchange={peerChange}>
-            {#each Array.from({ length: 13 }, (_, i) => i + 4) as v}
+          <label class="field-label" for="peers">{t("set.max_peers")}</label>
+          <select id="peers" value={cfg.maxPeers} onchange={peerChange}>
+            {#each [4, 8, 16, 32, 64, 125] as v}
               <option value={v}>{v}</option>
             {/each}
           </select>
@@ -209,17 +259,17 @@
         <div class="field">
           <label class="field-label" for="dbg">{t("set.debug_level")}</label>
           <select id="dbg" bind:value={cfg.debugLevel}>
-            <option>off</option>
-            <option>warn</option>
-            <option>info</option>
-            <option>debug</option>
             <option>trace</option>
+            <option>debug</option>
+            <option>info</option>
+            <option>warn</option>
+            <option>error</option>
           </select>
         </div>
         <div class="field apply-col">
-          <span class="hint omitted">&nbsp;</span>
-          <button class="btn btn-primary" onclick={applyPeers} disabled={!cfg}>
-            {applied ? "✓" : t("g.apply")}
+          <button class="btn btn-primary" onclick={saveNode} disabled={savingNode}>
+            {#if savingNode}<span class="spin" aria-hidden="true"></span>{/if}
+            {t("g.apply")}
           </button>
         </div>
       </div>
@@ -231,50 +281,26 @@
           <span>{t("set.upnp")}</span>
         </label>
         <label class="check">
-          <input type="checkbox" checked={cfg.proxy != null} />
-          <span>{t("set.proxy")} {cfg.proxy ? `:${cfg.proxy}` : ""}</span>
-        </label>
-        <label class="check">
-          <input type="checkbox" bind:checked={cfg.runNodeOnStart} />
-          <span>
-            {t("set.run_at_start")}
-            <span class="dim mono"> sugarchain-node</span>
-          </span>
+          <!-- frontend.ini client setting / frontend.ini 客户端设置 -->
+          <input type="checkbox" bind:checked={cfg.runNodeOnStart} onchange={saveRunOnStart} />
+          <span>{t("set.run_at_start")}</span>
         </label>
       </div>
     </div>
     {/if}
 
-    <!-- ── Wallet / display ────────────────────────── -->
+    <!-- ── Wallet / indexes — read-only node state ──── -->
     {#if cat === "wallet"}
     <div class="card">
       <h2 class="h-card">{t("set.wallet_display")}</h2>
-      <div class="field">
-        <span class="field-label">{t("set.addr_type")}</span>
-        <div class="cred-row">
-          <label class="check">
-            <input type="radio" name="addr" checked={cfg.addrType === "bech32"} onclick={() => (cfg!.addrType = "bech32")} />
-            <span>{t("set.bech32")}</span>
-          </label>
-          <label class="check">
-            <input type="radio" name="addr" checked={cfg.addrType === "segwit"} onclick={() => (cfg!.addrType = "segwit")} />
-            <span>{t("set.segwit")}</span>
-          </label>
-          <label class="check">
-            <input type="radio" name="addr" checked={cfg.addrType === "legacy"} onclick={() => (cfg!.addrType = "legacy")} />
-            <span>{t("set.legacy")}</span>
-          </label>
-        </div>
-      </div>
-
+      <p class="hint">{t("set.index_hint")}</p>
       <div class="field-row sync-row">
         <div class="field">
-          <span class="field-label">{t("set.unit")}</span>
-          <p class="unit-val mono">S <span class="dim">{t("set.unit_fixed")}</span></p>
-        </div>
-        <div class="field">
-          <span class="field-label">{t("set.default_wallet")}</span>
-          <p class="unit-val mono">{cfg.defaultWallet}</p>
+          <span class="field-label">sugarindex</span>
+          <p class="unit-val mono">
+            {cfg.sugarIndex ? "1 (on)" : "0 (off)"}
+            <span class="dim">· {t("set.sugar_hint")}</span>
+          </p>
         </div>
       </div>
     </div>
@@ -288,20 +314,13 @@
         <label class="field-label" for="datadir2">{t("set.data_dir")}</label>
         <div class="field-row">
           <input id="datadir2" class="mono" bind:value={cfg.dataDir} autocomplete="off" spellcheck="false" />
-          <button class="btn" onclick={chooseDir}>{t("set.choose")}</button>
-          <button class="btn btn-ghost">{t("set.open_dir")}</button>
-        </div>
-        <p class="hint">● {t("set.disk_free", { n: fmtBytes(cfg.diskFree) })} · {t("set.migrate_hint")}</p>
-        <div class="migrate-row">
-          <button class="btn btn-danger" onclick={migrate} disabled={migrateBusy}>
-            {#if migrateBusy}<span class="spin" aria-hidden="true"></span>{/if}
-            migrate →
+          <button class="btn" onclick={saveDataDir} disabled={savingDir}>
+            {#if savingDir}<span class="spin" aria-hidden="true"></span>{/if}
+            {t("g.apply")}
           </button>
-          {#if migratePct != null}
-            <div class="migrate-bar" aria-hidden="true"><span style:width={`${migratePct}%`}></span></div>
-            <span class="hint mono">{migratePct}%</span>
-          {/if}
+          <button class="btn btn-ghost" onclick={openDir}>{t("set.open_dir")}</button>
         </div>
+        <p class="hint">{t("set.data_dir_hint")}</p>
       </div>
     </div>
     {/if}
@@ -372,6 +391,11 @@
   .h-card {
     margin: 0 0 16px;
     font-size: 14px;
+  }
+  .save-chip {
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--mint);
   }
 
   /* ── category tabs ─────────────────────────────── */
@@ -542,10 +566,6 @@
     border-color: rgba(0, 0, 0, 0.25);
     color: var(--ink-dim);
   }
-  .conn-addr {
-    opacity: 0.65;
-    font-size: 11px;
-  }
   .field {
     display: flex;
     flex-direction: column;
@@ -614,25 +634,5 @@
     color: var(--mist);
     font-size: 12px;
     font-weight: 400;
-  }
-  .migrate-row {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    margin-top: 4px;
-    flex-wrap: wrap;
-  }
-  .migrate-bar {
-    flex: 1;
-    min-width: 120px;
-    height: 8px;
-    border-radius: 4px;
-    background: #e0e0e0;
-    overflow: hidden;
-  }
-  .migrate-bar span {
-    display: block;
-    height: 100%;
-    background: var(--straw);
   }
 </style>

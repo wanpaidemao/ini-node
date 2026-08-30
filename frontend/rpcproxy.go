@@ -275,6 +275,15 @@ func handleNodeConfig(iniPath string, o map[string]string, w http.ResponseWriter
 				_ = writeFrontendConfig(iniPath, map[string]string{"logredirect": lr})
 				delete(val, "logredirect")
 			}
+			// runnodeonstart is also a frontend-only client setting (launch
+			// the bundled node when the app starts) — route it to
+			// frontend.ini, NOT the runtime ini (btcd rejects unknown keys).
+			// runnodeonstart 同样是前端客户端专属设置(应用启动时拉起内置
+			// 节点)——路由到 frontend.ini,绝不写进 runtime ini(btcd 会拒启)。
+			if rn, ok := val["runnodeonstart"]; ok {
+				_ = writeFrontendConfig(iniPath, map[string]string{"runnodeonstart": rn})
+				delete(val, "runnodeonstart")
+			}
 			if ep, ok := val["rpcendpoint"]; ok && ep != "" {
 				if u, err := url.Parse(ep); err == nil && u.Host != "" {
 					val["rpclisten"] = u.Host

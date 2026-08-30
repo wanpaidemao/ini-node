@@ -24,6 +24,7 @@ import type {
 // 进程内钱包服务的 Wails bindings:钱包生命周期(创建/解锁/登录/锁定/新地址)
 // 在前端进程内运行,无需节点。链上数据仍走下方 RPC。
 import * as LocalWallet from "../../bindings/changeme/walletservice.js";
+import * as LocalGreet from "../../bindings/changeme/greetservice.js";
 import { chainSource } from "./wallet-registry.svelte";
 
 // ── low-level JSON-RPC client ───────────────────────────────────
@@ -700,51 +701,72 @@ export const Services = {
   },
 
   // ── Config ────────────────────────────────────────────────────
+  // getConfig returns the REAL node ini state: /api/node-config parses
+  // backend/btcd-runtime.ini server-side and returns every key (datadir,
+  // maxpeers, upnp, rpcuser, ...), plus frontend-only settings
+  // (runnodeonstart) from frontend.ini. Values are mapped into AppConfig;
+  // absent keys fall back to btcd defaults. The old version discarded this
+  // data and returned hardcoded mock values (a foreign machine's datadir!)
+  // — that is gone.
+  // getConfig 返回真实的节点 ini 状态:/api/node-config 在服务端解析
+  // backend/btcd-runtime.ini 并返回全部键(datadir/maxpeers/upnp/
+  // rpcuser/...),以及 frontend.ini 的前端专属设置(runnodeonstart)。
+  // 映射进 AppConfig;缺失键回退到 btcd 默认值。旧版本丢弃这些数据并
+  // 返回硬编码 mock(还是别人机器的 datadir!)——已移除。
   async getConfig(): Promise<AppConfig> {
-    const cfg = (await fetch("/api/node-config").then((r) => r.json())) as {
-      rpcEndpoint: string;
-      rpcUser: string;
-      rpcPass: string;
-      credFromIni: boolean;
+    const raw = (await fetch("/api/node-config").then((r) => r.json())) as Record<string, string>;
+    const num = (k: string, dflt: number): number => {
+      const v = Number(raw[k]);
+      return Number.isFinite(v) && v > 0 ? v : dflt;
     };
+    const bool = (k: string): boolean => raw[k] === "1" || raw[k] === "true";
     return {
-      ...cfg,
-      walletApi: "http://127.0.0.1:8080",
-      parallelPeers: 8,
-      addrType: "bech32",
-      defaultWallet: "main",
-      dataDir: "C:\\Users\\adest\\AppData\\Local\\Btcd",
-      diskFree: 0,
-      runNodeOnStart: true,
-      debugLevel: "info",
-      upnp: false,
-      proxy: null,
+      rpcEndpoint: raw.rpcEndpoint ?? "http://127.0.0.1:8334",
+      rpcUser: raw.rpcuser ?? "",
+      rpcPass: raw.rpcpass ?? "",
+      credFromIni: raw.credFromIni !== "false",
+      // node ini keys (btcd options, applied on node restart)
+      // 节点 ini 键(btcd 选项,节点重启后生效)
+      dataDir: raw.datadir ?? "",
+      maxPeers: num("maxpeers", 8),
+      upnp: bool("upnp"),
+      sugarIndex: bool("sugarindex"),
+      // frontend-only keys stored in frontend.ini / 前端专属键,存 frontend.ini
+      runNodeOnStart: raw.runnodeonstart !== "0" && raw.runnodeonstart !== "false",
+      // iniPath for reference (control center ini picker) / ini 路径(参考)
+      iniPath: raw.iniPath ?? "",
     };
   },
 
-  async saveConfig(cfg: AppConfig): Promise<AppConfig> {
-    try {
-      await fetch("/api/node-config", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          rpcuser: cfg.rpcUser,
-          rpcpass: cfg.rpcPass,
-          rpcendpoint: cfg.rpcEndpoint,
-        }),
-      });
-    } catch {
-      /* ini write failure — keep values client-side */
-    }
-    return cfg;
+  // saveConfig POSTs the changed fields. Server-side routing: rpcendpoint →
+  // rpclisten, runnodeonstart → frontend.ini, everything else → runtime ini
+  // (btcd applies on next start; debugLevel additionally applies live via
+  // the debuglevel RPC when the node is running).
+  // saveConfig 提交变更字段。服务端路由:rpcendpoint → rpclisten,
+  // runnodeonstart → frontend.ini,其余 → runtime ini(btcd 下次启动生效;
+  // debugLevel 在节点运行时还经 debuglevel RPC 即时生效)。
+  async saveConfig(cfg: Partial<AppConfig>): Promise<void> {
+    const body: Record<string, string> = {};
+    if (cfg.rpcEndpoint !== undefined) body.rpcendpoint = cfg.rpcEndpoint;
+    if (cfg.rpcUser !== undefined) body.rpcuser = cfg.rpcUser;
+    if (cfg.rpcPass !== undefined && cfg.rpcPass !== "") body.rpcpass = cfg.rpcPass;
+    if (cfg.dataDir !== undefined) body.datadir = cfg.dataDir;
+    if (cfg.maxPeers !== undefined) body.maxpeers = String(cfg.maxPeers);
+    if (cfg.upnp !== undefined) body.upnp = cfg.upnp ? "1" : "0";
+    if (cfg.runNodeOnStart !== undefined) body.runnodeonstart = cfg.runNodeOnStart ? "1" : "0";
+    if (cfg.debugLevel !== undefined) body.debuglevel = cfg.debugLevel;
+    if (Object.keys(body).length === 0) return;
+    await fetch("/api/node-config", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
   },
 
-  async pickDataDir(): Promise<string | null> {
-    return "C:\\Users\\adest\\AppData\\Local\\Btcd";
-  },
-
-  async migrateDataDir(_from: string, _to: string): Promise<number> {
-    return 0;
+  // Open the data directory in the OS file manager (Go binding).
+  // 在系统文件管理器中打开数据目录(Go binding)。
+  async openDataDir(path: string): Promise<void> {
+    await LocalGreet.OpenDataDir(path);
   },
 
   async estimateFee(_target: number): Promise<number> {

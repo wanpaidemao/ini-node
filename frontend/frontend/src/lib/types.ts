@@ -140,18 +140,18 @@ export interface WalletState {
 export interface AppConfig {
   rpcEndpoint: string;
   rpcUser: string;
-  rpcPass: string; // masked unless editing
+  rpcPass: string;
   credFromIni: boolean;
-  walletApi: string;
-  parallelPeers: number; // 4–16
-  addrType: "bech32" | "segwit" | "legacy";
-  defaultWallet: string;
+  /** node ini keys — applied on next node start / 节点 ini 键,下次启动生效 */
   dataDir: string;
-  diskFree: number;
-  runNodeOnStart: boolean;
-  debugLevel: string;
+  maxPeers: number;
   upnp: boolean;
-  proxy: string | null;
+  sugarIndex: boolean;
+  /** frontend-only keys stored in frontend.ini / 前端专属键,存 frontend.ini */
+  runNodeOnStart: boolean;
+  /** runtime ini file location (read-only reference) / runtime ini 位置(只读参考) */
+  iniPath: string;
+  debugLevel?: string;
 }
 
 export interface RpcResult {
