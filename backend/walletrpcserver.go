@@ -104,6 +104,32 @@ func handleCreateWallet(s *rpcServer, cmd interface{},
 	}, nil
 }
 
+// handleWalletLogin implements the walletlogin command. It derives a wallet
+// purely in memory from the legacy email/password KDF (so the address matches
+// the original web-wallet) and leaves it unlocked without writing wallet.db.
+// handleWalletLogin 实现 walletlogin 命令：用传统邮箱密码 KDF 纯内存派生钱包
+// （地址与原 web-wallet 一致）并保持解锁，不写入 wallet.db。
+func handleWalletLogin(s *rpcServer, cmd interface{},
+	closeChan <-chan struct{}) (interface{}, error) {
+
+	if s.cfg.Wallet == nil {
+		return nil, walletRPCError(btcjson.ErrRPCWallet,
+			"built-in wallet is not available / 内置钱包不可用")
+	}
+	c := cmd.(*btcjson.WalletLoginCmd)
+	w, err := s.cfg.Wallet.Login(c.Email, c.Password)
+	if err != nil {
+		return nil, walletRPCError(btcjson.ErrRPCWallet, "%v", err)
+	}
+	addr, err := w.Address(0)
+	if err != nil {
+		return nil, walletRPCError(btcjson.ErrRPCWallet, "%v", err)
+	}
+	return struct {
+		Address string `json:"address"` // primary (web-wallet) address / 主地址（web-wallet 地址）
+	}{Address: addr}, nil
+}
+
 // handleGetNewAddress implements the getnewaddress command, returning the next
 // derived address and advancing the persisted index.
 // handleGetNewAddress 实现 getnewaddress 命令，返回下一个派生地址并推进持久化索引。

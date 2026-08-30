@@ -101,13 +101,16 @@ backend (btcd fork)
 - 种子/私钥仅密文落盘；解锁口令不入前端、私钥不进前端
 - RPC 沿用 btcd-runtime.ini 认证；钱包 RPC 可加"仅本机回环"约束
 
-### 5.7 邮箱密码登录（Legacy KDF，新增 · 优化版）
+### 5.7 邮箱密码登录（Legacy KDF，新增 · 优化版）✅ 已实施（2026-08-30）
 - **移植**：web-wallet `internal/wallet/kdf.go` 的 `LegacyRegularSeed` → `backend/wallet/kdf.go`
   （含 JS UTF-16 长度对齐，中文/emoji 不串；52 轮 SHA-256，确定性；**纯 stdlib 无新依赖**）
-- **接入**：`NewFromLegacy(email, password, net)` = `LegacyRegularSeed(email,password)` → 32B 种子 → 复用 `NewFromSeed`（同一 BIP44 派生）
+- **接入**：`NewFromLegacy(email, password, net)` = `LegacyRegularSeed(email,password)` → 32B 种子 → **混合模式**
+  - index 0 = 种子直接作为私钥（`P2WPKH`），**与 web-wallet 地址完全一致**（交叉验证通过，老资产登录即恢复）
+  - index 1+ = 复用 `NewFromSeed` 的 BIP44 派生（多地址/找零能力保留）
+  - 说明：方案原正文"复用 NewFromSeed（同一 BIP44 派生）"与验收"派生相同地址"冲突，经确认采用**混合模式**兼顾两者
 - **RPC**：`walletlogin "email" "password"` → 派生 → **纯内存解锁（不落盘）**，与 BIP39 的 `wallet.db` **完全隔离、互不覆盖**
   - 理由（优化）：legacy 确定性派生、登录即恢复，无需加密落盘；**去掉"与 BIP39 二选一共用 wallet.db"的耦合**，两种登录方式天然隔离
-  - nextIndex 防地址复用：复用旁车文件（wallet.db.meta）持久化
+  - nextIndex 防地址复用：legacy 用**独立旁车 `wallet.db.legacy.meta`**（不共享 BIP39 的 `.meta`，避免跨模式索引冲突、确保 index 0 始终先分配）
 - **特点**：确定性登录即恢复，**无需助记词备份**；兼容原 web-wallet / 原 HTML 钱包（同算法）
 - **前端**：登录页（邮箱+密码）与创建页（BIP39 助记词）两个独立入口
 

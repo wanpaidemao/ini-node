@@ -66,7 +66,7 @@ func (m *Manager) Create(passphrase string) (mnemonic string, w *Wallet, err err
 	if err := w.SaveWallet(m.path, passphrase); err != nil {
 		return "", nil, err
 	}
-	_ = m.saveNextIndex(0) // ensure the sidecar exists / 确保旁车文件存在
+	_ = m.saveNextIndexFor(0, false) // ensure the sidecar exists / 确保旁车文件存在
 	m.unlocked = w
 	return mnemonic, w, nil
 }
@@ -85,7 +85,31 @@ func (m *Manager) Unlock(passphrase string) (*Wallet, error) {
 	if err != nil {
 		return nil, err
 	}
-	w.SetNextIndex(m.loadNextIndex()) // restore persisted address index / 恢复持久化的地址索引
+	w.SetNextIndex(m.loadNextIndexFor(false)) // restore persisted address index / 恢复持久化的地址索引
+	m.unlocked = w
+	return w, nil
+}
+
+// Login derives a wallet from the legacy email/password KDF purely in memory
+// and leaves it unlocked. Unlike Create/Unlock it never touches wallet.db, so
+// legacy login is fully isolated from the BIP39 wallet (no cross-overwrite).
+// Its next-address index lives in a separate sidecar, so index 0 (the original
+// web-wallet address) is always the first address handed out.
+// Login 用传统邮箱密码 KDF 纯内存派生钱包并保持解锁。与 Create/Unlock 不同，它
+// 不碰 wallet.db，与 BIP39 钱包完全隔离（互不覆盖）。其下一地址索引存放于独立
+// 旁车文件，从而 index 0（原 web-wallet 地址）始终是第一个分配的地址。
+func (m *Manager) Login(email, password string) (*Wallet, error) {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+
+	if m.unlocked != nil {
+		return nil, fmt.Errorf("wallet is already unlocked / 钱包已解锁")
+	}
+	w, err := NewFromLegacy(email, password, m.net)
+	if err != nil {
+		return nil, err
+	}
+	w.SetNextIndex(m.loadNextIndexFor(true)) // restore persisted legacy index / 恢复持久化的传统索引
 	m.unlocked = w
 	return w, nil
 }
@@ -113,9 +137,10 @@ func (m *Manager) Wallet() *Wallet {
 // NextAddress returns the next derived address and advances the persisted
 // next-address index. The index lives in a plaintext sidecar (it is not
 // sensitive) so addresses are never reused across restarts without needing the
-// wallet passphrase.
+// wallet passphrase. Legacy and BIP39 wallets keep separate sidecars.
 // NextAddress 返回下一个派生地址并推进持久化的下一地址索引。索引存放于明文旁车
-// 文件（非敏感），从而无需钱包口令即可避免重启后地址复用。
+// 文件（非敏感），从而无需钱包口令即可避免重启后地址复用。传统与 BIP39 钱包
+// 使用各自独立的旁车文件。
 func (m *Manager) NextAddress() (string, error) {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
@@ -129,7 +154,7 @@ func (m *Manager) NextAddress() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := m.saveNextIndex(idx + 1); err != nil {
+	if err := m.saveNextIndexFor(idx+1, w.legacy); err != nil {
 		return "", err
 	}
 	w.SetNextIndex(idx + 1)
@@ -137,15 +162,21 @@ func (m *Manager) NextAddress() (string, error) {
 }
 
 // metaPath returns the plaintext sidecar path storing the next address index.
-// metaPath 返回存储下一地址索引的明文旁车文件路径。
-func (m *Manager) metaPath() string {
+// Legacy wallets use a separate ".legacy.meta" file so their index never
+// collides with (and never skips index 0 because of) the BIP39 wallet.
+// metaPath 返回存储下一地址索引的明文旁车文件路径。传统钱包使用独立的
+// ".legacy.meta" 文件，避免与 BIP39 钱包索引冲突（也不会因此跳过 index 0）。
+func (m *Manager) metaPathFor(legacy bool) string {
+	if legacy {
+		return m.path + ".legacy.meta"
+	}
 	return m.path + ".meta"
 }
 
 // loadNextIndex reads the persisted next address index (0 when absent).
 // loadNextIndex 读取持久化的下一地址索引（不存在时为 0）。
-func (m *Manager) loadNextIndex() uint32 {
-	data, err := os.ReadFile(m.metaPath())
+func (m *Manager) loadNextIndexFor(legacy bool) uint32 {
+	data, err := os.ReadFile(m.metaPathFor(legacy))
 	if err != nil {
 		return 0
 	}
@@ -158,8 +189,8 @@ func (m *Manager) loadNextIndex() uint32 {
 
 // saveNextIndex persists the next address index.
 // saveNextIndex 持久化下一地址索引。
-func (m *Manager) saveNextIndex(i uint32) error {
-	return os.WriteFile(m.metaPath(), []byte(fmt.Sprintf("%d", i)), 0o600)
+func (m *Manager) saveNextIndexFor(i uint32, legacy bool) error {
+	return os.WriteFile(m.metaPathFor(legacy), []byte(fmt.Sprintf("%d", i)), 0o600)
 }
 
 // zeroBytes clears a byte slice in place.

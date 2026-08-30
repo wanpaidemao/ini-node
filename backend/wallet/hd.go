@@ -37,8 +37,9 @@ const (
 	InternalChain = 1
 )
 
-// Wallet is a BIP44 HD wallet rooted at a BIP39 seed.
-// Wallet 是基于 BIP39 种子的 BIP44 分层确定性钱包。
+// Wallet is a BIP44 HD wallet rooted at a BIP39 seed, optionally operating in
+// legacy (email/password) hybrid mode.
+// Wallet 是基于 BIP39 种子的 BIP44 分层确定性钱包，可选传统（邮箱密码）混合模式。
 type Wallet struct {
 	net       *chaincfg.Params        // network parameters / 网络参数
 	masterKey *hdkeychain.ExtendedKey // BIP32 master key (nil while locked) / BIP32 主密钥（锁定时为 nil）
@@ -46,6 +47,7 @@ type Wallet struct {
 	account   uint32                  // hardened account / 硬化账户
 	seed      []byte                  // BIP39 seed, cleared on lock / BIP39 种子（锁定时清空）
 	nextIndex uint32                  // next external address index / 下一个外部地址索引
+	legacy    bool                    // legacy hybrid mode: index 0 is the seed used directly as a private key / 传统混合模式：index 0 直接用种子作为私钥
 }
 
 // NewFromSeed creates a Wallet from a BIP39-derived seed using the default
@@ -72,6 +74,28 @@ func NewFromSeedPath(seed []byte, net *chaincfg.Params, coinType, account uint32
 		account:   account,
 		seed:      append([]byte(nil), seed...),
 	}, nil
+}
+
+// NewFromLegacy creates a Wallet from the legacy email/password KDF seed in
+// hybrid mode: the 32-byte seed is used directly as the private key for address
+// index 0 (so it matches the original web-wallet address exactly, restoring old
+// funds), and as the BIP32 master seed for indices >= 1 (standard BIP44 path,
+// preserving multi-address and change support). The seed is only kept in memory.
+// NewFromLegacy 用传统邮箱密码 KDF 种子以混合模式创建钱包：32 字节种子直接作为
+// index 0 的私钥（从而与原 web-wallet 地址完全一致、可恢复老资产），同时作为
+// BIP32 主种子用于 index 1+（标准 BIP44 路径，保留多地址与找零能力）。种子仅存内存。
+func NewFromLegacy(email, password string, net *chaincfg.Params) (*Wallet, error) {
+	seed, err := LegacyRegularSeed(email, password)
+	if err != nil {
+		return nil, err
+	}
+	w, err := NewFromSeed(seed, net)
+	zeroBytes(seed) // clear the temporary seed copy / 清空临时种子副本
+	if err != nil {
+		return nil, err
+	}
+	w.legacy = true
+	return w, nil
 }
 
 // Lock zeroes the in-memory key material (seed and master key), leaving the
@@ -142,14 +166,11 @@ func (w *Wallet) childKey(chain, index uint32) (*hdkeychain.ExtendedKey, error) 
 // Address 返回外部链上指定索引的 bech32（P2WPKH）地址。糖链始终启用隔离见证，
 // 故 bech32 为默认地址类型。
 func (w *Wallet) Address(index uint32) (string, error) {
-	key, err := w.childKey(ExternalChain, index)
+	priv, err := w.PrivateKey(index)
 	if err != nil {
-		return "", fmt.Errorf("derive address key / 派生地址密钥: %w", err)
+		return "", err
 	}
-	pub, err := key.ECPubKey()
-	if err != nil {
-		return "", fmt.Errorf("public key / 公钥: %w", err)
-	}
+	pub := priv.PubKey()
 	pkHash := address.Hash160(pub.SerializeCompressed())
 	addr, err := address.NewAddressWitnessPubKeyHash(pkHash, w.net)
 	if err != nil {

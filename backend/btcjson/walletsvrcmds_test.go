@@ -118,6 +118,20 @@ func TestWalletSvrCmds(t *testing.T) {
 			},
 		},
 		{
+			name: "walletlogin",
+			newCmd: func() (interface{}, error) {
+				return btcjson.NewCmd("walletlogin", "user@example.com", "s3cretpass1")
+			},
+			staticCmd: func() interface{} {
+				return btcjson.NewWalletLoginCmd("user@example.com", "s3cretpass1")
+			},
+			marshalled: `{"jsonrpc":"1.0","method":"walletlogin","params":["user@example.com","s3cretpass1"],"id":1}`,
+			unmarshalled: &btcjson.WalletLoginCmd{
+				Email:    "user@example.com",
+				Password: "s3cretpass1",
+			},
+		},
+		{
 			name: "addwitnessaddress",
 			newCmd: func() (interface{}, error) {
 				return btcjson.NewCmd("addwitnessaddress", "1address")

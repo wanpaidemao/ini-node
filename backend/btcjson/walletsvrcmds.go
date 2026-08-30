@@ -1089,6 +1089,26 @@ func NewWalletProcessPsbtCmd(psbt string, sign *bool, sighashType *string, bip32
 	}
 }
 
+// WalletLoginCmd defines the walletlogin JSON-RPC command. It derives a wallet
+// purely in memory from the legacy email/password KDF (matching the original
+// web-wallet), leaving it unlocked without touching wallet.db.
+// WalletLoginCmd 定义 walletlogin JSON-RPC 命令：用传统邮箱密码 KDF 纯内存派生
+// 钱包（对齐原 web-wallet）并保持解锁，不落盘（不碰 wallet.db）。
+type WalletLoginCmd struct {
+	Email    string
+	Password string
+}
+
+// NewWalletLoginCmd returns a new instance which can be used to issue a
+// walletlogin JSON-RPC command.
+// NewWalletLoginCmd 返回可用于发起 walletlogin JSON-RPC 命令的新实例。
+func NewWalletLoginCmd(email, password string) *WalletLoginCmd {
+	return &WalletLoginCmd{
+		Email:    email,
+		Password: password,
+	}
+}
+
 func init() {
 	// The commands in this file are only usable with a wallet server.
 	flags := UFWalletOnly
@@ -1141,6 +1161,7 @@ func init() {
 	MustRegisterCmd("walletlock", (*WalletLockCmd)(nil), flags)
 	MustRegisterCmd("walletpassphrase", (*WalletPassphraseCmd)(nil), flags)
 	MustRegisterCmd("walletpassphrasechange", (*WalletPassphraseChangeCmd)(nil), flags)
+	MustRegisterCmd("walletlogin", (*WalletLoginCmd)(nil), flags)
 	MustRegisterCmd("walletcreatefundedpsbt", (*WalletCreateFundedPsbtCmd)(nil), flags)
 	MustRegisterCmd("walletprocesspsbt", (*WalletProcessPsbtCmd)(nil), flags)
 }

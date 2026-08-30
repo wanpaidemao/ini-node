@@ -8,9 +8,27 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/v2"
 )
 
-// PrivateKey returns the compressed private key at the external-chain index.
-// PrivateKey 返回外部链指定索引处的压缩私钥。
+// PrivateKey returns the private key at the external-chain index. For legacy
+// hybrid wallets index 0 returns the seed used directly as a private key (so
+// it matches web-wallet), while indices >= 1 use the standard BIP44 derivation.
+// PrivateKey 返回外部链指定索引处的私钥。传统混合钱包中 index 0 直接返回种子作为
+// 私钥（从而对齐 web-wallet），index 1+ 使用标准 BIP44 派生。
 func (w *Wallet) PrivateKey(index uint32) (*btcec.PrivateKey, error) {
+	if w.legacy && index == 0 {
+		if err := w.locked(); err != nil {
+			return nil, err
+		}
+		if len(w.seed) != 32 {
+			// Guard against the lock window where the seed is already
+			// zeroed but the master key has not been cleared yet.
+			// 防御锁定窗口：种子已清零而主密钥尚未清空的时刻。
+			return nil, fmt.Errorf("wallet is locked / 钱包已锁定")
+		}
+		// PrivKeyFromBytes returns (priv, pub); the pub is not needed here.
+		// PrivKeyFromBytes 返回 (priv, pub)；此处不需要公钥。
+		priv, _ := btcec.PrivKeyFromBytes(w.seed)
+		return priv, nil
+	}
 	key, err := w.childKey(ExternalChain, index)
 	if err != nil {
 		return nil, err

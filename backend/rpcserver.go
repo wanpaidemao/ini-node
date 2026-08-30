@@ -205,6 +205,7 @@ var rpcHandlersBeforeInit = map[string]commandHandler{
 	"listtransactions":       handleListTransactions,
 	"listunspent":            handleListUnspent,
 	"walletlock":             handleWalletLock,
+	"walletlogin":            handleWalletLogin,
 	"walletpassphrase":       handleWalletPassphrase,
 }
 
