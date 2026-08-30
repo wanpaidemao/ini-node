@@ -277,6 +277,7 @@
   "wal.receive": "收款",
   "wal.receive_addr": "收款地址 (bech32)",
   "wal.send": "发送",
+  "wal.offline_balance": "节点离线——余额暂不可用,钱包仍可使用",
   "wal.set.auto_lock": "自动锁定",
   "wal.set.auto_lock_hint": "解锁后超过设定时间无操作,自动调用 walletlock 锁定钱包。",
   "wal.set.back": "返回钱包",

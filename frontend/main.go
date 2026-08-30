@@ -39,6 +39,11 @@ func main() {
 		Description: "A demo of using raw HTML & CSS",
 		Services: []application.Service{
 			application.NewService(&GreetService{}),
+			// Local wallet lifecycle: create/unlock/login/lock/new-address
+			// work in-process, independent of the node RPC.
+			// 本地钱包生命周期：创建/解锁/登录/锁定/新地址在进程内完成，
+			// 不依赖节点 RPC。
+			application.NewService(newWalletService()),
 		},
 		Assets: application.AssetOptions{
 			Handler:    application.AssetFileServerFS(assets),

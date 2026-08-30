@@ -58,16 +58,18 @@ function arm(): void {
   lockTimer = setTimeout(fire, walletSettings.autoLockMinutes * 60_000);
 }
 
-// Auto-lock fired: call walletlock RPC and announce the new locked state.
-// 自动锁定触发:调用 walletlock RPC 并广播新的锁定状态。
+// Auto-lock fired: call the in-process wallet lock (Wails binding) and
+// announce the new locked state. Local operation — works without the node.
+// 自动锁定触发:调用进程内钱包锁定(Wails binding)并广播新的锁定状态。
+// 纯本地操作——无需节点。
 async function fire(): Promise<void> {
   lockTimer = null;
   unlocked = false;
   try {
     await Services.lockWallet();
   } catch {
-    /* node unreachable — keys stay in memory on the node; nothing to do here */
-    /* 节点不可达 — 密钥留在节点内存;此处无事可做 */
+    /* binding call failed — keys stay in memory; next fire retries */
+    /* binding 调用失败 — 密钥留在内存;下次触发时重试 */
   }
   walletAutoLock.lockedAt = Date.now();
 }

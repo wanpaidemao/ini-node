@@ -18,6 +18,13 @@ import type {
   WalletState,
 } from "./types";
 
+// Wails bindings for the in-process wallet service: wallet lifecycle
+// (create / unlock / login / lock / next address) runs inside the frontend
+// process and works WITHOUT the node. Chain data still goes over RPC below.
+// 进程内钱包服务的 Wails bindings:钱包生命周期(创建/解锁/登录/锁定/新地址)
+// 在前端进程内运行,无需节点。链上数据仍走下方 RPC。
+import * as LocalWallet from "../../bindings/changeme/walletservice.js";
+
 // ── low-level JSON-RPC client ───────────────────────────────────
 let seq = 1;
 
@@ -542,94 +549,88 @@ export const Services = {
     }
   },
 
-  // ── Wallet (real RPCs backed by the built-in HD wallet) ────────
-  // Lifecycle/key commands always work; balance & history additionally
-  // require --sugarindex on the node (they degrade gracefully here).
-  // 钱包服务(真实 RPC,由内置 HD 钱包提供):生命周期/密钥命令始终可用;
-  // 余额与历史另需节点启用 --sugarindex(此处优雅降级)。
+  // ── Wallet (local Wails bindings + node RPC for chain data) ────
+  // Lifecycle/key commands run in-process (node NOT required); balance &
+  // history come from the node's sugar index over RPC and degrade to
+  // placeholders when the node is offline or the index is disabled.
+  // 钱包服务(本地 Wails bindings + 节点 RPC 链上数据):生命周期/密钥命令在
+  // 进程内运行(无需节点);余额与历史走节点 sugar index RPC,节点离线或索引
+  // 未启用时降级为占位显示。
 
-  // getwalletinfo → WalletState; a locked/not-created wallet maps to the
-  // locked shell so the page can show the unlock form.
-  // getwalletinfo → WalletState;锁定/未创建的钱包映射为锁定外壳状态,
-  // 以便页面展示解锁表单。
+  // Hybrid snapshot: local Status() is authoritative for locked/address/name
+  // (never fails); getwalletinfo RPC only enriches the balance figures. With
+  // the node down the wallet page still renders — balance shows "—".
+  // 混合快照:本地 Status() 是 locked/address/name 的权威来源(永不失败);
+  // getwalletinfo RPC 仅补充余额数字。节点未启动时钱包页照常渲染——余额
+  // 显示 "—"。
   async getWallet(): Promise<WalletState> {
-    try {
-      const r = await rpc<{
-        locked: boolean;
-        walletname: string;
-        address: string;
-        total: number;
-        confirmed: number;
-        pending: number;
-        immature: number;
-        watchonly: number;
-      }>("getwalletinfo");
-      return {
-        locked: false,
-        total: r.total,
-        confirmed: r.confirmed,
-        pending: r.pending,
-        immature: r.immature,
-        watchOnly: r.watchonly,
-        address: r.address,
-        defaultWalletName: r.walletname,
-      };
-    } catch (e) {
-      const msg = String(e);
-      // Locked / not created / manager unavailable → locked shell state.
-      // 锁定/未创建/管理器不可用 → 锁定外壳状态。
-      if (msg.includes("locked") || msg.includes("not created") || msg.includes("not available")) {
-        return {
-          locked: true,
-          total: 0,
-          confirmed: 0,
-          pending: 0,
-          immature: 0,
-          watchOnly: 0,
-          address: null,
-          defaultWalletName: "main",
-        };
+    const st = await LocalWallet.Status();
+    let chain: { total: number; confirmed: number; pending: number; immature: number; watchonly: number } | null =
+      null;
+    if (st.unlocked) {
+      try {
+        chain = await rpc<{
+          total: number;
+          confirmed: number;
+          pending: number;
+          immature: number;
+          watchonly: number;
+        }>("getwalletinfo");
+      } catch {
+        /* node offline or sugarindex disabled — figures stay unknown */
+        /* 节点离线或 sugarindex 未启用 — 数字保持未知 */
       }
-      throw e;
     }
+    return {
+      locked: !st.unlocked,
+      total: chain?.total ?? 0,
+      confirmed: chain?.confirmed ?? 0,
+      pending: chain?.pending ?? 0,
+      immature: chain?.immature ?? 0,
+      watchOnly: chain?.watchonly ?? 0,
+      address: st.address || null,
+      defaultWalletName: st.name,
+      chainOnline: chain !== null,
+    };
   },
 
-  // walletpassphrase <pass> 0 → unlock the BIP39 wallet.db.
-  // walletpassphrase <pass> 0 → 解锁 BIP39 wallet.db。
+  // Unlock wallet.db with the passphrase, in-process. / 进程内用口令解锁 wallet.db。
   async unlock(pass: string): Promise<boolean> {
     try {
-      await rpc("walletpassphrase", pass, 0);
-      return true;
+      const addr = await LocalWallet.Unlock(pass);
+      return !!addr;
     } catch {
       return false;
     }
   },
 
-  // walletlogin <email> <pass> → legacy in-memory login; returns the primary
-  // (web-wallet compatible) address. / 邮箱密码登录(纯内存),返回主地址。
+  // Legacy email/password login (in-memory KDF); returns the primary
+  // (web-wallet compatible) address. / 邮箱密码登录(纯内存 KDF),返回主地址。
   async login(email: string, password: string): Promise<{ address: string }> {
-    return rpc<{ address: string }>("walletlogin", email, password);
+    const address = await LocalWallet.Login(email, password);
+    return { address };
   },
 
-  // createwallet → fresh BIP39 wallet; the mnemonic is returned once.
-  // createwallet → 全新 BIP39 钱包;助记词仅返回一次。
+  // Fresh BIP39 wallet, in-process; the mnemonic is returned once.
+  // 进程内创建全新 BIP39 钱包;助记词仅返回一次。
   async createWallet(pass: string): Promise<{
     name: string;
     mnemonic: string;
     address: string;
   }> {
-    return rpc("createwallet", "default", false, false, pass, false);
+    const r = await LocalWallet.Create(pass);
+    return { name: r.name, mnemonic: r.mnemonic, address: r.address };
   },
 
-  // walletlock → drop in-memory key material. / walletlock → 丢弃内存密钥。
+  // Lock: drop in-process key material. / 锁定:丢弃进程内密钥材料。
   async lockWallet(): Promise<void> {
-    await rpc("walletlock");
+    await LocalWallet.Lock();
   },
 
-  // getnewaddress → next derived address (advances the persisted index).
-  // getnewaddress → 下一个派生地址(推进持久化索引)。
+  // Next derived address (advances the persisted index), in-process.
+  // 进程内获取下一个派生地址(推进持久化索引)。
   async getNewAddress(): Promise<string> {
-    return rpc<string>("getnewaddress");
+    return LocalWallet.NextAddress();
   },
 
   // listtransactions → recent wallet history mapped to the frontend Tx shape.

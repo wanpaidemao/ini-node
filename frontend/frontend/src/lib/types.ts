@@ -129,6 +129,9 @@ export interface WalletState {
   watchOnly: number;
   address: string | null;
   defaultWalletName: string;
+  /** false when the node RPC was unreachable — chain figures unknown (UI shows "—"), wallet itself still usable */
+  /** 节点 RPC 不可达时为 false — 链上数字未知(UI 显示 "—"),钱包本身仍可用 */
+  chainOnline: boolean;
 }
 
 export interface AppConfig {

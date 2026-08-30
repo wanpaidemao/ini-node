@@ -157,19 +157,25 @@
         <!-- 隐私模式:遮蔽全部余额数字(钱包设置) -->
         {#if walletSettings.hideBalance}
           <p class="bal mono" translate="no">{t("wal.hidden_balance")}</p>
+        {:else if !w.chainOnline}
+          <!-- node offline: wallet itself works; chain figures unknown -->
+          <!-- 节点离线:钱包本身可用;链上数字未知 -->
+          <p class="bal mono" translate="no">— <span class="unit">S</span></p>
         {:else}
           <p class="bal mono" translate="no">{(w.total).toFixed(8)} <span class="unit">S</span></p>
         {/if}
         <div class="bal-sub">
           {#if walletSettings.hideBalance}
             <span class="part"><span class="dot ok" aria-hidden="true"></span>{t("wal.confirmed", { n: t("wal.hidden_balance") })}</span>
+          {:else if !w.chainOnline}
+            <span class="part"><span class="dot wait" aria-hidden="true"></span>{t("wal.offline_balance")}</span>
           {:else}
             <span class="part"><span class="dot ok" aria-hidden="true"></span>{t("wal.confirmed", { n: w.confirmed.toFixed(4) })}</span>
           {/if}
-          {#if !walletSettings.hideBalance && w.pending > 0}
+          {#if w.chainOnline && !walletSettings.hideBalance && w.pending > 0}
             <span class="part"><span class="dot wait" aria-hidden="true"></span>{t("wal.pending", { n: w.pending.toFixed(4) })}</span>
           {/if}
-          {#if !walletSettings.hideBalance && w.immature > 0}
+          {#if w.chainOnline && !walletSettings.hideBalance && w.immature > 0}
             <span class="part"><span class="dot lock" aria-hidden="true"></span>{t("wal.immature", { n: w.immature.toFixed(4) })}</span>
           {/if}
         </div>
@@ -225,7 +231,9 @@
 
       {#if tab === "history"}
         {#if txs.length === 0}
-          <p class="empty">{t("wal.empty")}</p>
+          <!-- node offline: distinguish "no history" from "node not reachable" -->
+          <!-- 节点离线:区分"无历史记录"与"节点不可达" -->
+          <p class="empty">{w && !w.chainOnline ? t("wal.offline_balance") : t("wal.empty")}</p>
         {:else}
           <table class="tx-table">
             <thead>

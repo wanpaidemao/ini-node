@@ -277,6 +277,7 @@
   "wal.receive": "Receive",
   "wal.receive_addr": "Receive address (bech32)",
   "wal.send": "Send",
+  "wal.offline_balance": "Node offline — balance unavailable, wallet still usable",
   "wal.set.auto_lock": "Auto-lock",
   "wal.set.auto_lock_hint": "Lock the wallet automatically once the auto-lock time passes after unlocking.",
   "wal.set.back": "Back to wallet",
