@@ -251,50 +251,18 @@ func externalUTXOs(api string, addrs []string) ([]UTXO, error) {
 // UTXOs returns the wallet's spendable outputs. Two-level chain: local node
 // getaddressutxos first, external REST fallback second (when externalAPI is
 // non-empty). Each UTXO carries its owning address so signing can pick the
-// right key per input.
+// right key per input. Since Step 9 the scan covers ALL THREE address types
+// per derivation index (old-type funds stay spendable after a type switch).
 // UTXOs 返回钱包的可花费输出。两级链：先本地节点 getaddressutxos，再外部
 // REST 降级（externalAPI 非空时）。每个 UTXO 附带所属地址，签名时按输入
-// 匹配对应私钥。
+// 匹配对应私钥。第 9 步起扫描覆盖每个派生索引的全部三种地址类型
+// （类型切换后旧类型资金仍可花费）。
 func (s *SendService) UTXOs(externalAPI string) ([]UTXO, error) {
 	w, err := s.unlocked()
 	if err != nil {
 		return nil, err
 	}
-	addrs, err := s.walletAddresses(w)
-	if err != nil {
-		return nil, err
-	}
-	utxos, nodeErr := nodeUTXOs(addrs)
-	if nodeErr == nil {
-		return utxos, nil
-	}
-	if strings.TrimSpace(externalAPI) == "" {
-		return nil, fmt.Errorf("node offline and no external API configured (node error: %v) / 节点离线且未配置外部 API（节点错误：%v）", nodeErr, nodeErr)
-	}
-	utxos, extErr := externalUTXOs(externalAPI, addrs)
-	if extErr != nil {
-		return nil, fmt.Errorf("node: %v; external: %v / 节点：%v；外部：%v", nodeErr, extErr, nodeErr, extErr)
-	}
-	return utxos, nil
-}
-
-// walletAddresses lists all derived addresses of the live session
-// (read-only, index 0 .. nextIndex-1).
-// walletAddresses 只读列出当前会话的全部已派生地址（index 0 .. nextIndex-1）。
-func (s *SendService) walletAddresses(w *wallet.Wallet) ([]string, error) {
-	n := w.NextIndex()
-	if n < 1 {
-		n = 1 // index 0 is always the primary address / index 0 始终为主地址
-	}
-	addrs := make([]string, 0, n)
-	for i := uint32(0); i < n; i++ {
-		a, err := w.Address(i)
-		if err != nil {
-			return nil, err
-		}
-		addrs = append(addrs, a)
-	}
-	return addrs, nil
+	return gatherUTXOs(w, strings.TrimSpace(externalAPI))
 }
 
 // EstimateFee returns the fee suggestion from the external REST /fee
@@ -701,7 +669,7 @@ func (s *SendService) Send(outputs []SendOutput, fee int64, externalAPI string) 
 		if _, ok := keys[in.Address]; ok {
 			continue
 		}
-		idx, err := s.addressIndex(w, in.Address)
+		idx, err := addressIndexFor(w, in.Address)
 		if err != nil {
 			return SendResult{}, err
 		}
@@ -735,26 +703,6 @@ func (s *SendService) Send(outputs []SendOutput, fee int64, externalAPI string) 
 	}
 	res.TxID = txid
 	return *res, nil
-}
-
-// addressIndex finds the derivation index of a wallet address (linear scan
-// over the derived range; the list is small). / addressIndex 查找钱包地址的
-// 派生索引（在已派生范围内线性查找；列表很小）。
-func (s *SendService) addressIndex(w *wallet.Wallet, addr string) (uint32, error) {
-	n := w.NextIndex()
-	if n < 1 {
-		n = 1
-	}
-	for i := uint32(0); i < n; i++ {
-		a, err := w.Address(i)
-		if err != nil {
-			return 0, err
-		}
-		if a == addr {
-			return i, nil
-		}
-	}
-	return 0, fmt.Errorf("address %s not derived by this wallet / 地址 %s 不是本钱包派生的", addr, addr)
 }
 
 // sugarFloatToSat converts a coin-unit float (RPC listunspent style) to

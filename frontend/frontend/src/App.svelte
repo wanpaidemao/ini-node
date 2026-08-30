@@ -14,6 +14,9 @@
   import Settings from "./pages/Settings.svelte";
   import Console from "./pages/Console.svelte";
   import ControlCenter from "./pages/ControlCenter.svelte";
+  // Step 10 Explorer: chain / block / tx three-level drill-down views.
+  // 第 10 步浏览器:链/区块/交易三级下钻视图。
+  import Explorer from "./pages/Explorer.svelte";
 
   // Page kinds: "rpc" pages go through the RPC proxy and can also be
   // served standalone as a plain frontend; "wails" pages need the desktop
@@ -27,6 +30,7 @@
       items: [
         { route: "dashboard", label: "nav.dashboard", kind: "rpc" },
         { route: "internals", label: "nav.internals", kind: "rpc" },
+        { route: "explorer", label: "nav.explorer", kind: "rpc" },
         { route: "control", label: "nav.control", kind: "wails" },
       ],
     },
@@ -54,6 +58,7 @@
   const titles: Record<Route, string> = {
     dashboard: "nav.dashboard",
     internals: "nav.internals",
+    explorer: "nav.explorer",
     control: "nav.control",
     wallet: "nav.wallet",
     "wallet-settings": "wal.set.title",
@@ -316,6 +321,8 @@
         <Console />
       {:else if app.route === "control"}
         <ControlCenter />
+      {:else if app.route === "explorer"}
+        <Explorer />
       {/if}
     </main>
   </div>

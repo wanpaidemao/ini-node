@@ -54,6 +54,12 @@ func main() {
 			// 发送链路（第 8 步）：UTXO 查询 → 选币 → 构造+签名 → 广播，
 			// 与上方钱包共享同一会话。
 			application.NewService(newSendService(walletSvc)),
+			// Token layer (Step 6/6b): the token ledger is an off-chain REST
+			// service, so token ops (transfer/create/issue/burn) run in this
+			// process against the layer endpoint, sharing the wallet session.
+			// 代币层（第 6/6b 步）：代币账本是链外 REST 服务，代币操作
+			// （转账/创建/增发/销毁）在本进程内对接层端点，与钱包共享会话。
+			application.NewService(newTokenService(walletSvc)),
 		},
 		Assets: application.AssetOptions{
 			Handler:    application.AssetFileServerFS(assets),

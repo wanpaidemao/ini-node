@@ -19,10 +19,14 @@ export function setConnected(state: { connected: boolean; syncing: boolean }): v
   app.syncing = state.syncing;
 }
 
-export function navigate(route: Route): void {
+// navigate with optional cross-page params: they land in app.shortcut so the
+// target page can pick them up (e.g. wallet history → explorer tx detail).
+// navigate 附带跨页参数:参数写入 app.shortcut 供目标页读取(例如钱包
+// 历史 → 浏览器交易详情)。
+export function navigate(route: Route, params?: Record<string, unknown>): void {
   app.route = route;
-  // clear stale shortcuts on navigation
-  app.shortcut = {};
+  // clear stale shortcuts on navigation (or set the new ones)
+  app.shortcut = params ?? {};
   try {
     history.replaceState(null, "", `#${route}`);
   } catch {
@@ -45,7 +49,7 @@ export function setNavMode(mode: NavMode): void {
 // init route from location.hash (deep-linking, also enables headless screenshots)
 function initRoute(): void {
   const h = (location.hash || "").replace("#", "") as Route;
-  const valid: Route[] = ["dashboard", "internals", "wallet", "wallet-settings", "send", "create", "settings", "console"];
+  const valid: Route[] = ["dashboard", "internals", "explorer", "wallet", "wallet-settings", "send", "create", "settings", "console", "control"];
   if (valid.includes(h)) app.route = h;
 }
 if (typeof window !== "undefined") initRoute();

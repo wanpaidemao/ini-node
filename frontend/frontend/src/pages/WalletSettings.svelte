@@ -33,6 +33,16 @@
   const autoLockOptions = [0, 1, 5, 10, 30];
   const historyOptions = [10, 25, 50, 100];
 
+  // Step 9 address types (same key material, three encodings). The wallet
+  // page + send pipeline follow this immediately on change.
+  // 第 9 步地址类型(同一密钥材料,三种编码)。钱包页与发送链路在
+  // 变更后即时跟随。
+  const addrTypes = [
+    { v: "bech32", label: "bech32 (P2WPKH)" },
+    { v: "segwit", label: "segwit (P2SH-P2WPKH)" },
+    { v: "legacy", label: "legacy (P2PKH)" },
+  ] as const;
+
   // minutes label: "Never" for 0, otherwise "N minutes"
   // 分钟标签:0 显示"永不",否则显示"N 分钟"
   function minutesLabel(n: number): string {
@@ -103,6 +113,48 @@
           <option value={n}>{n}</option>
         {/each}
       </select>
+    </div>
+
+    <div class="divider" aria-hidden="true"></div>
+
+    <!-- Step 9: address type — same key material, three encodings. Takes
+         effect immediately (no restart, no re-unlock). -->
+    <!-- 第 9 步:地址类型——同一密钥材料,三种编码。即时生效(无需
+         重启、无需重新解锁)。 -->
+    <div class="field">
+      <div class="field-text">
+        <label class="field-label" for="addr-type">{t("wal.set.addr_type")}</label>
+        <p class="field-hint">{t("wal.set.addr_type_hint")}</p>
+      </div>
+      <select id="addr-type" bind:value={walletSettings.addressType} onchange={apply}>
+        {#each addrTypes as a}
+          <option value={a.v}>{a.label}</option>
+        {/each}
+      </select>
+    </div>
+  </div>
+
+  <!-- Step 6: token layer endpoint — the REST service backing the Tokens
+       tab (balances / transfer / create / issue / burn). -->
+  <!-- 第 6 步:代币层端点——支撑 Tokens 标签页的 REST 服务(余额/
+       转账/创建/增发/销毁)。 -->
+  <div class="card source-card">
+    <p class="card-title">{t("wal.set.token_title")}</p>
+    <div class="field column">
+      <div class="field-text">
+        <label class="field-label" for="token-api">{t("wal.set.token_api")}</label>
+        <p class="field-hint">{t("wal.set.token_api_hint")}</p>
+      </div>
+      <input
+        id="token-api"
+        class="api-input"
+        type="url"
+        bind:value={walletSettings.tokenAPI}
+        onchange={apply}
+        placeholder="https://tokenstest.sugar.wtf"
+        spellcheck="false"
+        translate="no"
+      />
     </div>
   </div>
 

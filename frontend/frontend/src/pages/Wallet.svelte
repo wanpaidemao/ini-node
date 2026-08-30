@@ -5,7 +5,19 @@
   import { Services } from "../lib/services";
   import { navigate } from "../lib/store.svelte";
   import { walletAutoLock, walletLocked, walletSettings, walletUnlocked } from "../lib/wallet-settings.svelte";
-  import type { Tx, WalletState } from "../lib/types";
+  import type { TokenBalance, Tx, WalletState } from "../lib/types";
+
+  // Token op result (same shape the send pipeline returns): txid + rawHex
+  // kept for a broadcast retry, plus the fee actually paid.
+  // 代币操作结果(与发送链路同形):txid + 保留 rawHex 供广播重试,
+  // 另附实付手续费。
+  interface TokenResult {
+    txid: string;
+    rawHex: string;
+    broadcastErr: string;
+    fee: number;
+    inputCount: number;
+  }
 
   // Page state: w is the real getwalletinfo snapshot; locked mirrors
   // w.locked so the unlock form replaces the old click-to-unlock mock.
@@ -40,6 +52,117 @@
     navigator.clipboard?.writeText(a);
     addrCopied = i;
     setTimeout(() => (addrCopied = -1), 1500);
+  }
+
+  // Step 11: per-address WIF export (Keys tab). The key is copied straight
+  // to the clipboard and never rendered on screen.
+  // 第 11 步:按地址导出 WIF(Keys 标签页)。私钥直接复制到剪贴板,
+  // 绝不在屏幕上渲染。
+  let wifCopied = $state(-1);
+  async function exportKeyWIF(i: number) {
+    try {
+      const wif = await Services.exportWIF(i);
+      navigator.clipboard?.writeText(wif);
+      wifCopied = i;
+      setTimeout(() => (wifCopied = -1), 2000);
+    } catch {
+      /* locked mid-call — ignore / 调用间隙锁定 — 忽略 */
+    }
+  }
+
+  // ── Tokens tab (Step 6/6b): real token layer over Wails bindings ──
+  // Balances load lazily on the first tab visit (like Keys); the ops panel
+  // covers transfer / create / issue / burn with a shared form. Amounts are
+  // display units — services converts with each token's own decimals.
+  // 代币标签页(第 6/6b 步):Wails bindings 对接真实代币层。余额在首次
+  // 切入时懒加载(与 Keys 一致);操作面板以共用表单覆盖转账/创建/
+  // 增发/销毁。金额为显示单位——services 按各代币自身 decimals 换算。
+  let tokens = $state<TokenBalance[] | null>(null);
+  let tokensErr = $state<string | null>(null);
+  let tokenBusy = $state(false);
+  $effect(() => {
+    if (tab === "tokens" && tokens === null && w && !w.locked) {
+      tokensErr = null;
+      Services.getTokenBalances()
+        .then((bs) => (tokens = bs))
+        .catch((e) => {
+          tokensErr = String(e);
+          tokens = [];
+        });
+    }
+  });
+
+  // fmtToken renders a base-unit balance in display units (per decimals).
+  // fmtToken 按精度把基本单位余额渲染为显示单位。
+  function fmtToken(b: TokenBalance): string {
+    const v = b.value / Math.pow(10, b.decimals);
+    return v.toLocaleString("en-US", { maximumFractionDigits: Math.max(2, b.decimals) });
+  }
+
+  // op form state: one mode switcher, shared fields. / 表单状态:单一
+  // 模式切换 + 共用字段。
+  let opMode = $state<"transfer" | "create" | "issue" | "burn">("transfer");
+  let opTicker = $state("");
+  let opTo = $state("");
+  let opValue = $state(0);
+  let opDecimals = $state(8);
+  let opReissuable = $state(true);
+  let opMarker = $state(0.001);
+  let opFee = $state(0.001);
+  let opResult = $state<TokenResult | null>(null);
+  let opErr = $state<string | null>(null);
+
+  // picking a balance row pre-fills ticker + switches to transfer.
+  // 点击余额行预填 ticker 并切到转账模式。
+  function pickToken(b: TokenBalance) {
+    opMode = "transfer";
+    opTicker = b.ticker;
+  }
+
+  async function runTokenOp() {
+    opErr = null;
+    opResult = null;
+    tokenBusy = true;
+    try {
+      const r =
+        opMode === "transfer"
+          ? await Services.tokenTransfer(opTicker.trim(), opTo.trim(), opValue, opMarker, opFee)
+          : opMode === "create"
+            ? await Services.tokenCreate(opTicker.trim(), opValue, opDecimals, opReissuable, opFee)
+            : opMode === "issue"
+              ? await Services.tokenIssue(opTicker.trim(), opValue, opFee)
+              : await Services.tokenBurn(opTicker.trim(), opValue, opFee);
+      opResult = r as TokenResult;
+      // refresh the balances after a successful op / 操作成功后刷新余额
+      if (!r.broadcastErr) {
+        Services.getTokenBalances()
+          .then((bs) => (tokens = bs))
+          .catch(() => {});
+      }
+    } catch (e) {
+      opErr = String(e).replace(/^Error:\s*/, "");
+    } finally {
+      tokenBusy = false;
+    }
+  }
+
+  // Broadcast retry for a signed token tx whose broadcast failed.
+  // 已签名代币交易广播失败后的重试。
+  async function retryTokenBroadcast() {
+    if (!opResult?.rawHex) return;
+    opErr = null;
+    tokenBusy = true;
+    try {
+      const txid = await Services.broadcastRaw(opResult.rawHex);
+      opResult = { ...opResult, txid, broadcastErr: "" };
+      Services.getTokenBalances()
+        .then((bs) => (tokens = bs))
+        .catch(() => {});
+    } catch (e) {
+      opErr = String(e).replace(/^Error:\s*/, "");
+    } finally {
+      tokenBusy = false;
+    }
   }
 
   // Real QR of the receive address (replaces the old decorative pseudo
@@ -236,7 +359,9 @@
       <!-- ── receive address card ── -->
       <!-- ── 收款地址卡片 ── -->
       <div class="card receive">
-        <p class="eyebrow">{t("wal.receive_addr")}</p>
+        <!-- Step 9: label follows the configured address type / 标签跟随
+             配置的地址类型 -->
+        <p class="eyebrow">{t("wal.receive_addr")} ({walletSettings.addressType})</p>
         <!-- real QR encoding the receive address / 编码收款地址的真实二维码 -->
         {#if qrSvg}
           <div class="qr" aria-hidden="true">{@html qrSvg}</div>
@@ -296,7 +421,17 @@
                       <span class="dot" aria-hidden="true"></span>
                       {x.status === "confirmed" ? t("wal.confirmed_status") : t("wal.pending_status")}
                     </span>
-                    <span class="mono hash" translate="no" title={x.hash}>({x.hash})</span>
+                    <!-- txid deep-links into the Explorer tx view (Step 10) -->
+                    <!-- txid 内链到浏览器交易视图(第 10 步) -->
+                    <span
+                      class="mono hash link"
+                      translate="no"
+                      title={x.hash}
+                      role="button"
+                      tabindex="0"
+                      onclick={() => navigate("explorer", { txid: x.hash })}
+                      onkeydown={(e) => e.key === "Enter" && navigate("explorer", { txid: x.hash })}
+                    >({x.hash})</span>
                   </td>
                 </tr>
               {/each}
@@ -304,9 +439,113 @@
           </table>
         {/if}
       {:else if tab === "tokens"}
-        <!-- placeholder until the token REST proxy (Step 6) -->
-        <!-- 代币 REST 代理(Step 6)上线前的占位 -->
-        <p class="empty">{t("wal.tab_tokens_hint")}</p>
+        <!-- ── Tokens tab (Step 6/6b): balances + four ops ── -->
+        <!-- ── 代币标签页(第 6/6b 步):余额 + 四操作 ── -->
+        {#if tokens === null}
+          <p class="empty">{t("wal.loading")}</p>
+        {:else if tokensErr}
+          <p class="empty">{tokensErr}</p>
+        {:else if tokens.length === 0}
+          <p class="empty">{t("wal.tab_tokens_empty")}</p>
+        {:else}
+          <table class="key-table token-table">
+            <thead>
+              <tr>
+                <th scope="col">{t("wal.tok_col_ticker")}</th>
+                <th scope="col">{t("wal.tok_col_balance")}</th>
+                <th scope="col">{t("con.col_action")}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each tokens as b (b.ticker)}
+                <tr>
+                  <td class="mono" translate="no">{b.ticker}</td>
+                  <td class="mono" translate="no">{fmtToken(b)}</td>
+                  <td>
+                    <button class="mini" onclick={() => pickToken(b)}>{t("wal.tok_transfer")}</button>
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        {/if}
+
+        <!-- ops panel: one form, mode switcher / 操作面板:单表单 + 模式切换 -->
+        <div class="token-ops">
+          <div class="op-tabs" role="tablist">
+            {#each ["transfer", "create", "issue", "burn"] as m}
+              <button class="op-tab" class:active={opMode === m} role="tab" aria-selected={opMode === m} onclick={() => (opMode = m as typeof opMode)}>
+                {t(`wal.tok_${m}`)}
+              </button>
+            {/each}
+          </div>
+          <form
+            class="op-form"
+            onsubmit={(e) => {
+              e.preventDefault();
+              runTokenOp();
+            }}
+          >
+            <div class="op-row">
+              <label>
+                <span>{t("wal.tok_ticker")}</span>
+                <input type="text" bind:value={opTicker} spellcheck="false" translate="no" required />
+              </label>
+              {#if opMode === "transfer"}
+                <label>
+                  <span>{t("send.to")}</span>
+                  <input type="text" bind:value={opTo} spellcheck="false" translate="no" required />
+                </label>
+              {/if}
+              <label>
+                <span>{t("wal.tok_value")}</span>
+                <input type="number" bind:value={opValue} min="0" step="any" required />
+              </label>
+              {#if opMode === "transfer"}
+                <label>
+                  <span>{t("wal.tok_marker")}</span>
+                  <input type="number" bind:value={opMarker} min="0.00000001" step="any" />
+                </label>
+              {/if}
+              {#if opMode === "create"}
+                <label>
+                  <span>{t("wal.tok_decimals")}</span>
+                  <input type="number" bind:value={opDecimals} min="0" max="18" />
+                </label>
+                <label class="check-inline">
+                  <input type="checkbox" bind:checked={opReissuable} />
+                  <span>{t("wal.tok_reissuable")}</span>
+                </label>
+              {/if}
+              <label>
+                <span>{t("wal.tok_fee")}</span>
+                <input type="number" bind:value={opFee} min="0.00000001" step="any" />
+              </label>
+            </div>
+            <button class="btn btn-primary" type="submit" disabled={tokenBusy}>
+              {#if tokenBusy}<span class="spin" aria-hidden="true"></span>{/if}
+              {t(`wal.tok_${opMode}`)}
+            </button>
+          </form>
+          {#if opErr}
+            <p class="err" role="alert"><span class="dot" aria-hidden="true"></span>{opErr}</p>
+          {/if}
+          {#if opResult}
+            <div class="op-result" role="status">
+              {#if opResult.broadcastErr}
+                <p class="err"><span class="dot" aria-hidden="true"></span>{t("wal.tok_broadcast_failed", { e: opResult.broadcastErr })}</p>
+                <button class="btn btn-ghost" onclick={retryTokenBroadcast} disabled={tokenBusy}>{t("wal.tok_retry")}</button>
+              {:else}
+                <p class="ok mono" translate="no">
+                  {t("wal.tok_done")} <span class="hash" title={opResult.txid} role="button" tabindex="0"
+                    onclick={() => navigate("explorer", { txid: opResult!.txid })}
+                    onkeydown={(e) => e.key === "Enter" && navigate("explorer", { txid: opResult!.txid })}
+                  >{opResult.txid}</span>
+                </p>
+              {/if}
+            </div>
+          {/if}
+        </div>
       {:else if tab === "keys"}
         <!-- derived-address list: local, works without the node -->
         <!-- 已派生地址列表:纯本地,无需节点 -->
@@ -331,6 +570,10 @@
                   <td>
                     <button class="mini" onclick={() => copyKeyAddr(a.index, a.address)}>
                       {addrCopied === a.index ? "✓" : t("g.copy")}
+                    </button>
+                    <!-- Step 11: WIF export → clipboard only / WIF 导出 → 仅剪贴板 -->
+                    <button class="mini" title={t("wal.wif_export_hint")} onclick={() => exportKeyWIF(a.index)}>
+                      {wifCopied === a.index ? "✓ WIF" : "WIF"}
                     </button>
                   </td>
                 </tr>
@@ -672,6 +915,109 @@
     margin: 0;
     text-align: center;
     font-size: 13px;
+  }
+
+  /* ── Tokens tab (Step 6/6b): ops panel + result ── */
+  /* ── 代币标签页(第 6/6b 步):操作面板 + 结果 ── */
+  .token-ops {
+    border-top: 1px solid var(--line);
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .op-tabs {
+    display: flex;
+    gap: 4px;
+    flex-wrap: wrap;
+  }
+  .op-tab {
+    background: none;
+    border: 1px solid var(--line);
+    color: var(--ink-dim);
+    padding: 5px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    border-radius: 999px;
+  }
+  .op-tab:hover {
+    color: var(--ink-fg);
+    border-color: var(--straw);
+  }
+  .op-tab.active {
+    color: var(--straw);
+    border-color: var(--straw);
+    background: var(--violet-2);
+  }
+  .op-form {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .op-row {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .op-row label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 11px;
+    color: var(--ink-dim);
+    min-width: 120px;
+    flex: 1;
+  }
+  .op-row label.check-inline {
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    flex: none;
+    align-self: end;
+    padding-bottom: 7px;
+  }
+  .op-row input[type="number"] {
+    font-variant-numeric: tabular-nums;
+  }
+  .op-result {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .ok {
+    color: var(--mint);
+    font-size: 12px;
+    margin: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+  }
+  .hash.link,
+  .kv-v.link {
+    color: var(--straw);
+    cursor: pointer;
+  }
+  .hash.link:hover {
+    text-decoration: underline;
+  }
+  .err {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    color: var(--honey);
+    font-size: 12px;
+    margin: 0;
+  }
+  .err .dot {
+    background: var(--honey);
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex: none;
   }
 
   @media (max-width: 760px) {

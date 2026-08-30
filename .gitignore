@@ -1,5 +1,8 @@
 frontend.rar
 
+# wails dev/build binary artifact / wails 开发构建产物
+/frontend/changeme.exe
+
 # runtime artifacts
 /btcd-data/
 /btcd-logs/

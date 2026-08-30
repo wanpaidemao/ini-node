@@ -10,12 +10,16 @@ import type { WalletSettings } from "./types";
 
 const KEY = "ini-node.wallet-settings";
 
-// Defaults: auto-lock after 5 min, balance visible, 25 history rows.
-// 默认值:5 分钟自动锁定,余额可见,历史 25 条。
+// Defaults: auto-lock after 5 min, balance visible, 25 history rows,
+// bech32 (native segwit) address type, testnet token layer endpoint.
+// 默认值:5 分钟自动锁定,余额可见,历史 25 条,bech32(原生隔离见证)
+// 地址类型,测试网代币层端点。
 const DEFAULTS: WalletSettings = {
   autoLockMinutes: 5,
   hideBalance: false,
   historyCount: 25,
+  addressType: "bech32",
+  tokenAPI: "https://tokenstest.sugar.wtf",
 };
 
 function load(): WalletSettings {

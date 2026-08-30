@@ -66,7 +66,7 @@ func (m *Manager) Create(passphrase string) (mnemonic string, w *Wallet, err err
 	if err := w.SaveWallet(m.path, passphrase); err != nil {
 		return "", nil, err
 	}
-	_ = m.saveNextIndexFor(0, false) // ensure the sidecar exists / 确保旁车文件存在
+	_ = m.saveNextIndexFor(0, "") // ensure the sidecar exists / 确保旁车文件存在
 	m.unlocked = w
 	return mnemonic, w, nil
 }
@@ -85,7 +85,7 @@ func (m *Manager) Unlock(passphrase string) (*Wallet, error) {
 	if err != nil {
 		return nil, err
 	}
-	w.SetNextIndex(m.loadNextIndexFor(false)) // restore persisted address index / 恢复持久化的地址索引
+	w.SetNextIndex(m.loadNextIndexFor("")) // restore persisted address index / 恢复持久化的地址索引
 	m.unlocked = w
 	return w, nil
 }
@@ -109,7 +109,7 @@ func (m *Manager) Login(email, password string) (*Wallet, error) {
 	if err != nil {
 		return nil, err
 	}
-	w.SetNextIndex(m.loadNextIndexFor(true)) // restore persisted legacy index / 恢复持久化的传统索引
+	w.SetNextIndex(m.loadNextIndexFor(".legacy")) // restore persisted legacy index / 恢复持久化的传统索引
 	m.unlocked = w
 	return w, nil
 }
@@ -154,29 +154,52 @@ func (m *Manager) NextAddress() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := m.saveNextIndexFor(idx+1, w.legacy); err != nil {
+	if err := m.saveNextIndexFor(idx+1, w.sidecarSuffix()); err != nil {
 		return "", err
 	}
 	w.SetNextIndex(idx + 1)
 	return addr, nil
 }
 
-// metaPath returns the plaintext sidecar path storing the next address index.
-// Legacy wallets use a separate ".legacy.meta" file so their index never
-// collides with (and never skips index 0 because of) the BIP39 wallet.
-// metaPath 返回存储下一地址索引的明文旁车文件路径。传统钱包使用独立的
-// ".legacy.meta" 文件，避免与 BIP39 钱包索引冲突（也不会因此跳过 index 0）。
-func (m *Manager) metaPathFor(legacy bool) string {
-	if legacy {
-		return m.path + ".legacy.meta"
+// LoginWIF derives a single-key wallet from an imported WIF private key
+// purely in memory (hybrid mode, see NewFromWIF) and leaves it unlocked.
+// Like Login it never touches wallet.db; its next-address index lives in a
+// dedicated ".wif.meta" sidecar, so the imported key's address (index 0) is
+// always the first address handed out.
+// LoginWIF 用导入的 WIF 私钥纯内存派生单钥钱包（混合模式，见 NewFromWIF）
+// 并保持解锁。与 Login 一样不碰 wallet.db；其下一地址索引存于独立的
+// ".wif.meta" 旁车文件，导入私钥的地址（index 0）始终第一个分配。
+func (m *Manager) LoginWIF(wifStr string) (*Wallet, error) {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+
+	if m.unlocked != nil {
+		return nil, fmt.Errorf("wallet is already unlocked / 钱包已解锁")
 	}
-	return m.path + ".meta"
+	w, err := NewFromWIF(wifStr, m.net)
+	if err != nil {
+		return nil, err
+	}
+	w.SetNextIndex(m.loadNextIndexFor(".wif")) // restore persisted WIF index / 恢复持久化的 WIF 索引
+	m.unlocked = w
+	return w, nil
 }
 
-// loadNextIndex reads the persisted next address index (0 when absent).
-// loadNextIndex 读取持久化的下一地址索引（不存在时为 0）。
-func (m *Manager) loadNextIndexFor(legacy bool) uint32 {
-	data, err := os.ReadFile(m.metaPathFor(legacy))
+// metaPathFor returns the plaintext sidecar path storing the next address
+// index. Suffix "" is the BIP39 wallet, ".legacy" the email/password login
+// wallet, ".wif" the WIF import wallet — three separate files so the kinds
+// never collide (and each hands out its own index 0 first).
+// metaPathFor 返回存储下一地址索引的明文旁车文件路径。后缀 "" 为 BIP39
+// 钱包、".legacy" 为邮箱密码登录钱包、".wif" 为 WIF 导入钱包——三个独立
+// 文件，类别间互不冲突（各自都从自己的 index 0 起分配）。
+func (m *Manager) metaPathFor(suffix string) string {
+	return m.path + suffix + ".meta"
+}
+
+// loadNextIndexFor reads the persisted next address index (0 when absent).
+// loadNextIndexFor 读取持久化的下一地址索引（不存在时为 0）。
+func (m *Manager) loadNextIndexFor(suffix string) uint32 {
+	data, err := os.ReadFile(m.metaPathFor(suffix))
 	if err != nil {
 		return 0
 	}
@@ -187,10 +210,10 @@ func (m *Manager) loadNextIndexFor(legacy bool) uint32 {
 	return idx
 }
 
-// saveNextIndex persists the next address index.
-// saveNextIndex 持久化下一地址索引。
-func (m *Manager) saveNextIndexFor(i uint32, legacy bool) error {
-	return os.WriteFile(m.metaPathFor(legacy), []byte(fmt.Sprintf("%d", i)), 0o600)
+// saveNextIndexFor persists the next address index.
+// saveNextIndexFor 持久化下一地址索引。
+func (m *Manager) saveNextIndexFor(i uint32, suffix string) error {
+	return os.WriteFile(m.metaPathFor(suffix), []byte(fmt.Sprintf("%d", i)), 0o600)
 }
 
 // zeroBytes clears a byte slice in place.

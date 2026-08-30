@@ -9,7 +9,13 @@ export type Route =
   | "create"
   | "settings"
   | "console"
-  | "control";
+  | "control"
+  | "explorer";
+
+// Address type for the Step 9 three-type derivation (same key material,
+// three Sugarchain encodings). / 第 9 步三型派生的地址类型(同一密钥
+// 材料,三种糖链编码)。
+export type AddressType = "bech32" | "segwit" | "legacy";
 
 // Wallet settings — local UI preferences for the wallet pages, persisted
 // client-side (localStorage), not part of the node RPC config.
@@ -23,6 +29,29 @@ export interface WalletSettings {
   hideBalance: boolean;
   /** how many recent transactions listtransactions fetches / 拉取的近期交易条数 */
   historyCount: number;
+  /** Step 9: address type shown/used by the wallet page (immediate effect) */
+  /** 第 9 步:钱包页展示/使用的地址类型(即时生效) */
+  addressType: AddressType;
+  /** Step 6: token layer REST endpoint (default tokenstest.sugar.wtf) */
+  /** 第 6 步:代币层 REST 端点(默认 tokenstest.sugar.wtf) */
+  tokenAPI: string;
+}
+
+// Token balance entry of the wallet (Step 6 Tokens tab).
+// 钱包的代币余额条目(第 6 步 Tokens 标签页)。
+export interface TokenBalance {
+  ticker: string;
+  value: number; // base units / 基本单位
+  decimals: number;
+}
+
+// Token metadata from the layer's /layer/token/{ticker}.
+// 代币层 /layer/token/{ticker} 返回的代币元数据。
+export interface TokenInfo {
+  ticker: string;
+  decimals: number;
+  reissuable: boolean;
+  supply: number; // base units / 基本单位
 }
 
 export type ConnState = "online" | "syncing" | "offline";
@@ -159,4 +188,41 @@ export interface RpcResult {
   output: string;
   elapsedMs: number;
   format: "json" | "text";
+}
+
+// ── Explorer (Step 10): chain / block / tx view shapes ──
+// ── 浏览器(第 10 步):链/区块/交易视图数据形态 ──
+export interface ExplorerChain {
+  height: number;
+  bestHash: string;
+  chain: string;
+  difficulty: number;
+  headers: number;
+  mediantime: number;
+}
+
+export interface ExplorerBlock {
+  hash: string;
+  height: number;
+  confirmations: number;
+  time: number;
+  size: number;
+  txCount: number;
+  nonce: number;
+  bits: string;
+  difficulty: number;
+}
+
+export interface ExplorerTx {
+  txid: string;
+  blockhash?: string;
+  blocktime?: number;
+  confirmations?: number;
+  time?: number;
+  size: number;
+  vinCount: number;
+  voutCount: number;
+  totalOut: number; // SUGAR / SUGAR
+  outputs: { n: number; value: number; address: string | null }[];
+  inputs: { txid: string; vout: number; address: string | null }[];
 }

@@ -5,15 +5,17 @@
   import { registerWallet, removeWallet, walletRegistry } from "../lib/wallet-registry.svelte";
 
   // ── state ──────────────────────────────────────────────────────
-  // Open-wallet tabs: legacy email/password login (in-memory) or BIP39
-  // wallet.db passphrase unlock. WIF/file mock tabs were removed — only
-  // methods backed by real RPCs are offered.
-  // 打开钱包两个入口:邮箱密码登录(纯内存)或 BIP39 wallet.db 口令解锁。
-  // 移除了 WIF/文件 mock 标签页——只提供真实 RPC 支持的方式。
-  let openTab = $state<"email" | "pass">("email");
+  // Open-wallet tabs: legacy email/password login (in-memory), BIP39
+  // wallet.db passphrase unlock, or WIF private key import (Step 11,
+  // in-memory hybrid — index 0 is the imported key's web-wallet address).
+  // 打开钱包三个入口:邮箱密码登录(纯内存)、BIP39 wallet.db 口令解锁、
+  // 或 WIF 私钥导入(第 11 步,纯内存混合——index 0 即导入私钥的
+  // web 钱包地址)。
+  let openTab = $state<"email" | "pass" | "wif">("email");
   let email = $state("");
   let emailPass = $state("");
   let pass = $state("");
+  let wifKey = $state("");
   let error = $state<string | null>(null);
   let busy = $state(false);
 
@@ -31,6 +33,10 @@
     if (p.type === "web" && p.email) {
       openTab = "email";
       email = p.email;
+    } else if (p.type === "web") {
+      // WIF import profile (web type, no email) → WIF tab.
+      // WIF 导入档案(web 类,无邮箱)→ WIF 标签页。
+      openTab = "wif";
     } else {
       openTab = "pass";
     }
@@ -48,16 +54,17 @@
   let mnemonicCopied = $state(false);
 
   // ── actions ────────────────────────────────────────────────────
-  // openWallet: dispatch by tab — legacy KDF login (in-memory) or BIP39
-  // wallet.db passphrase unlock. Both navigate to the wallet page on success.
+  // openWallet: dispatch by tab — legacy KDF login (in-memory), BIP39
+  // wallet.db passphrase unlock, or WIF import (Step 11). All navigate to
+  // the wallet page on success.
   // NOTE: legacy login is deterministic derivation — any email/password
   // derives a wallet, so there is no "wrong password" at the KDF level.
   // Real failures (e.g. "already unlocked") are shown verbatim instead of
   // the old misleading generic message.
-  // openWallet: 按标签页分发——传统 KDF 登录(纯内存)或 BIP39 wallet.db
-  // 口令解锁。成功后进入钱包页。注意:传统登录是确定性派生——任意邮箱
-  // 密码都能派生钱包,KDF 层面不存在"密码错误"。真实错误(如"已解锁")
-  // 原样展示,不再显示误导性的笼统文案。
+  // openWallet: 按标签页分发——传统 KDF 登录(纯内存)、BIP39 wallet.db
+  // 口令解锁或 WIF 导入(第 11 步)。成功后进入钱包页。注意:传统登录是
+  // 确定性派生——任意邮箱密码都能派生钱包,KDF 层面不存在"密码错误"。
+  // 真实错误(如"已解锁")原样展示,不再显示误导性的笼统文案。
   async function openWallet() {
     error = null;
     // Only basic sanity here: the web wallet has NO minimum password
@@ -69,19 +76,35 @@
         error = t("login.fail");
         return;
       }
+    } else if (openTab === "wif") {
+      if (wifKey.trim().length < 20) {
+        error = t("login.bad_wif");
+        return;
+      }
     } else if (pass.length < 1) {
       error = t("create.bad_passphrase");
       return;
     }
     busy = true;
     try {
-      const ok =
-        openTab === "email"
-          ? !!(await Services.login(email.trim(), emailPass)).address
-          : await Services.unlock(pass);
-      if (!ok) {
-        error = openTab === "email" ? t("login.fail") : t("create.bad_passphrase");
-        return;
+      if (openTab === "email") {
+        const ok = !!(await Services.login(email.trim(), emailPass)).address;
+        if (!ok) {
+          error = t("login.fail");
+          return;
+        }
+      } else if (openTab === "wif") {
+        // WIF import: the binding validates the key and derives the
+        // hybrid wallet in memory; errors (bad checksum etc.) surface
+        // verbatim. / WIF 导入:binding 校验私钥并在内存中派生混合
+        // 钱包;错误(校验和错误等)原样上浮。
+        await Services.loginWIF(wifKey.trim());
+      } else {
+        const ok = await Services.unlock(pass);
+        if (!ok) {
+          error = t("create.bad_passphrase");
+          return;
+        }
       }
       // Register the opened wallet in the saved-profiles list (metadata
       // only — password never stored). / 登记到已保存档案列表(仅元数据,
@@ -89,9 +112,12 @@
       const st = await Services.getWallet();
       if (openTab === "email") {
         registerWallet({ type: "web", email: email.trim(), address: st.address ?? undefined });
+      } else if (openTab === "wif") {
+        registerWallet({ type: "web", name: "WIF import", address: st.address ?? undefined });
       } else {
         registerWallet({ type: "hd", address: st.address ?? undefined });
       }
+      wifKey = ""; // never keep the key in the field / 字段绝不保留私钥
       navigate("wallet");
     } catch (e) {
       // Surface the real cause: "wallet is already unlocked", binding
@@ -235,6 +261,8 @@
       <div class="tabs" role="tablist">
         <button class="tab" class:active={openTab === "email"} role="tab" aria-selected={openTab === "email"} onclick={() => (openTab = "email")}>{t("create.tab_email")}</button>
         <button class="tab" class:active={openTab === "pass"} role="tab" aria-selected={openTab === "pass"} onclick={() => (openTab = "pass")}>{t("create.tab_passphrase")}</button>
+        <!-- Step 11: WIF private key import / 第 11 步:WIF 私钥导入 -->
+        <button class="tab" class:active={openTab === "wif"} role="tab" aria-selected={openTab === "wif"} onclick={() => (openTab = "wif")}>{t("create.tab_wif")}</button>
       </div>
 
       <form onsubmit={(e) => { e.preventDefault(); openWallet(); }}>
@@ -248,6 +276,26 @@
             <input id="lpass" type="password" bind:value={emailPass} autocomplete="current-password" />
           </div>
           <p class="hint">{t("login.hint")}</p>
+        {:else if openTab === "wif"}
+          <!-- Step 11: import a WIF private key — in-memory hybrid wallet,
+               index 0 is the imported key's web-wallet address so funds
+               restore exactly. Never written to disk. -->
+          <!-- 第 11 步:导入 WIF 私钥——纯内存混合钱包,index 0 即导入
+               私钥的 web 钱包地址,资产精确恢复。绝不写入磁盘。 -->
+          <div class="field">
+            <label class="field-label" for="wifkey">{t("create.wif_label")}</label>
+            <input
+              id="wifkey"
+              class="mono-input"
+              type="password"
+              bind:value={wifKey}
+              placeholder="WIF private key / WIF 私钥"
+              autocomplete="off"
+              spellcheck="false"
+              translate="no"
+            />
+          </div>
+          <p class="hint">{t("create.wif_hint")}</p>
         {:else}
           <div class="field">
             <label class="field-label" for="wpass">{t("g.password")}</label>
@@ -262,7 +310,7 @@
 
         <button class="btn btn-primary wide" type="submit" disabled={busy}>
           {#if busy}<span class="spin" aria-hidden="true"></span>{/if}
-          {openTab === "email" ? t("login.btn") : t("create.open")}
+          {openTab === "email" ? t("login.btn") : openTab === "wif" ? t("create.wif_btn") : t("create.open")}
         </button>
       </form>
     </div>
@@ -518,5 +566,10 @@
     color: var(--ink-dim);
     margin: 0;
     line-height: 1.45;
+  }
+  /* WIF key field: monospace, no wrap / WIF 私钥输入:等宽字体 */
+  .mono-input {
+    font-family: var(--font-mono);
+    font-size: 12px;
   }
 </style>

@@ -9,11 +9,16 @@
 
 import type {
   AppConfig,
+  ExplorerBlock,
+  ExplorerChain,
+  ExplorerTx,
   NodeInfo,
   NodeInternals,
   Peer,
   RpcResult,
   SyncStatus,
+  TokenBalance,
+  TokenInfo,
   Tx,
   WalletState,
 } from "./types";
@@ -31,7 +36,13 @@ import * as LocalGreet from "../../bindings/changeme/greetservice.js";
 // 第 8 步发送链路 bindings:UTXO 查询 → 选币 → 构造+签名 → 广播,全在进程内
 // (UTXO/广播两级链:先节点,钱包设置启用外部源时降级外部 REST)。
 import * as LocalSend from "../../bindings/changeme/sendservice.js";
+// Step 6 token layer bindings: balances/transfer/create/issue/burn against
+// the off-chain token REST layer, in-process, sharing the wallet session.
+// 第 6 步代币层 bindings:对接链外代币 REST 层的余额/转账/创建/增发/销毁,
+// 进程内完成,与钱包共享会话。
+import * as LocalToken from "../../bindings/changeme/tokenservice.js";
 import { chainSource } from "./wallet-registry.svelte";
+import { walletSettings } from "./wallet-settings.svelte";
 
 // ── low-level JSON-RPC client ───────────────────────────────────
 let seq = 1;
@@ -580,6 +591,18 @@ export const Services = {
   // 仅节点提供(REST 浏览器无历史端点——原版也是外链区块浏览器)。
   async getWallet(): Promise<WalletState> {
     const st = await LocalWallet.Status();
+    // Step 9: the shown address follows the configured address type
+    // (bech32/segwit/legacy). The switch takes effect immediately — no
+    // restart, no re-unlock. Falls back to the bech32 default on error.
+    // 第 9 步:展示地址跟随配置的地址类型(bech32/segwit/legacy)。
+    // 切换即时生效——无需重启、无需重新解锁。出错时回退 bech32 默认值。
+    if (st.unlocked) {
+      try {
+        st.address = await LocalWallet.AddressFor(0, walletSettings.addressType);
+      } catch {
+        /* locked mid-call — keep the status address / 调用间隙锁定 — 保留状态地址 */
+      }
+    }
     let chain: { total: number; confirmed: number; pending: number; immature: number; watchonly: number } | null =
       null;
     let external = false;
@@ -677,6 +700,105 @@ export const Services = {
     return (await LocalWallet.Addresses()) ?? [];
   },
 
+  // Step 9: address of the given type at a derivation index (immediate
+  // effect, no restart). / 第 9 步:派生索引上指定类型的地址(即时生效,
+  // 无需重启)。
+  async getAddressFor(index: number, addrType: string): Promise<string> {
+    return LocalWallet.AddressFor(index, addrType);
+  },
+
+  // Step 11: import a WIF private key (in-memory hybrid wallet; index 0 is
+  // the imported key's web-wallet address). / 第 11 步:导入 WIF 私钥
+  // (纯内存混合钱包;index 0 即导入私钥的 web-wallet 地址)。
+  async loginWIF(wif: string): Promise<{ address: string }> {
+    const address = await LocalWallet.LoginWIF(wif);
+    return { address };
+  },
+
+  // Per-address WIF export for backups / migration (Keys tab).
+  // 按地址导出 WIF,供备份/迁移(Keys 标签页)。
+  async exportWIF(index: number): Promise<string> {
+    return LocalWallet.ExportWIF(index);
+  },
+
+  // ── Token layer (Step 6, in-process Wails bindings) ───────────
+  // Amounts are display-unit floats here; the base-unit conversion uses the
+  // token's own decimals (web-wallet amountFormatSatoshis parity).
+  // 代币层(第 6 步,进程内 Wails bindings)。此处金额为显示单位浮点;
+  // 基本单位换算按代币自身 decimals(对齐 web-wallet amountFormatSatoshis)。
+  async getTokenBalances(): Promise<TokenBalance[]> {
+    return (await LocalToken.Balances(walletSettings.tokenAPI)) ?? [];
+  },
+
+  async getTokenInfo(ticker: string): Promise<TokenInfo> {
+    return LocalToken.Info(ticker, walletSettings.tokenAPI);
+  },
+
+  // Token transfer: value is display units of the token; markerS is the
+  // SUGAR amount riding along with the token output (tokens follow the
+  // marker — it must reach the recipient); feeS is the total miner fee.
+  // 代币转账:value 为代币显示单位;markerS 为随代币输出携带的 SUGAR 金额
+  // (代币跟随 marker——必须到达收款人);feeS 为总矿工费。
+  async tokenTransfer(
+    ticker: string,
+    to: string,
+    value: number,
+    markerS: number,
+    feeS: number,
+  ): Promise<{
+    txid: string;
+    rawHex: string;
+    broadcastErr: string;
+    fee: number;
+    inputCount: number;
+  }> {
+    const info = await this.getTokenInfo(ticker).catch(() => ({ decimals: 0 } as TokenInfo));
+    const sat = (v: number) => Math.round(v * 1e8);
+    const base = Math.round(value * Math.pow(10, info.decimals ?? 0));
+    const ext = chainSource.mode === "external" ? chainSource.api : "";
+    return LocalToken.Transfer(ticker, to, base, sat(markerS), sat(feeS), 0, walletSettings.tokenAPI, ext);
+  },
+
+  // Create a new token. / 创建新代币。
+  async tokenCreate(
+    ticker: string,
+    value: number,
+    decimals: number,
+    reissuable: boolean,
+    feeS: number,
+  ): Promise<{ txid: string; rawHex: string; broadcastErr: string; fee: number; inputCount: number }> {
+    const base = Math.round(value * Math.pow(10, decimals));
+    const sat = (v: number) => Math.round(v * 1e8);
+    const ext = chainSource.mode === "external" ? chainSource.api : "";
+    return LocalToken.Create(ticker, base, decimals, reissuable, sat(feeS), walletSettings.tokenAPI, ext);
+  },
+
+  // Issue (mint) additional units. / 增发代币。
+  async tokenIssue(
+    ticker: string,
+    value: number,
+    feeS: number,
+  ): Promise<{ txid: string; rawHex: string; broadcastErr: string; fee: number; inputCount: number }> {
+    const info = await this.getTokenInfo(ticker);
+    const base = Math.round(value * Math.pow(10, info.decimals ?? 0));
+    const sat = (v: number) => Math.round(v * 1e8);
+    const ext = chainSource.mode === "external" ? chainSource.api : "";
+    return LocalToken.Issue(ticker, base, sat(feeS), walletSettings.tokenAPI, ext);
+  },
+
+  // Burn units. / 销毁代币。
+  async tokenBurn(
+    ticker: string,
+    value: number,
+    feeS: number,
+  ): Promise<{ txid: string; rawHex: string; broadcastErr: string; fee: number; inputCount: number }> {
+    const info = await this.getTokenInfo(ticker);
+    const base = Math.round(value * Math.pow(10, info.decimals ?? 0));
+    const sat = (v: number) => Math.round(v * 1e8);
+    const ext = chainSource.mode === "external" ? chainSource.api : "";
+    return LocalToken.Burn(ticker, base, sat(feeS), walletSettings.tokenAPI, ext);
+  },
+
   // listtransactions → recent wallet history mapped to the frontend Tx shape.
   // Degrades to [] when the sugar index is disabled so the page stays usable.
   // `n` is the row count requested (wallet settings → history rows).
@@ -765,6 +887,126 @@ export const Services = {
   > {
     const ext = chainSource.mode === "external" ? chainSource.api : "";
     return (await LocalSend.UTXOs(ext)) ?? [];
+  },
+
+  // ── Explorer (Step 10): local node RPC data, three-level drill-down ──
+  // Requires txindex=1 for tx lookups (getrawtransaction verbose) — the
+  // pages degrade with an error card when the index is off, matching the
+  // wallet history behavior.
+  // 浏览器(第 10 步):本节点 RPC 数据,三级下钻。交易查询(带详细信息的
+  // getrawtransaction)需要 txindex=1——索引未启用时页面以错误卡降级,
+  // 与钱包历史行为一致。
+  async getExplorerChain(): Promise<ExplorerChain> {
+    return rpc<ExplorerChain>("getblockchaininfo");
+  },
+
+  // Height → hash for the explorer search box. / 高度 → 哈希,浏览器搜索用。
+  async getExplorerBlockHash(height: number): Promise<string> {
+    return rpc<string>("getblockhash", height);
+  },
+
+  // Recent blocks newest-first: getblockhash(h) + getblock(hash, 1) per
+  // height (verbosity 1 keeps the list light — tx ids only).
+  // 最新在前的区块列表:逐高度 getblockhash(h) + getblock(hash, 1)
+  // (verbosity 1 保证列表轻量——只含交易 id)。
+  async getExplorerBlocks(count = 12): Promise<ExplorerBlock[]> {
+    const info = await rpc<{ blocks: number }>("getblockchaininfo");
+    const out: ExplorerBlock[] = [];
+    for (let h = info.blocks; h > Math.max(-1, info.blocks - count); h--) {
+      const hash = await rpc<string>("getblockhash", h);
+      const b = await rpc<{
+        hash: string;
+        height: number;
+        confirmations: number;
+        time: number;
+        size: number;
+        nonce: number;
+        bits: string;
+        difficulty: number;
+        tx: string[];
+      }>("getblock", hash, 1);
+      out.push({
+        hash: b.hash,
+        height: b.height,
+        confirmations: b.confirmations,
+        time: b.time,
+        size: b.size,
+        txCount: (b.tx ?? []).length,
+        nonce: b.nonce,
+        bits: b.bits,
+        difficulty: b.difficulty,
+      });
+    }
+    return out;
+  },
+
+  // Block detail: verbosity 2 carries full transactions (ids + summaries).
+  // 区块详情:verbosity 2 携带完整交易(id + 摘要)。
+  async getExplorerBlock(hash: string): Promise<ExplorerBlock & { tx: string[] }> {
+    const b = await rpc<{
+      hash: string;
+      height: number;
+      confirmations: number;
+      time: number;
+      size: number;
+      nonce: number;
+      bits: string;
+      difficulty: number;
+      tx: string[] | Array<{ txid: string }>;
+    }>("getblock", hash, 2);
+    // btcd verbosity 2 answers tx as verbose objects; verbosity 1 as ids.
+    // Normalize both into a plain id list.
+    // btcd verbosity 2 的 tx 是详述对象;verbosity 1 是 id。
+    // 两种形态都归一为纯 id 列表。
+    const tx = (b.tx ?? []).map((t) => (typeof t === "string" ? t : t.txid));
+    return {
+      hash: b.hash,
+      height: b.height,
+      confirmations: b.confirmations,
+      time: b.time,
+      size: b.size,
+      txCount: tx.length,
+      nonce: b.nonce,
+      bits: b.bits,
+      difficulty: b.difficulty,
+      tx,
+    };
+  },
+
+  // Transaction detail via getrawtransaction verbose (needs txindex=1).
+  // 交易详情:带详细信息的 getrawtransaction(需 txindex=1)。
+  async getExplorerTx(txid: string): Promise<ExplorerTx> {
+    const tx = await rpc<{
+      txid: string;
+      blockhash?: string;
+      blocktime?: number;
+      confirmations?: number;
+      time?: number;
+      size: number;
+      vin: Array<{ txid?: string; vout?: number; addr?: string; address?: string; coinbase?: string }>;
+      vout: Array<{ n: number; value: number; scriptPubKey: { addresses?: string[]; address?: string } }>;
+    }>("getrawtransaction", txid, 1);
+    return {
+      txid: tx.txid,
+      blockhash: tx.blockhash,
+      blocktime: tx.blocktime,
+      confirmations: tx.confirmations,
+      time: tx.time,
+      size: tx.size,
+      vinCount: (tx.vin ?? []).length,
+      voutCount: (tx.vout ?? []).length,
+      totalOut: (tx.vout ?? []).reduce((s, o) => s + o.value, 0),
+      outputs: (tx.vout ?? []).map((o) => ({
+        n: o.n,
+        value: o.value,
+        address: o.scriptPubKey?.addresses?.[0] ?? o.scriptPubKey?.address ?? null,
+      })),
+      inputs: (tx.vin ?? []).map((v) => ({
+        txid: v.txid ?? "",
+        vout: v.vout ?? 0,
+        address: v.addr ?? v.address ?? null,
+      })),
+    };
   },
 
   // ── Config ────────────────────────────────────────────────────

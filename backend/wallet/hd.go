@@ -48,6 +48,25 @@ type Wallet struct {
 	seed      []byte                  // BIP39 seed, cleared on lock / BIP39 种子（锁定时清空）
 	nextIndex uint32                  // next external address index / 下一个外部地址索引
 	legacy    bool                    // legacy hybrid mode: index 0 is the seed used directly as a private key / 传统混合模式：index 0 直接用种子作为私钥
+	wif       bool                    // WIF import mode: legacy hybrid wallet created from an imported WIF key / WIF 导入模式：由导入 WIF 私钥创建的传统混合钱包
+}
+
+// sidecarSuffix returns the meta sidecar suffix of the wallet kind: "" for
+// BIP39, ".legacy" for email/password login, ".wif" for WIF import. Keeping
+// the three kinds in separate sidecars guarantees each wallet hands out its
+// own index 0 first and never skips addresses because of another kind.
+// sidecarSuffix 返回钱包类别的旁车文件后缀：BIP39 为 ""、邮箱密码登录为
+// ".legacy"、WIF 导入为 ".wif"。三种类别各自独立旁车，保证每类钱包都从
+// 自己的 index 0 起分配，绝不因其他类别而跳号。
+func (w *Wallet) sidecarSuffix() string {
+	switch {
+	case w.wif:
+		return ".wif"
+	case w.legacy:
+		return ".legacy"
+	default:
+		return ""
+	}
 }
 
 // NewFromSeed creates a Wallet from a BIP39-derived seed using the default

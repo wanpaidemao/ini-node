@@ -137,6 +137,42 @@ func (s *WalletService) Login(email, password string) (string, error) {
 	return w.Address(0)
 }
 
+// LoginWIF imports a WIF-encoded private key and derives a single-key wallet
+// purely in memory (hybrid mode: index 0 is the imported key's web-wallet
+// address, index 1+ are BIP44 children — funds restore exactly and change
+// still works). Never touches wallet.db; the index sidecar is wallet.db.wif.meta.
+// Like Login, an already-unlocked session is swapped (deterministic import —
+// no wrong-password dead end).
+// LoginWIF 导入 WIF 私钥并纯内存派生单钥钱包（混合模式：index 0 即导入
+// 私钥的 web-wallet 地址，index 1+ 为 BIP44 子地址——资产完整恢复且找零
+// 仍可用）。不碰 wallet.db；索引旁车为 wallet.db.wif.meta。与 Login 一样，
+// 已解锁会话直接替换（确定性导入——不存在密码错误的死胡同）。
+func (s *WalletService) LoginWIF(wifStr string) (string, error) {
+	if s.mgr.Wallet() != nil {
+		s.mgr.Lock()
+	}
+	w, err := s.mgr.LoginWIF(strings.TrimSpace(wifStr))
+	if err != nil {
+		return "", err
+	}
+	return w.Address(0)
+}
+
+// ExportWIF returns the WIF-encoded private key at the given derivation
+// index (compressed). The wallet must be unlocked. Exposing the key is
+// intentional — the Keys tab offers per-address WIF export for backups and
+// migration to other wallets (web-wallet parity).
+// ExportWIF 返回指定派生索引的 WIF 私钥（压缩格式）。钱包须处于解锁状态。
+// 暴露私钥是有意为之——Keys 标签页按地址导出 WIF，用于备份与迁移到其他
+// 钱包（对齐 web-wallet）。
+func (s *WalletService) ExportWIF(index uint32) (string, error) {
+	w := s.mgr.Wallet()
+	if w == nil {
+		return "", errors.New("wallet is locked / 钱包已锁定")
+	}
+	return w.ExportWIF(index)
+}
+
 // Lock drops the in-memory key material. Idempotent.
 // Lock 丢弃内存密钥材料。幂等。
 func (s *WalletService) Lock() {
