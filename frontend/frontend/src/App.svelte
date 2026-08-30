@@ -36,6 +36,10 @@
         { route: "wallet", label: "nav.wallet", kind: "rpc" },
         { route: "create", label: "create.title", kind: "rpc" },
         { route: "send", label: "nav.send", kind: "rpc" },
+        // wallet settings as a sub-page entry below Send, same access as the
+        // gear button on the wallet page header
+        // 钱包设置二级入口,位于发送之下;与钱包页头部齿轮按钮同目标
+        { route: "wallet-settings", label: "wal.set.title", kind: "rpc" },
       ],
     },
     {
