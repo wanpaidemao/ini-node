@@ -45,11 +45,20 @@ async function rpc<T>(method: string, ...params: unknown[]): Promise<T> {
       body: JSON.stringify({ jsonrpc: "1.0", id, method, params }),
       signal: ctl.signal,
     });
-    if (!res.ok) {
-      throw new Error(`RPC ${method}: HTTP ${res.status}`);
-    }
-    const env = (await res.json()) as RpcEnvelope;
-    if (env.error) throw new Error(`RPC ${method}: ${env.error.message}`);
+    // Parse the body first even on non-2xx: the Wails RPC proxy answers
+    // transport failures (node down, auth mismatch) with HTTP 502 + a
+    // JSON-RPC envelope whose error.message carries the real cause
+    // ("dial tcp ...: connectex: ..."). Surfacing it beats a bare
+    // "HTTP 502". Bodies that are not JSON (vite dev proxy text errors)
+    // fall back to the status code.
+    // 先解析响应体,即使非 2xx:Wails RPC 代理对传输层失败(节点未启动、
+    // 认证不符)返回 HTTP 502 + JSON-RPC 信封,其 error.message 携带真实
+    // 原因("dial tcp ...: connectex: ...")。展示它比光秃秃的 "HTTP 502"
+    // 有用。非 JSON 响应体(vite dev 代理的纯文本错误)回退到状态码。
+    const env = (await res.json().catch(() => null)) as RpcEnvelope | null;
+    if (env?.error) throw new Error(`RPC ${method}: ${env.error.message}`);
+    if (!res.ok) throw new Error(`RPC ${method}: HTTP ${res.status}`);
+    if (!env) throw new Error(`RPC ${method}: HTTP ${res.status} (no JSON body)`);
     return env.result as T;
   } finally {
     clearTimeout(timer);
