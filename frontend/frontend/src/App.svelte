@@ -1,4 +1,4 @@
-﻿<script lang="ts">
+<script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { Window } from "@wailsio/runtime";
   import { app, navigate, setConnected } from "./lib/store.svelte";
@@ -8,6 +8,7 @@
   import Dashboard from "./pages/Dashboard.svelte";
   import Internals from "./pages/Internals.svelte";
   import Wallet from "./pages/Wallet.svelte";
+  import WalletSettings from "./pages/WalletSettings.svelte";
   import Send from "./pages/Send.svelte";
   import Create from "./pages/Create.svelte";
   import Settings from "./pages/Settings.svelte";
@@ -51,6 +52,7 @@
     internals: "nav.internals",
     control: "nav.control",
     wallet: "nav.wallet",
+    "wallet-settings": "wal.set.title",
     send: "nav.send",
     create: "create.title",
     settings: "nav.settings",
@@ -63,8 +65,14 @@
     items: s.items.slice(1),
   }));
 
+  // Secondary pages (no nav entry of their own) map back to their parent so
+  // the top menu keeps its active highlight while the sub-page is open.
+  // 二级页面(无独立导航项)映射回父页面,子页打开时顶部菜单保持高亮。
+  const parentRoute: Partial<Record<Route, Route>> = { "wallet-settings": "wallet" };
+
   function isOnMenu(m: { main: { route: Route }; items: { route: Route }[] }): boolean {
-    return app.route === m.main.route || m.items.some((i) => i.route === app.route);
+    const here = parentRoute[app.route] ?? app.route;
+    return here === m.main.route || m.items.some((i) => i.route === app.route);
   }
 
   let openMenu: Route | null = $state(null);
@@ -292,6 +300,8 @@
         <Internals />
       {:else if app.route === "wallet"}
         <Wallet />
+      {:else if app.route === "wallet-settings"}
+        <WalletSettings />
       {:else if app.route === "send"}
         <Send />
       {:else if app.route === "create"}

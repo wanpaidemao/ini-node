@@ -625,9 +625,10 @@ export const Services = {
 
   // listtransactions → recent wallet history mapped to the frontend Tx shape.
   // Degrades to [] when the sugar index is disabled so the page stays usable.
+  // `n` is the row count requested (wallet settings → history rows).
   // listtransactions → 映射为前端 Tx 形态的近期历史;sugar 索引未启用时降级为
-  // 空数组,页面保持可用。
-  async getHistory(): Promise<Tx[]> {
+  // 空数组,页面保持可用。n 为请求条数(钱包设置 → 历史记录条数)。
+  async getHistory(n = 25): Promise<Tx[]> {
     try {
       const rs = await rpc<
         Array<{
@@ -638,7 +639,7 @@ export const Services = {
           blocktime: number;
           confirmations: number;
         }>
-      >("listtransactions", "*", 25);
+      >("listtransactions", "*", n);
       return rs.map((r) => ({
         time: r.blocktime,
         dir: r.category === "send" ? "out" : "in",

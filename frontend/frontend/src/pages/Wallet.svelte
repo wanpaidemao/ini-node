@@ -3,6 +3,7 @@
   import { fmtDateTime, t } from "../lib/i18n";
   import { Services } from "../lib/services";
   import { navigate } from "../lib/store.svelte";
+  import { walletAutoLock, walletLocked, walletSettings, walletUnlocked } from "../lib/wallet-settings.svelte";
   import type { Tx, WalletState } from "../lib/types";
 
   // Page state: w is the real getwalletinfo snapshot; locked mirrors
@@ -28,10 +29,23 @@
       loadErr = String(e);
       w = null;
     }
-    if (w && !w.locked) txs = await Services.getHistory();
+    if (w && !w.locked) {
+      // Found unlocked (page load / email login elsewhere): start the
+      // auto-lock countdown and fetch history with the configured row count.
+      // 发现已解锁(页面加载/他处邮箱登录):启动自动锁定倒计时,
+      // 并按设置的条数拉取历史。
+      walletUnlocked();
+      txs = await Services.getHistory(walletSettings.historyCount);
+    }
   }
 
   onMount(refresh);
+
+  // React to the auto-lock firing while this page is open: refresh into the
+  // locked state. / 页面停留期间自动锁定触发时:刷新为锁定态。
+  $effect(() => {
+    if (walletAutoLock.lockedAt > 0) refresh();
+  });
 
   // unlock: real walletpassphrase RPC; on success reload balance + history.
   // unlock: 真实 walletpassphrase RPC;成功后重载余额与历史。
@@ -45,6 +59,7 @@
         return;
       }
       pass = "";
+      walletUnlocked();
       await refresh();
     } catch {
       unlockErr = t("wal.unlock_failed");
@@ -56,6 +71,7 @@
   // lock: walletlock RPC; drops the in-memory keys.
   // lock: walletlock RPC;丢弃内存密钥。
   async function lock() {
+    walletLocked();
     await Services.lockWallet().catch(() => {});
     await refresh();
   }
@@ -81,11 +97,26 @@
       <p class="eyebrow">wallet · {w?.defaultWalletName ?? "main"}</p>
       <h1 class="h-page">{t("wal.title")}</h1>
     </div>
-    {#if w && !w.locked}
-      <button class="chip btn-chip" onclick={lock} title={t("wal.lock")}>
-        <span class="dot ok" aria-hidden="true"></span> {t("wal.lock")}
+    <div class="head-actions">
+      <!-- secondary page entry: wallet settings / 二级页面入口:钱包设置 -->
+      <button
+        class="chip btn-chip"
+        onclick={() => navigate("wallet-settings")}
+        title={t("wal.set.title")}
+        aria-label={t("wal.set.title")}
+      >
+        <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="3" />
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+        </svg>
+        {t("wal.set.entry")}
       </button>
-    {/if}
+      {#if w && !w.locked}
+        <button class="chip btn-chip" onclick={lock} title={t("wal.lock")}>
+          <span class="dot ok" aria-hidden="true"></span> {t("wal.lock")}
+        </button>
+      {/if}
+    </div>
   </div>
 
   {#if loadErr}
@@ -122,13 +153,23 @@
       <!-- ── 余额卡片 ── -->
       <div class="card balance">
         <p class="eyebrow">{t("wal.total")}</p>
-        <p class="bal mono" translate="no">{(w.total).toFixed(8)} <span class="unit">S</span></p>
+        <!-- privacy mode: mask all balance figures (wallet settings) -->
+        <!-- 隐私模式:遮蔽全部余额数字(钱包设置) -->
+        {#if walletSettings.hideBalance}
+          <p class="bal mono" translate="no">{t("wal.hidden_balance")}</p>
+        {:else}
+          <p class="bal mono" translate="no">{(w.total).toFixed(8)} <span class="unit">S</span></p>
+        {/if}
         <div class="bal-sub">
-          <span class="part"><span class="dot ok" aria-hidden="true"></span>{t("wal.confirmed", { n: w.confirmed.toFixed(4) })}</span>
-          {#if w.pending > 0}
+          {#if walletSettings.hideBalance}
+            <span class="part"><span class="dot ok" aria-hidden="true"></span>{t("wal.confirmed", { n: t("wal.hidden_balance") })}</span>
+          {:else}
+            <span class="part"><span class="dot ok" aria-hidden="true"></span>{t("wal.confirmed", { n: w.confirmed.toFixed(4) })}</span>
+          {/if}
+          {#if !walletSettings.hideBalance && w.pending > 0}
             <span class="part"><span class="dot wait" aria-hidden="true"></span>{t("wal.pending", { n: w.pending.toFixed(4) })}</span>
           {/if}
-          {#if w.immature > 0}
+          {#if !walletSettings.hideBalance && w.immature > 0}
             <span class="part"><span class="dot lock" aria-hidden="true"></span>{t("wal.immature", { n: w.immature.toFixed(4) })}</span>
           {/if}
         </div>
@@ -258,6 +299,12 @@
     font-family: var(--font-display);
     font-size: 24px;
     margin: 2px 0 0;
+  }
+  .head-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
   }
   .btn-chip {
     cursor: pointer;

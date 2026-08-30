@@ -4,11 +4,26 @@ export type Route =
   | "dashboard"
   | "internals"
   | "wallet"
+  | "wallet-settings"
   | "send"
   | "create"
   | "settings"
   | "console"
   | "control";
+
+// Wallet settings — local UI preferences for the wallet pages, persisted
+// client-side (localStorage), not part of the node RPC config.
+// 钱包设置 — 钱包页面的本地界面偏好,客户端持久化(localStorage),
+// 不属于节点 RPC 配置。
+export interface WalletSettings {
+  /** auto-lock the wallet N minutes after unlock (0 = never) */
+  /** 解锁 N 分钟后自动锁定钱包(0 = 永不) */
+  autoLockMinutes: number;
+  /** privacy: mask balances on the wallet page / 隐私:钱包页余额遮蔽显示 */
+  hideBalance: boolean;
+  /** how many recent transactions listtransactions fetches / 拉取的近期交易条数 */
+  historyCount: number;
+}
 
 export type ConnState = "online" | "syncing" | "offline";
 

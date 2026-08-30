@@ -146,7 +146,7 @@ umami（C++）`sendtoaddress` 流程（`src/wallet/spend.cpp`）：**选币 → 
 | **Step 4** ✅ | 邮箱密码登录（Legacy KDF）：移植 kdf.go + NewFromLegacy + walletlogin RPC（纯内存解锁，不落盘）+ 单测 | ✅ `68623664`：混合模式交叉验证通过（index 0 = web-wallet 地址，外部测试向量）；8 单测全绿 |
 | **Step 5** | 发送 RPC：sendtoaddress（选币+建交易+签名+广播）+ signrawtransaction | 真实转账上链（对齐 umami 流程） |
 | **Step 6** | 代币接入：tokenapi 包（新增）+ token 代理 RPC（新增） | tokenbalance/info/params/build 调通 tokenstest |
-| **Step 7** 🔶 | **UI 先行**：设计登录/创建/Wallet/Send/Tokens 界面 → services.ts 去 mock 接线 → 同步 backend/doc/md RPC 文档 | 🔶（2026-08-30）UI 先行部分完成：登录/创建/Wallet/Send 三页改造 + services.ts 钱包查询去 mock + i18n×9；余额/历史已通真实 RPC；发送待 Step 5、代币待 Step 6 |
+| **Step 7** 🔶 | **UI 先行**：设计登录/创建/Wallet/Send/Tokens 界面 → services.ts 去 mock 接线 → 同步 backend/doc/md RPC 文档 | 🔶（2026-08-30）UI 先行部分完成：登录/创建/Wallet/Send 三页改造 + services.ts 钱包查询去 mock + i18n×9；余额/历史已通真实 RPC；🔶（2026-08-30）新增钱包设置二级页面（`wallet-settings` 路由：自动锁定/隐藏余额/历史条数，localStorage 持久化 + 自动锁定接 walletlock RPC）；发送待 Step 5、代币待 Step 6 |
 
 > 每步遵循 `dev_doc/开发流程与提交规范.md`：读现状→方案→分步→双语注释→gofmt/vet/test→同步文档→提交。
 
