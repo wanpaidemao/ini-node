@@ -25,6 +25,12 @@ import type {
 // 在前端进程内运行,无需节点。链上数据仍走下方 RPC。
 import * as LocalWallet from "../../bindings/changeme/walletservice.js";
 import * as LocalGreet from "../../bindings/changeme/greetservice.js";
+// Step 8 send pipeline bindings: UTXO query → coin selection → build+sign →
+// broadcast, all in-process (two-level UTXO/broadcast chain: node first,
+// external REST fallback when the wallet settings enable it).
+// 第 8 步发送链路 bindings:UTXO 查询 → 选币 → 构造+签名 → 广播,全在进程内
+// (UTXO/广播两级链:先节点,钱包设置启用外部源时降级外部 REST)。
+import * as LocalSend from "../../bindings/changeme/sendservice.js";
 import { chainSource } from "./wallet-registry.svelte";
 
 // ── low-level JSON-RPC client ───────────────────────────────────
@@ -698,6 +704,67 @@ export const Services = {
     } catch {
       return []; // sugarindex off / wallet locked → empty history / 索引未启用或锁定 → 空历史
     }
+  },
+
+  // ── Send pipeline (Step 8, in-process Wails bindings) ─────────
+  // Amounts are SUGAR (display unit) here; converted to satoshis for the
+  // Go pipeline. Broadcast failures come back as SendResult.broadcastErr
+  // with rawHex kept — the UI offers a retry, not an error dead-end.
+  // 发送链路(第 8 步,进程内 Wails bindings)。此处金额为 SUGAR(显示单位),
+  // 传给 Go 流水线前换算为聪。广播失败以 SendResult.broadcastErr 返回且保留
+  // rawHex——UI 提供重试,而非错误死胡同。
+  async sendOutputs(
+    outputs: { address: string; amount: number }[],
+    feeSugar: number,
+  ): Promise<{
+    txid: string;
+    rawHex: string;
+    totalIn: number;
+    amount: number;
+    fee: number;
+    change: number;
+    inputCount: number;
+    broadcastErr: string;
+  }> {
+    // externalAPI is forwarded only when the wallet settings enable the
+    // external chain-data source; otherwise the pipeline is node-only.
+    // 仅当钱包设置启用外部链上数据源时转发 externalAPI;否则流水线仅用节点。
+    const ext = chainSource.mode === "external" ? chainSource.api : "";
+    const sat = (v: number) => Math.round(v * 1e8);
+    return LocalSend.Send(
+      outputs.map((o) => ({ address: o.address, amount: sat(o.amount) })),
+      sat(feeSugar),
+      ext,
+    );
+  },
+
+  // Retry broadcasting a previously signed raw tx (result card retry
+  // button). Node first, external fallback. / 重试广播先前已签名裸交易
+  // (结果卡重试按钮)。先节点,后外部降级。
+  async broadcastRaw(rawHex: string): Promise<string> {
+    const ext = chainSource.mode === "external" ? chainSource.api : "";
+    return LocalSend.BroadcastRaw(rawHex, ext);
+  },
+
+  // Fee suggestion from the external REST /fee endpoint (SUGAR float).
+  // Errors when no external source is configured — the UI keeps the
+  // manual fee input. / 外部 REST /fee 端点的手续费建议(SUGAR 浮点)。
+  // 未配置外部源时报错——UI 保留手动手续费输入。
+  async estimateFee(): Promise<number> {
+    if (chainSource.mode !== "external") {
+      throw new Error("no external API configured / 未配置外部 API");
+    }
+    return LocalSend.EstimateFee(chainSource.api);
+  },
+
+  // Coin-control view: the wallet's spendable outputs (node
+  // getaddressutxos, external REST fallback). Read-only.
+  // 币控视图:钱包可花费输出(节点 getaddressutxos,外部 REST 降级)。只读。
+  async getUTXOs(): Promise<
+    { txid: string; index: number; value: number; script: string; address: string }[]
+  > {
+    const ext = chainSource.mode === "external" ? chainSource.api : "";
+    return (await LocalSend.UTXOs(ext)) ?? [];
   },
 
   // ── Config ────────────────────────────────────────────────────

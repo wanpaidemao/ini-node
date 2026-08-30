@@ -34,6 +34,11 @@ func main() {
 	// 'Assets' configures the asset server with the 'FS' variable pointing to the frontend files.
 	// 'Bind' is a list of Go struct instances. The frontend has access to the methods of these instances.
 	// 'Mac' options tailor the application when running an macOS.
+	// One shared wallet session for both services: the send pipeline must
+	// see the SAME unlock state as the lifecycle service.
+	// 两个服务共享同一钱包会话：发送链路必须看到与生命周期服务相同的解锁状态。
+	walletSvc := newWalletService()
+
 	app := application.New(application.Options{
 		Name:        "ini-node",
 		Description: "A demo of using raw HTML & CSS",
@@ -43,7 +48,12 @@ func main() {
 			// work in-process, independent of the node RPC.
 			// 本地钱包生命周期：创建/解锁/登录/锁定/新地址在进程内完成，
 			// 不依赖节点 RPC。
-			application.NewService(newWalletService()),
+			application.NewService(walletSvc),
+			// Send pipeline (Step 8): UTXO query → coin selection →
+			// build+sign → broadcast, sharing the wallet session above.
+			// 发送链路（第 8 步）：UTXO 查询 → 选币 → 构造+签名 → 广播，
+			// 与上方钱包共享同一会话。
+			application.NewService(newSendService(walletSvc)),
 		},
 		Assets: application.AssetOptions{
 			Handler:    application.AssetFileServerFS(assets),

@@ -173,7 +173,7 @@ umami（C++）`sendtoaddress` 流程（`src/wallet/spend.cpp`）：**选币 → 
 | **Step 6** | 代币接入：tokenapi 包（新增）+ token 代理 RPC（新增） | tokenbalance/info/params/build 调通 tokenstest |
 | **Step 6b** | **代币四操作对齐**（§ 功能差距清单 P1）：移植 web-wallet `internal/api/token.go` + `TokenTransfer/Create/Issue/Burn` bindings → Tokens tab 真实 UI | 钱包页 Tokens tab 可查余额/转账/创建/增发/销毁（tokenstest 联调） |
 | **Step 7** 🔶 | **UI 先行**：设计登录/创建/Wallet/Send/Tokens 界面 → services.ts 去 mock 接线 → 同步 backend/doc/md RPC 文档 | 🔶（2026-08-30）UI 先行部分完成：登录/创建/Wallet/Send 三页改造 + services.ts 钱包查询去 mock + i18n×9；余额/历史已通真实 RPC；🔶（2026-08-30）新增钱包设置二级页面（`wallet-settings` 路由：自动锁定/隐藏余额/历史条数，localStorage 持久化 + 自动锁定接 walletlock RPC）；发送待 Step 8、代币待 Step 6 |
-| **Step 8** | **发送链路（P0）**：§5.11——gosend.go 移植 BuildAndSign + Send/BroadcastRaw/EstimateFee/UTXOs bindings → Send 页多输出+确认 modal+近期收款人 | regtest/主网真实转账上链；广播失败可 rawHex 重试 |
+| **Step 8** ✅ | **发送链路（P0）**：§5.11——gosend.go 移植 BuildAndSign + Send/BroadcastRaw/EstimateFee/UTXOs bindings → Send 页多输出+确认 modal+近期收款人 | 🔶（2026-08-31）代码完成待实机验证：`frontend/gosend.go`（Send 全流水线：UTXO 两级降级→大额优先选币→构造+签名（P2WPKH/P2PKH/P2SH-P2WPKH）→广播两级降级，广播失败保留 rawHex 不报错死胡同）；`Send/BroadcastRaw/EstimateFee/UTXOs` 4 bindings（与 WalletService 共享会话）；Send.svelte 重写（多输出行≤10/近期收款人 datalist/手续费三档+外部建议/确认弹窗/结果卡 txid+rawHex+重试）；i18n×9；`go build`/`go vet`/`vite build` 全过。**替代 Step 5**（发送改在前端进程内实现，节点侧 sendtoaddress 不再需要）。待 regtest/主网真实转账上链验证 |
 | **Step 9** | **地址三型切换（P1）**：§5.12——移植 internal/address 三型派生 + AddressFor binding + 设置项即时生效 | 同一密钥三型地址可查余额/历史（sugarindex 验证） |
 | **Step 10** | **Explorer（P2）**：§5.13——三级路由 + 本节点 RPC 数据 + 历史 txid 内链 | 链统计/区块列表/区块详情/交易详情四视图可用 |
 | **Step 11** | P3 收尾：WIF 导入（OpenWalletKey 对应 binding）+ Broadcast 并入控制台 | 旧钱包可导入 |
