@@ -10,7 +10,8 @@ export type Route =
   | "settings"
   | "console"
   | "control"
-  | "explorer";
+  | "explorer"
+  | "explorer-settings";
 
 // Address type for the Step 9 three-type derivation (same key material,
 // three Sugarchain encodings). / 第 9 步三型派生的地址类型(同一密钥

@@ -219,7 +219,7 @@
     unlockErr = null;
     busy = true;
     try {
-      const ok = await Services.unlock(pass);
+      const ok = await Services.unlock(w?.defaultWalletName ?? "default", pass);
       if (!ok) {
         unlockErr = t("wal.unlock_failed");
         return;

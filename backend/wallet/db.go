@@ -54,9 +54,10 @@ type storedWallet struct {
 	Cipher    []byte `json:"cipher"`    // AES-GCM(seed), incl. auth tag / 密文（含认证标签）
 }
 
-// DefaultWalletName is the wallet file name under the data directory.
-// DefaultWalletName 为数据目录下的钱包文件名。
-const DefaultWalletName = "wallet.db"
+// DefaultWalletDir is the wallet directory name under the data directory,
+// holding one <name>.db file per BIP39 wallet.
+// DefaultWalletDir 为数据目录下的钱包目录名，每个 BIP39 钱包一个 <name>.db 文件。
+const DefaultWalletDir = "wallet"
 
 // SaveWallet encrypts the wallet seed with a passphrase-derived key and writes
 // it to path (e.g. <datadir>/wallet.db). The file is written atomically via a

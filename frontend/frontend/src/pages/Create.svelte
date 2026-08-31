@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { t } from "../lib/i18n";
   import { navigate } from "../lib/store.svelte";
   import { Services } from "../lib/services";
@@ -11,11 +12,15 @@
   // 打开钱包三个入口:邮箱密码登录(纯内存)、BIP39 wallet.db 口令解锁、
   // 或 WIF 私钥导入(第 11 步,纯内存混合——index 0 即导入私钥的
   // web 钱包地址)。
-  let openTab = $state<"email" | "pass" | "wif">("email");
+  let openTab = $state<"email" | "pass" | "wif" | "mnemonic">("email");
   let email = $state("");
   let emailPass = $state("");
   let pass = $state("");
   let wifKey = $state("");
+  let walletName = $state("");
+  let restoreMnemonic = $state("");
+  let restorePass = $state("");
+  let walletNames = $state<string[]>([]);
   let error = $state<string | null>(null);
   let busy = $state(false);
 
@@ -39,12 +44,14 @@
       openTab = "wif";
     } else {
       openTab = "pass";
+      walletName = p.walletName ?? p.name ?? "default";
     }
   }
 
   // Create panel (collapsed by default, like before).
   // 创建面板(默认折叠,与之前一致)。
   let createOpen = $state(false);
+  let createName = $state("");
   let createPass = $state("");
   let createPass2 = $state("");
   let mnemonic = $state<string[]>([]);
@@ -52,6 +59,16 @@
   let creating = $state(false);
   let newAddr = $state("");
   let mnemonicCopied = $state(false);
+
+  // Load the existing BIP39 wallet names for the open/restore picker hint.
+  // 加载已有 BIP39 钱包名,供打开/恢复时提示。
+  onMount(async () => {
+    try {
+      walletNames = await Services.listWallets();
+    } catch {
+      walletNames = [];
+    }
+  });
 
   // ── actions ────────────────────────────────────────────────────
   // openWallet: dispatch by tab — legacy KDF login (in-memory), BIP39
@@ -81,6 +98,11 @@
         error = t("login.bad_wif");
         return;
       }
+    } else if (openTab === "mnemonic") {
+      if (restoreMnemonic.trim().length < 11 || restorePass.length < 1) {
+        error = t("create.bad_passphrase");
+        return;
+      }
     } else if (pass.length < 1) {
       error = t("create.bad_passphrase");
       return;
@@ -99,8 +121,13 @@
         // verbatim. / WIF 导入:binding 校验私钥并在内存中派生混合
         // 钱包;错误(校验和错误等)原样上浮。
         await Services.loginWIF(wifKey.trim());
+      } else if (openTab === "mnemonic") {
+        // Restore from mnemonic: the binding validates the phrase, derives
+        // and persists the wallet under walletName, then unlocks it.
+        // 助记词恢复:binding 校验助记词,按 walletName 派生并持久化钱包并解锁。
+        await Services.restoreWallet(walletName, restoreMnemonic.trim(), restorePass);
       } else {
-        const ok = await Services.unlock(pass);
+        const ok = await Services.unlock(walletName, pass);
         if (!ok) {
           error = t("create.bad_passphrase");
           return;
@@ -115,9 +142,12 @@
       } else if (openTab === "wif") {
         registerWallet({ type: "web", name: "WIF import", address: st.address ?? undefined });
       } else {
-        registerWallet({ type: "hd", address: st.address ?? undefined });
+        const nm = walletName.trim() || "default";
+        registerWallet({ type: "hd", walletName: nm, name: nm, address: st.address ?? undefined });
       }
       wifKey = ""; // never keep the key in the field / 字段绝不保留私钥
+      restoreMnemonic = ""; // never keep the phrase in the field / 字段绝不保留助记词
+      restorePass = "";
       navigate("wallet");
     } catch (e) {
       // Surface the real cause: "wallet is already unlocked", binding
@@ -142,12 +172,13 @@
     }
     creating = true;
     try {
-      const r = await Services.createWallet(createPass);
+      const r = await Services.createWallet(createName, createPass);
       mnemonic = r.mnemonic.trim().split(/\s+/);
       newAddr = r.address;
       // New HD wallet goes straight into the saved list. / 新建 HD 钱包
       // 直接进入已保存列表。
-      registerWallet({ type: "hd", name: "HD wallet", address: r.address });
+      registerWallet({ type: "hd", walletName: r.name, name: r.name, address: r.address });
+      walletNames = await Services.listWallets().catch(() => walletNames);
     } catch (e) {
       error = String(e).replace(/^Error:\s*/, "");
     } finally {
@@ -181,6 +212,10 @@
     <div class="card auth-card">
       <h2 class="h-card">{t("create.new_wallet")}</h2>
       <form onsubmit={(e) => { e.preventDefault(); createWallet(); }}>
+        <div class="field">
+          <label class="field-label" for="cname">{t("create.wallet_name")}</label>
+          <input id="cname" type="text" bind:value={createName} placeholder="default" autocomplete="off" spellcheck="false" />
+        </div>
         <div class="field">
           <label class="field-label" for="cp1">{t("g.password")}</label>
           <input id="cp1" type="password" bind:value={createPass} autocomplete="new-password" />
@@ -261,6 +296,7 @@
       <div class="tabs" role="tablist">
         <button class="tab" class:active={openTab === "email"} role="tab" aria-selected={openTab === "email"} onclick={() => (openTab = "email")}>{t("create.tab_email")}</button>
         <button class="tab" class:active={openTab === "pass"} role="tab" aria-selected={openTab === "pass"} onclick={() => (openTab = "pass")}>{t("create.tab_passphrase")}</button>
+        <button class="tab" class:active={openTab === "mnemonic"} role="tab" aria-selected={openTab === "mnemonic"} onclick={() => (openTab = "mnemonic")}>{t("create.tab_mnemonic")}</button>
         <!-- Step 11: WIF private key import / 第 11 步:WIF 私钥导入 -->
         <button class="tab" class:active={openTab === "wif"} role="tab" aria-selected={openTab === "wif"} onclick={() => (openTab = "wif")}>{t("create.tab_wif")}</button>
       </div>
@@ -296,7 +332,24 @@
             />
           </div>
           <p class="hint">{t("create.wif_hint")}</p>
+        {:else if openTab === "mnemonic"}
+          <div class="field">
+            <label class="field-label" for="mname">{t("create.wallet_name")}</label>
+            <input id="mname" type="text" bind:value={walletName} placeholder="default" autocomplete="off" spellcheck="false" />
+          </div>
+          <div class="field">
+            <label class="field-label" for="mnemonic">{t("create.mnemonic_label")}</label>
+            <textarea id="mnemonic" class="mono-input" bind:value={restoreMnemonic} rows="3" placeholder="word1 word2 … word12" autocomplete="off" spellcheck="false" translate="no"></textarea>
+          </div>
+          <div class="field">
+            <label class="field-label" for="mrestorepass">{t("g.password")}</label>
+            <input id="mrestorepass" type="password" bind:value={restorePass} autocomplete="new-password" />
+          </div>
         {:else}
+          <div class="field">
+            <label class="field-label" for="wname">{t("create.wallet_name")}</label>
+            <input id="wname" type="text" bind:value={walletName} placeholder="default" autocomplete="off" spellcheck="false" />
+          </div>
           <div class="field">
             <label class="field-label" for="wpass">{t("g.password")}</label>
             <input id="wpass" type="password" bind:value={pass} autocomplete="off" />
@@ -310,7 +363,7 @@
 
         <button class="btn btn-primary wide" type="submit" disabled={busy}>
           {#if busy}<span class="spin" aria-hidden="true"></span>{/if}
-          {openTab === "email" ? t("login.btn") : openTab === "wif" ? t("create.wif_btn") : t("create.open")}
+          {openTab === "email" ? t("login.btn") : openTab === "wif" ? t("create.wif_btn") : openTab === "mnemonic" ? t("create.restore_btn") : t("create.open")}
         </button>
       </form>
     </div>

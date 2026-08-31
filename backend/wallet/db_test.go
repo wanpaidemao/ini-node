@@ -12,7 +12,7 @@ import (
 // TestSaveUnlockRoundTrip 验证 创建 → 保存 → 锁定 → 解锁 后地址与下一索引一致
 // （即"建 → 锁 → 解锁 → 地址一致"验收点）。
 func TestSaveUnlockRoundTrip(t *testing.T) {
-	path := filepath.Join(t.TempDir(), DefaultWalletName)
+	path := filepath.Join(t.TempDir(), "test.db")
 
 	seed := bytes.Repeat([]byte{0x77}, 32)
 	w, err := NewFromSeed(seed, testNet())
@@ -49,7 +49,7 @@ func TestSaveUnlockRoundTrip(t *testing.T) {
 // TestUnlockWrongPassphrase verifies a wrong passphrase is rejected.
 // TestUnlockWrongPassphrase 验证错误口令被拒绝。
 func TestUnlockWrongPassphrase(t *testing.T) {
-	path := filepath.Join(t.TempDir(), DefaultWalletName)
+	path := filepath.Join(t.TempDir(), "test.db")
 	w, err := NewFromSeed(bytes.Repeat([]byte{0x88}, 32), testNet())
 	if err != nil {
 		t.Fatal(err)
@@ -78,7 +78,7 @@ func TestLockDisablesDerivation(t *testing.T) {
 // TestSaveRequiresUnlocked verifies a locked wallet cannot be saved.
 // TestSaveRequiresUnlocked 验证锁定钱包不能保存。
 func TestSaveRequiresUnlocked(t *testing.T) {
-	path := filepath.Join(t.TempDir(), DefaultWalletName)
+	path := filepath.Join(t.TempDir(), "test.db")
 	w, err := NewFromSeed(bytes.Repeat([]byte{0xaa}, 32), testNet())
 	if err != nil {
 		t.Fatal(err)
@@ -92,7 +92,7 @@ func TestSaveRequiresUnlocked(t *testing.T) {
 // TestWalletFileCreated verifies the wallet file is written to disk.
 // TestWalletFileCreated 验证钱包文件已写入磁盘。
 func TestWalletFileCreated(t *testing.T) {
-	path := filepath.Join(t.TempDir(), DefaultWalletName)
+	path := filepath.Join(t.TempDir(), "test.db")
 	w, err := NewFromSeed(bytes.Repeat([]byte{0xbb}, 32), testNet())
 	if err != nil {
 		t.Fatal(err)

@@ -3,6 +3,7 @@
   import { fmtDateTime, t } from "../lib/i18n";
   import { Services } from "../lib/services";
   import { app } from "../lib/store.svelte";
+  import { explorerSettings } from "../lib/explorer-settings.svelte";
   import type { ExplorerBlock, ExplorerChain, ExplorerTx } from "../lib/types";
 
   // ── Explorer (Step 10): local node RPC, three-level drill-down ──
@@ -40,7 +41,7 @@
       // newest first — the list is capped to keep getblock loops light).
       // 链统计与近期区块列表并行加载(12 行,最新在前——限制行数以
       // 保持 getblock 循环轻量)。
-      const [c, bs] = await Promise.all([Services.getExplorerChain(), Services.getExplorerBlocks(12)]);
+      const [c, bs] = await Promise.all([Services.getExplorerChain(), Services.getExplorerBlocks(explorerSettings.recentBlocks)]);
       chain = c;
       blocks = bs;
     } catch (e) {

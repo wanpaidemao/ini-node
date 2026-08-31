@@ -49,7 +49,7 @@ export function setNavMode(mode: NavMode): void {
 // init route from location.hash (deep-linking, also enables headless screenshots)
 function initRoute(): void {
   const h = (location.hash || "").replace("#", "") as Route;
-  const valid: Route[] = ["dashboard", "internals", "explorer", "wallet", "wallet-settings", "send", "create", "settings", "console", "control"];
+  const valid: Route[] = ["dashboard", "internals", "explorer", "explorer-settings", "wallet", "wallet-settings", "send", "create", "settings", "console", "control"];
   if (valid.includes(h)) app.route = h;
 }
 if (typeof window !== "undefined") initRoute();

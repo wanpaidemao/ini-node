@@ -17,6 +17,9 @@
   // Step 10 Explorer: chain / block / tx three-level drill-down views.
   // 第 10 步浏览器:链/区块/交易三级下钻视图。
   import Explorer from "./pages/Explorer.svelte";
+  // Explorer settings (secondary page under the Explorer menu).
+  // 浏览器设置(浏览器菜单下的二级页面)。
+  import ExplorerSettings from "./pages/ExplorerSettings.svelte";
 
   // Page kinds: "rpc" pages go through the RPC proxy and can also be
   // served standalone as a plain frontend; "wails" pages need the desktop
@@ -30,8 +33,17 @@
       items: [
         { route: "dashboard", label: "nav.dashboard", kind: "rpc" },
         { route: "internals", label: "nav.internals", kind: "rpc" },
-        { route: "explorer", label: "nav.explorer", kind: "rpc" },
         { route: "control", label: "nav.control", kind: "wails" },
+      ],
+    },
+    {
+      // Explorer is its own top-level menu; its submenu holds the explorer
+      // settings (a separate secondary page, not the global Settings).
+      // 浏览器独立成主菜单,子菜单含浏览器设置(独立二级页面,非全局设置)。
+      title: "nav.explorer",
+      items: [
+        { route: "explorer", label: "nav.explorer", kind: "rpc" },
+        { route: "explorer-settings", label: "exp.set.title", kind: "rpc" },
       ],
     },
     {
@@ -59,6 +71,7 @@
     dashboard: "nav.dashboard",
     internals: "nav.internals",
     explorer: "nav.explorer",
+    "explorer-settings": "exp.set.title",
     control: "nav.control",
     wallet: "nav.wallet",
     "wallet-settings": "wal.set.title",
@@ -77,7 +90,7 @@
   // Secondary pages (no nav entry of their own) map back to their parent so
   // the top menu keeps its active highlight while the sub-page is open.
   // 二级页面(无独立导航项)映射回父页面,子页打开时顶部菜单保持高亮。
-  const parentRoute: Partial<Record<Route, Route>> = { "wallet-settings": "wallet" };
+  const parentRoute: Partial<Record<Route, Route>> = { "wallet-settings": "wallet", "explorer-settings": "explorer" };
 
   function isOnMenu(m: { main: { route: Route }; items: { route: Route }[] }): boolean {
     const here = parentRoute[app.route] ?? app.route;
@@ -323,6 +336,8 @@
         <ControlCenter />
       {:else if app.route === "explorer"}
         <Explorer />
+      {:else if app.route === "explorer-settings"}
+        <ExplorerSettings />
       {/if}
     </main>
   </div>

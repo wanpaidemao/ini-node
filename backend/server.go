@@ -3257,7 +3257,7 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 	// 内置钱包管理器始终创建（独立于可选索引）；其查询类 RPC 还需 sugar 索引
 	// 已启用，详见 walletrpcserver.go。
 	s.walletMgr = wallet.NewManager(
-		filepath.Join(cfg.DataDir, wallet.DefaultWalletName), chainParams)
+		filepath.Join(cfg.DataDir, wallet.DefaultWalletDir), chainParams)
 
 	// Log that the node is pruned.
 	if cfg.Prune != 0 {

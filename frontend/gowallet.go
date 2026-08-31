@@ -62,7 +62,7 @@ func newWalletService() *WalletService {
 	}
 	return &WalletService{
 		mgr: wallet.NewManager(
-			filepath.Join(datadir, wallet.DefaultWalletName),
+			filepath.Join(datadir, wallet.DefaultWalletDir),
 			&chaincfg.SugarMainNetParams),
 	}
 }
@@ -70,8 +70,9 @@ func newWalletService() *WalletService {
 // Status reports the local wallet state. Pure local: no RPC involved.
 // Status 报告本地钱包状态。纯本地，不涉及 RPC。
 func (s *WalletService) Status() WalletStatus {
-	st := WalletStatus{Name: "default"}
-	st.Exists = s.mgr.Exists()
+	st := WalletStatus{Name: walletNameOr(s.mgr.Name())}
+	names, _ := s.mgr.List()
+	st.Exists = len(names) > 0
 	if w := s.mgr.Wallet(); w != nil {
 		st.Unlocked = true
 		// Mirror getwalletinfo: show the index-0 primary address.
@@ -88,8 +89,9 @@ func (s *WalletService) Status() WalletStatus {
 // already exists or one is already unlocked.
 // Create 生成全新 BIP39 钱包，以口令加密保存，助记词仅返回一次。
 // 钱包已存在或已有解锁钱包时报错。
-func (s *WalletService) Create(passphrase string) (WalletCreation, error) {
-	mnemonic, w, err := s.mgr.Create(passphrase)
+func (s *WalletService) Create(name, passphrase string) (WalletCreation, error) {
+	name = walletNameOr(name)
+	mnemonic, w, err := s.mgr.Create(name, passphrase)
 	if err != nil {
 		return WalletCreation{}, err
 	}
@@ -97,18 +99,50 @@ func (s *WalletService) Create(passphrase string) (WalletCreation, error) {
 	if err != nil {
 		return WalletCreation{}, err
 	}
-	return WalletCreation{Mnemonic: mnemonic, Address: addr, Name: "default"}, nil
+	return WalletCreation{Mnemonic: mnemonic, Address: addr, Name: name}, nil
 }
 
-// Unlock decrypts wallet.db with the passphrase and leaves it unlocked.
-// A wrong passphrase returns an error. Returns the primary address.
-// Unlock 用口令解密 wallet.db 并保持解锁；口令错误返回错误。返回主地址。
-func (s *WalletService) Unlock(passphrase string) (string, error) {
-	w, err := s.mgr.Unlock(passphrase)
+// Restore rebuilds a wallet named name from a BIP39 mnemonic, saves it
+// encrypted with passphrase and leaves it unlocked. Returns the primary
+// address (recovery for a wallet whose mnemonic was backed up).
+// Restore 用 BIP39 助记词重建名为 name 的钱包，以口令加密保存并保持解锁；
+// 返回主地址（用于凭备份助记词找回钱包）。
+func (s *WalletService) Restore(name, mnemonic, passphrase string) (string, error) {
+	name = walletNameOr(name)
+	w, err := s.mgr.Restore(name, mnemonic, passphrase)
 	if err != nil {
 		return "", err
 	}
 	return w.Address(0)
+}
+
+// List returns the names of all BIP39 wallets on disk, sorted (for the
+// open-wallet picker). / List 返回磁盘上所有 BIP39 钱包名（排序，供打开
+// 钱包选择器使用）。
+func (s *WalletService) List() ([]string, error) {
+	return s.mgr.List()
+}
+
+// Unlock decrypts the named wallet with the passphrase and leaves it
+// unlocked. A wrong passphrase returns an error. Returns the primary address.
+// Unlock 用口令解密指定钱包并保持解锁；口令错误返回错误。返回主地址。
+func (s *WalletService) Unlock(name, passphrase string) (string, error) {
+	name = walletNameOr(name)
+	w, err := s.mgr.Unlock(name, passphrase)
+	if err != nil {
+		return "", err
+	}
+	return w.Address(0)
+}
+
+// walletNameOr trims name and falls back to "default" when blank.
+// walletNameOr 去除 name 首尾空白，为空时回退 "default"。
+func walletNameOr(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = "default"
+	}
+	return name
 }
 
 // Login derives a wallet from the legacy email/password KDF purely in

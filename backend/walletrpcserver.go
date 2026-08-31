@@ -85,7 +85,7 @@ func handleCreateWallet(s *rpcServer, cmd interface{},
 	if c.Passphrase != nil {
 		passphrase = *c.Passphrase
 	}
-	mnemonic, w, err := s.cfg.Wallet.Create(passphrase)
+	mnemonic, w, err := s.cfg.Wallet.Create("", passphrase)
 	if err != nil {
 		return nil, walletRPCError(btcjson.ErrRPCWallet, "%v", err)
 	}
@@ -363,7 +363,7 @@ func handleWalletPassphrase(s *rpcServer, cmd interface{},
 			"built-in wallet is not available / 内置钱包不可用")
 	}
 	c := cmd.(*btcjson.WalletPassphraseCmd)
-	if _, err := s.cfg.Wallet.Unlock(c.Passphrase); err != nil {
+	if _, err := s.cfg.Wallet.Unlock("", c.Passphrase); err != nil {
 		return nil, walletRPCError(btcjson.ErrRPCWallet, "%v", err)
 	}
 	return nil, nil

@@ -606,15 +606,28 @@ export const Services = {
     let chain: { total: number; confirmed: number; pending: number; immature: number; watchonly: number } | null =
       null;
     let external = false;
-    if (st.unlocked) {
+    if (st.unlocked && st.address) {
       try {
-        chain = await rpc<{
-          total: number;
-          confirmed: number;
-          pending: number;
-          immature: number;
-          watchonly: number;
-        }>("getwalletinfo");
+        // Balance is aggregated by the sugar index per address. Query the
+        // primary address directly (getaddressbalance) instead of the node's
+        // getwalletinfo — the latter requires the NODE's own wallet to be
+        // unlocked, a separate instance from the in-process wallet unlocked
+        // here through Wails bindings (so it would always fail).
+        // 余额由 sugar 索引按地址聚合。直接查主地址(getaddressbalance),
+        // 而非节点 getwalletinfo——后者需要节点自身钱包解锁,与本进程经
+        // Wails bindings 解锁的钱包是不同实例(因此必然失败)。
+        const bal = await rpc<{
+          balance: number;
+          balance_spendable: number;
+          balance_immature: number;
+        }>("getaddressbalance", st.address);
+        chain = {
+          total: bal.balance / 1e8,
+          confirmed: bal.balance_spendable / 1e8,
+          pending: 0,
+          immature: bal.balance_immature / 1e8,
+          watchonly: 0,
+        };
       } catch {
         /* node offline or sugarindex disabled — try the external source */
         /* 节点离线或 sugarindex 未启用 — 尝试外部数据源 */
@@ -651,10 +664,11 @@ export const Services = {
     };
   },
 
-  // Unlock wallet.db with the passphrase, in-process. / 进程内用口令解锁 wallet.db。
-  async unlock(pass: string): Promise<boolean> {
+  // Unlock a BIP39 wallet by name with the passphrase, in-process.
+  // 进程内用口令按名字解锁 BIP39 钱包。
+  async unlock(name: string, pass: string): Promise<boolean> {
     try {
-      const addr = await LocalWallet.Unlock(pass);
+      const addr = await LocalWallet.Unlock(name, pass);
       return !!addr;
     } catch {
       return false;
@@ -670,13 +684,25 @@ export const Services = {
 
   // Fresh BIP39 wallet, in-process; the mnemonic is returned once.
   // 进程内创建全新 BIP39 钱包;助记词仅返回一次。
-  async createWallet(pass: string): Promise<{
+  async createWallet(name: string, pass: string): Promise<{
     name: string;
     mnemonic: string;
     address: string;
   }> {
-    const r = await LocalWallet.Create(pass);
+    const r = await LocalWallet.Create(name, pass);
     return { name: r.name, mnemonic: r.mnemonic, address: r.address };
+  },
+
+  // Restore a BIP39 wallet from its mnemonic, in-process; saved under name
+  // and left unlocked. Returns the primary address.
+  // 进程内用助记词恢复 BIP39 钱包;以 name 保存并保持解锁。返回主地址。
+  async restoreWallet(name: string, mnemonic: string, pass: string): Promise<string> {
+    return LocalWallet.Restore(name, mnemonic, pass);
+  },
+
+  // Names of all BIP39 wallets on disk (sorted). / 磁盘上所有 BIP39 钱包名(排序)。
+  async listWallets(): Promise<string[]> {
+    return (await LocalWallet.List()) ?? [];
   },
 
   // Lock: drop in-process key material. / 锁定:丢弃进程内密钥材料。
@@ -897,7 +923,26 @@ export const Services = {
   // getrawtransaction)需要 txindex=1——索引未启用时页面以错误卡降级,
   // 与钱包历史行为一致。
   async getExplorerChain(): Promise<ExplorerChain> {
-    return rpc<ExplorerChain>("getblockchaininfo");
+    // getblockchaininfo returns blocks/headers/bestblockhash; map them onto
+    // the ExplorerChain shape (height/headers/bestHash) the page renders.
+    // getblockchaininfo 返回 blocks/headers/bestblockhash;映射到页面渲染的
+    // ExplorerChain 形态(height/headers/bestHash)。
+    const info = await rpc<{
+      chain: string;
+      blocks: number;
+      headers: number;
+      bestblockhash: string;
+      difficulty: number;
+      mediantime: number;
+    }>("getblockchaininfo");
+    return {
+      height: info.blocks,
+      headers: info.headers,
+      bestHash: info.bestblockhash,
+      chain: info.chain,
+      difficulty: info.difficulty,
+      mediantime: info.mediantime,
+    };
   },
 
   // Height → hash for the explorer search box. / 高度 → 哈希,浏览器搜索用。
@@ -952,13 +997,19 @@ export const Services = {
       nonce: number;
       bits: string;
       difficulty: number;
-      tx: string[] | Array<{ txid: string }>;
+      // btcd verbosity 1 answers ids in "tx"; verbosity 2 answers verbose
+      // objects in "rawtx". Accept both and normalize below.
+      // btcd verbosity 1 在 "tx" 里返回 id;verbosity 2 在 "rawtx" 里返回
+      // 详述对象。两种都接受,下面归一。
+      tx?: string[];
+      rawtx?: Array<{ txid: string }>;
     }>("getblock", hash, 2);
-    // btcd verbosity 2 answers tx as verbose objects; verbosity 1 as ids.
-    // Normalize both into a plain id list.
-    // btcd verbosity 2 的 tx 是详述对象;verbosity 1 是 id。
+    // btcd verbosity 2 answers tx as verbose objects under rawtx; verbosity 1
+    // as ids under tx. Normalize both into a plain id list.
+    // btcd verbosity 2 的交易在 rawtx 下是详述对象;verbosity 1 的 tx 是 id。
     // 两种形态都归一为纯 id 列表。
-    const tx = (b.tx ?? []).map((t) => (typeof t === "string" ? t : t.txid));
+    const raw = b.rawtx ?? b.tx ?? [];
+    const tx = raw.map((t) => (typeof t === "string" ? t : (t as { txid: string }).txid));
     return {
       hash: b.hash,
       height: b.height,

@@ -25,6 +25,8 @@ export interface WalletProfile {
   id: string;
   type: ProfileType;
   name: string;
+  /** HD wallets: the BIP39 wallet name (the <name>.db key) / HD 钱包:BIP39 钱包名(<name>.db 键) */
+  walletName?: string;
   /** web wallets: the email used for login (hint + one-click fill) */
   /** web 钱包:登录邮箱(提示与一键填充用) */
   email?: string;
@@ -71,15 +73,18 @@ function persist(): void {
 export function registerWallet(input: {
   type: ProfileType;
   name?: string;
+  walletName?: string;
   email?: string;
   address?: string;
 }): WalletProfile {
-  const id = input.type === "web" ? `web:${input.email ?? ""}` : "hd";
+  const wname = input.walletName ?? input.name ?? "default";
+  const id = input.type === "web" ? `web:${input.email ?? ""}` : `hd:${wname}`;
   const name =
-    input.name ?? (input.type === "web" ? (input.email ?? "web").split("@")[0] : "HD wallet");
+    input.name ?? (input.type === "web" ? (input.email ?? "web").split("@")[0] : wname);
   const existing = walletRegistry.find((p) => p.id === id);
   if (existing) {
     existing.name = name;
+    if (input.walletName) existing.walletName = input.walletName;
     if (input.address) existing.address = input.address;
     if (input.email) existing.email = input.email;
     persist();
@@ -89,6 +94,7 @@ export function registerWallet(input: {
     id,
     type: input.type,
     name,
+    walletName: input.type === "hd" ? wname : undefined,
     email: input.email,
     address: input.address,
     createdAt: Date.now(),
