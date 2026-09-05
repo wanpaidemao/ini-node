@@ -186,6 +186,38 @@ func (b *BlockChain) ProcessBlock(block *btcutil.Block, flags BehaviorFlags) (bo
 		return false, false, ruleError(ErrDuplicateBlock, str)
 	}
 
+	// Handle orphan blocks before any expensive validation: a block whose
+	// parent is unknown cannot be connected yet, so defer the full
+	// proof-of-work check (the most expensive per-block validation, ~29ms of
+	// yespower) until the orphan is actually connected by
+	// processOrphans/maybeAcceptBlock below.  Only the cheap structural
+	// sanity checks run here (with the PoW check skipped), so an orphan
+	// flood (e.g. after a lost block race) cannot hold the chain write lock
+	// for ~29ms per block and stall every RPC reader.
+	// 在昂贵的校验之前先处理孤儿:父块未知的块无法立即连接,因此把最贵的
+	// PoW 检查(yespower,每次约 29ms)推迟到 processOrphans/maybeAcceptBlock
+	// 真正接入该孤儿时再做。这里只跑廉价的结构 sanity 检查并跳过 PoW,这样
+	// 孤儿洪流(如竞争失败后)不会以每块约 29ms 占用链写锁、阻塞所有 RPC 读。
+	prevHash := &block.MsgBlock().Header.PrevBlock
+	prevHashExists, err := b.blockExists(prevHash)
+	if err != nil {
+		return false, false, err
+	}
+	if !prevHashExists {
+		if err := checkBlockSanity(block, b.chainParams.PowLimit,
+			b.timeSource, flags|BFNoPoWCheck); err != nil {
+			// TEMP DEBUG: log the sanity-check rejection reason.
+			log.Warnf("TEMP-DBG checkBlockSanity-fail(orphan) hash=%s err=%v",
+				blockHash, err)
+			return false, false, err
+		}
+
+		log.Infof("Adding orphan block %v with parent %v", blockHash, prevHash)
+		b.addOrphanBlock(block)
+
+		return false, true, nil
+	}
+
 	// Consensus-anchor fast path.  A block that connects to an already
 	// known parent more than consensusPowSkipDepth below the header tip the
 	// peers agreed on is in deep history: its hash is fixed by the shared
@@ -199,7 +231,7 @@ func (b *BlockChain) ProcessBlock(block *btcutil.Block, flags BehaviorFlags) (bo
 	// agreed header chain and its PoW was validated when the corresponding
 	// block was processed at connect time; a mismatch (side chain / re-org
 	// candidate) keeps the block fully validated.
-	parentHash := &block.MsgBlock().Header.PrevBlock
+	parentHash := prevHash
 	if prevNode := b.index.LookupNode(parentHash); prevNode != nil {
 		height := prevNode.height + 1
 		bestHeader := b.bestHeader.Tip()
@@ -280,19 +312,6 @@ func (b *BlockChain) ProcessBlock(block *btcutil.Block, flags BehaviorFlags) (bo
 				return false, false, ruleError(ErrDifficultyTooLow, str)
 			}
 		}
-	}
-
-	// Handle orphan blocks.
-	prevHash := &blockHeader.PrevBlock
-	prevHashExists, err := b.blockExists(prevHash)
-	if err != nil {
-		return false, false, err
-	}
-	if !prevHashExists {
-		log.Infof("Adding orphan block %v with parent %v", blockHash, prevHash)
-		b.addOrphanBlock(block)
-
-		return false, true, nil
 	}
 
 	// The block has passed all context independent checks and appears sane

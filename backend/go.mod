@@ -6,6 +6,14 @@ replace github.com/btcsuite/btcd/chaincfg/v2 => ./chaincfg
 
 replace github.com/btcsuite/btcd/txscript/v2 => ./txscript
 
+// Local wire override: upstream btcd/wire keeps DefaultUserAgent="/btcwire:0.5.0/",
+// which would leak into every version handshake (AddUserAgent appends, it does
+// not replace). Our ./wire sets it to "/" so we advertise /ini:0.0.1/.
+// 本地 wire 覆盖:上游 btcd/wire 的 DefaultUserAgent 仍是 "/btcwire:0.5.0/",
+// 而 AddUserAgent 是追加不是替换,会导致广播值带 btcwire;本地 ./wire 已改为
+// "/",使本节点对外上报 /ini:0.0.1/。
+replace github.com/btcsuite/btcd/wire/v2 => ./wire
+
 require (
 	github.com/btcsuite/btcd/address/v2 v2.0.0
 	github.com/btcsuite/btcd/btcec/v2 v2.5.0

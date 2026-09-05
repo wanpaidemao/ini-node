@@ -84,7 +84,11 @@ func TestMessage(t *testing.T) {
 		btcnet BitcoinNet // Network to use for wire encoding
 		bytes  int        // Expected num bytes read/written
 	}{
-		{msgVersion, msgVersion, pver, MainNet, 125},
+		// Version message length: DefaultUserAgent is "/" (1 byte) in our fork,
+		// upstream btcd uses "/btcwire:0.5.0/" (15 bytes), which would make this 125.
+		// version 消息长度:本 fork 的 DefaultUserAgent 为 "/"(1 字节);上游 btcd
+		// 是 "/btcwire:0.5.0/"(15 字节),若用上游则该值为 125。
+		{msgVersion, msgVersion, pver, MainNet, 111},
 		{msgVerack, msgVerack, pver, MainNet, 24},
 		{msgGetAddr, msgGetAddr, pver, MainNet, 24},
 		{msgAddr, msgAddr, pver, MainNet, 25},

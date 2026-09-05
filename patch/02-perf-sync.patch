@@ -1,5 +1,5 @@
 diff --git a/netsync/manager.go b/netsync/manager.go
-index e6243e40..5441761b 100644
+index 24bcdd43..61d3f9c3 100644
 --- a/netsync/manager.go
 +++ b/netsync/manager.go
 @@ -5,7 +5,11 @@
@@ -38,7 +38,7 @@ index e6243e40..5441761b 100644
  	// maxRequestedTxns is the maximum number of requested transactions
  	// hashes to store in memory.
  	maxRequestedTxns = wire.MaxInvPerMsg
-@@ -45,6 +66,96 @@ const (
+@@ -45,6 +66,112 @@ const (
  	// stallSampleInterval the interval at which we will check to see if our
  	// sync has stalled.
  	stallSampleInterval = 30 * time.Second
@@ -115,8 +115,24 @@ index e6243e40..5441761b 100644
 +	// by the network; a forged chain's blocks either do not exist on any peer
 +	// or do not link to the applied tip, so the download would spin forever.
 +	// The window is deliberately much larger than blockSliceStallTimeout so a
-+	// merely slow peer is never misjudged.
-+	blockUnavailableTimeout = 10 * time.Minute
++	// merely slow peer is never misjudged.  It is, however, well below the old
++	// 10 minutes: the strong divergence detectors (best-tip-vs-header chain,
++	// peer-height, and the front-unreachable votes) typically fire first, but
++	// this block-side timer is the last-resort fallback for a lone/competing
++	// miner whose own block was orphaned -- leaving it at 10 minutes made a
++	// mining-loss stall last ~10 minutes before the node even attempted to
++	// recover.  At 90s (and with the fabricated blocks hard-deleted on rollback)
++	// a lost block race heals in ~1.5 minutes instead.
++	blockUnavailableTimeout = 90 * time.Second
++
++	// orphanFloodThreshold is how many consecutive orphan blocks must arrive
++	// before the orphan-flood divergence check runs immediately (rather than
++	// waiting for the next 30s stall sample).  A lost block race turns every
++	// real main-chain block above the fabricated tip into an orphan, so a
++	// flood is a strong early fingerprint; the check itself only rolls back
++	// when the DB height index disagrees with the tip, so a mere burst of
++	// out-of-order slices during a healthy parallel download cannot misfire.
++	orphanFloodThreshold = 50
 +
 +	// maxFabricatedRollbacks caps how many times the fabricated-header-chain
 +	// rollback may target the same height before it is refused.  The rollback
@@ -135,7 +151,7 @@ index e6243e40..5441761b 100644
  )
  
  // zeroHash is the zero value hash (all zeros).  It is defined as a convenience.
-@@ -128,6 +239,13 @@ type isCurrentMsg struct {
+@@ -128,6 +255,13 @@ type isCurrentMsg struct {
  	reply chan bool
  }
  
@@ -149,7 +165,7 @@ index e6243e40..5441761b 100644
  // pauseMsg is a message type to be sent across the message channel for
  // pausing the sync manager.  This effectively provides the caller with
  // exclusive access over the manager until a receive is performed on the
-@@ -152,6 +270,183 @@ type peerSyncState struct {
+@@ -152,6 +286,183 @@ type peerSyncState struct {
  	requestedBlocks map[chainhash.Hash]struct{}
  }
  
@@ -333,7 +349,7 @@ index e6243e40..5441761b 100644
  // limitAdd is a helper function for maps that require a maximum limit by
  // evicting a random value if adding the new value would cause it to
  // overflow the maximum allowed.
-@@ -196,9 +491,108 @@ type SyncManager struct {
+@@ -196,9 +507,120 @@ type SyncManager struct {
  	peerStates       map[*peerpkg.Peer]*peerSyncState
  	lastProgressTime time.Time
  
@@ -428,6 +444,18 @@ index e6243e40..5441761b 100644
 +	// goroutine.
 +	frontUnreachable map[int32]map[string]time.Time
 +
++	// orphanFloodCount counts consecutive orphan blocks received while the
++	// block download has not advanced.  An orphan flood whose parents are all
++	// unknown is the classic fingerprint of a lost block race (a locally-mined
++	// block sits on the best-chain tip, so every real main-chain block above
++	// it arrives as an orphan).  Once the count crosses orphanFloodThreshold,
++	// run a divergence check immediately instead of waiting for the next stall
++	// sample, so the rollback fires within seconds even when the header chain
++	// has not yet advanced past the tip (the HeaderChainDiverged blind spot).
++	// Reset whenever the download makes progress.  Only touched from the
++	// blockHandler goroutine.
++	orphanFloodCount int32
++
 +	// lastUtxoFlush is the last time the UTXO cache was asked to flush.
 +	// It is used to trigger periodic flushes even while in initial block
 +	// download mode so that an unclean shutdown does not fall far behind the
@@ -442,7 +470,7 @@ index e6243e40..5441761b 100644
  	// An optional fee estimator.
  	feeEstimator *mempool.FeeEstimator
  }
-@@ -263,8 +657,22 @@ func (sm *SyncManager) isInIBDMode() bool {
+@@ -263,8 +685,22 @@ func (sm *SyncManager) isInIBDMode() bool {
  	return true
  }
  
@@ -467,7 +495,7 @@ index e6243e40..5441761b 100644
  func (sm *SyncManager) fetchHeaders() {
  	_, height := sm.chain.BestHeader()
  	higherPeers := sm.fetchHigherPeers(height)
-@@ -272,23 +680,272 @@ func (sm *SyncManager) fetchHeaders() {
+@@ -272,23 +708,272 @@ func (sm *SyncManager) fetchHeaders() {
  		log.Warnf("No sync peer candidates available")
  		return
  	}
@@ -750,7 +778,7 @@ index e6243e40..5441761b 100644
  }
  
  // startSync will choose the best peer among the available candidate peers to
-@@ -354,7 +1011,20 @@ func (sm *SyncManager) startSync() {
+@@ -354,7 +1039,20 @@ func (sm *SyncManager) startSync() {
  
  	log.Infof("Syncing to block height %d from peer %v",
  		sm.syncPeer.LastBlock(), sm.syncPeer.Addr())
@@ -772,7 +800,7 @@ index e6243e40..5441761b 100644
  }
  
  // isSyncCandidate returns whether or not the peer is a candidate to consider
-@@ -443,6 +1113,161 @@ func (sm *SyncManager) handleNewPeerMsg(peer *peerpkg.Peer) {
+@@ -443,6 +1141,161 @@ func (sm *SyncManager) handleNewPeerMsg(peer *peerpkg.Peer) {
  	if isSyncCandidate && sm.syncPeer == nil {
  		sm.startSync()
  	}
@@ -934,7 +962,7 @@ index e6243e40..5441761b 100644
  }
  
  // handleStallSample will switch to a new sync peer if the current one has
-@@ -454,6 +1279,178 @@ func (sm *SyncManager) handleStallSample() {
+@@ -454,6 +1307,186 @@ func (sm *SyncManager) handleStallSample() {
  		return
  	}
  
@@ -1041,12 +1069,20 @@ index e6243e40..5441761b 100644
 +			peerHeight = sm.syncPeer.StartingHeight()
 +		}
 +		// Only fire once the download has demonstrably stalled (the front
-+		// height has not moved for over a minute), so a normal catch-up that
-+		// is merely behind the peer is not mistaken for a fork.
-+		// 仅当下载确实停滞(front 高度超过一分钟未推进)才触发,避免把正常
-+		// 追赶(只是落后于对等点)误判为分叉。
++		// height has not moved for 20s), so a normal catch-up that is merely
++		// behind the peer is not mistaken for a fork.  20s is well below the
++		// 1-minute window that predates the orphan-flood early signal: the
++		// peer-height detector is a pure network-side comparison (the peer's
++		// advertised height cannot be polluted by a local fork) and the
++		// stall sample runs every 30s, so a sub-sample window cannot misfire
++		// more often, while a lost block race is caught a full minute sooner.
++		// 仅当下载确实停滞(front 高度超过 20 秒未推进)才触发,避免把正常
++		// 追赶(只是落后于对等点)误判为分叉。20s 远低于原来的 1 分钟:peer
++		// 高度检测是纯网络侧比较(对等点通告高度不可能被本地分叉污染),且
++		// 停滞采样每 30s 才跑一次,子采样窗口不会增加误判,而竞争失败能
++		// 提前整整一分钟被捕获。
 +		stalled := bestTip.Height == sm.blockMissingHeight &&
-+			time.Since(sm.blockMissingSince) > time.Minute
++			time.Since(sm.blockMissingSince) > 20*time.Second
 +		if peerHeight > bestTip.Height && stalled {
 +			log.Warnf("Best chain tip (height %d) is %d blocks behind the "+
 +				"sync peer (height %d) with the download stalled -- "+
@@ -1077,9 +1113,9 @@ index e6243e40..5441761b 100644
 +	if sm.headerSync != nil && sm.chain.HeaderChainDiverged() {
 +		forkHeight := sm.chain.BestChainHeaderForkHeight()
 +		log.Warnf("Best chain tip diverges from the header chain at height "+
-+			"%d (fork at %d) -- fabricated/forked tip, rolling back early",
++			"%d (fork at %d) -- fabricated/forked tip, rolling back to fork",
 +			sm.chain.BestSnapshot().Height, forkHeight)
-+		sm.rollbackFabricatedHeaderChain()
++		sm.rollbackToForkPoint(forkHeight)
 +	}
 +
 +	// Detect a fabricated or forked header chain: the block download has not
@@ -1113,7 +1149,7 @@ index e6243e40..5441761b 100644
  	// If we don't have an active sync peer, exit early.
  	if sm.syncPeer == nil {
  		return
-@@ -476,6 +1473,72 @@ func (sm *SyncManager) handleStallSample() {
+@@ -476,6 +1509,72 @@ func (sm *SyncManager) handleStallSample() {
  	sm.updateSyncPeer(disconnectSyncPeer)
  }
  
@@ -1186,7 +1222,7 @@ index e6243e40..5441761b 100644
  // shouldDCStalledSyncPeer determines whether or not we should disconnect a
  // stalled sync peer. If the peer has stalled and its reported height is greater
  // than our own best height, we will disconnect it. Otherwise, we will keep the
-@@ -516,6 +1579,27 @@ func (sm *SyncManager) handleDonePeerMsg(peer *peerpkg.Peer) {
+@@ -516,6 +1615,27 @@ func (sm *SyncManager) handleDonePeerMsg(peer *peerpkg.Peer) {
  
  	sm.clearRequestedState(state)
  
@@ -1214,7 +1250,7 @@ index e6243e40..5441761b 100644
  	if peer == sm.syncPeer {
  		// Update the sync peer. The server has already disconnected the
  		// peer before signaling to the sync manager.
-@@ -724,6 +1808,37 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
+@@ -724,6 +1844,37 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
  	delete(state.requestedBlocks, *blockHash)
  	delete(sm.requestedBlocks, *blockHash)
  
@@ -1252,7 +1288,58 @@ index e6243e40..5441761b 100644
  	// Process the block to include validation, best chain selection, orphan
  	// handling, etc.
  	_, isOrphan, err := sm.chain.ProcessBlock(bmsg.block, behaviorFlags)
-@@ -794,7 +1909,17 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
+@@ -765,6 +1916,50 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
+ 
+ 	// Request the parents for the orphan block from the peer that sent it.
+ 	if isOrphan {
++		// Fast divergence detection: an orphan arriving while the best-chain
++		// tip diverges from the network-projected header chain means the
++		// local tip is a fabricated/forked block (e.g. a lost block race
++		// where the locally-mined sibling no peer's chain contains).  Roll
++		// back immediately instead of waiting for the next 30s stall sample
++		// so block download resumes within seconds, not ~1.5 minutes.
++		// 快速分叉检测:孤儿到达时若 best chain tip 已与(网络投影的)header
++		// 链分叉,说明本地 tip 是伪造/分叉块(如竞争失败,本地挖出的兄弟块
++		// 无对等点主链包含)。立即回滚,而不是等下一个 30 秒停滞采样——
++		// block 下载秒级恢复,而不是约 1.5 分钟。
++		if sm.chain.HeaderChainDiverged() {
++			forkHeight := sm.chain.BestChainHeaderForkHeight()
++			log.Warnf("Orphan %v received while best-chain tip diverges "+
++				"from header chain (fork at %d) -- fabricated/forked tip, "+
++				"rolling back to fork", blockHash, forkHeight)
++			sm.rollbackToForkPoint(forkHeight)
++		}
++
++		// Orphan-flood early signal: count consecutive orphans; once the
++		// threshold is crossed, compare the DB height index against the tip
++		// immediately.  This catches the lost-block-race fingerprint within
++		// seconds even when the header chain has not yet advanced past the
++		// tip (HeaderChainDiverged above requires the header chain to lead).
++		// The check only rolls back when the DB index disagrees, so a burst
++		// of out-of-order slices during a healthy parallel download cannot
++		// misfire.
++		// 孤儿洪流早期信号:累计连续孤儿数,越过阈值后立即把 DB 高度索引与
++		// tip 对比。这能在 header 链尚未越过 tip(上方 HeaderChainDiverged
++		// 需要 header 链领先)时,于数秒内捕获竞争失败的指纹。仅当 DB 索引
++		// 与 tip 不一致才回滚,正常并行下载的乱序突发不会误触发。
++		sm.orphanFloodCount++
++		if sm.orphanFloodCount >= orphanFloodThreshold {
++			sm.orphanFloodCount = 0
++			bestTip := sm.chain.BestSnapshot()
++			if dbHash, err := sm.chain.MainChainHashByHeight(bestTip.Height); err == nil &&
++				!dbHash.IsEqual(&bestTip.Hash) {
++				log.Warnf("Orphan flood (%d+) while best-chain tip %v (height "+
++					"%d) is not the main-chain block %v -- fabricated/forked "+
++					"tip, rolling back early", orphanFloodThreshold,
++					bestTip.Hash, bestTip.Height, dbHash)
++				sm.rollbackFabricatedHeaderChain()
++			}
++		}
++
+ 		// We've just received an orphan block from a peer. In order
+ 		// to update the height of the peer, we try to extract the
+ 		// block height from the scriptSig of the coinbase transaction.
+@@ -794,7 +1989,17 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
  			peer.PushGetBlocksMsg(locator, orphanRoot)
  		}
  	} else {
@@ -1271,7 +1358,19 @@ index e6243e40..5441761b 100644
  			sm.lastProgressTime = time.Now()
  		}
  
-@@ -826,11 +1951,17 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
+@@ -810,6 +2015,11 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
+ 
+ 		// Clear the rejected transactions.
+ 		sm.rejectedTxns = make(map[chainhash.Hash]struct{})
++
++		// The download made progress (a block was connected): reset the
++		// orphan-flood counter so a healthy run never accumulates stale votes.
++		// 下载有进展(块被连接):重置孤儿洪流计数,正常运行的累计不会残留。
++		sm.orphanFloodCount = 0
+ 	}
+ 
+ 	// Update the block height for this peer. But only send a message to
+@@ -826,11 +2036,17 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
  
  	// If we are not in the initial block download mode, it's a good time to
  	// periodically flush the blockchain cache because we don't expect new
@@ -1291,7 +1390,7 @@ index e6243e40..5441761b 100644
  		return
  	}
  
-@@ -846,12 +1977,18 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
+@@ -846,12 +2062,18 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
  		}
  	}
  
@@ -1315,19 +1414,13 @@ index e6243e40..5441761b 100644
  		return
  	}
  
-@@ -877,15 +2014,190 @@ func (sm *SyncManager) fetchHeaderBlocks(peer *peerpkg.Peer) {
+@@ -877,14 +2099,189 @@ func (sm *SyncManager) fetchHeaderBlocks(peer *peerpkg.Peer) {
  	}
  }
  
 -// buildBlockRequest builds a getdata message for blocks that need to be
 -// downloaded based on the current list of headers.
 -//
--// Start fetching from the fork point between the best chain and
--// the best header chain rather than from the best chain height.
--// When the best header chain has diverged (e.g. due to a reorg),
--// blocks between the fork point and the current height on the new
--// chain are different and must also be downloaded.
--func (sm *SyncManager) buildBlockRequest(peer *peerpkg.Peer) *wire.MsgGetData {
 +// assignBlockSlice hands the next unassigned, non-overlapping slice of the
 +// block chain to the given peer, if it does not already have one.  It prefers
 +// to fill a hole at the front of the download (left by a dropped or stalled
@@ -1501,21 +1594,20 @@ index e6243e40..5441761b 100644
 +// buildBlockRequest builds a getdata message for blocks that need to be
 +// downloaded based on the current list of headers.
 +//
-+// Start fetching from the fork point between the best chain and
-+// the best header chain rather than from the best chain height.
-+// When the best header chain has diverged (e.g. due to a reorg),
-+// blocks between the fork point and the current height on the new
-+// chain are different and must also be downloaded.
+ // Start fetching from the fork point between the best chain and
+ // the best header chain rather than from the best chain height.
+ // When the best header chain has diverged (e.g. due to a reorg),
+ // blocks between the fork point and the current height on the new
+ // chain are different and must also be downloaded.
 +//
 +// In a parallel download each peer owns a disjoint slice of the chain (see
 +// assignBlockSlice); this method only walks the heights inside that slice.  A
 +// slice is released once every height in it has been requested (in flight or
 +// already present), so the peer claims the next slice on the next top-up.
-+func (sm *SyncManager) buildBlockRequest(peer *peerpkg.Peer) *wire.MsgGetData {
+ func (sm *SyncManager) buildBlockRequest(peer *peerpkg.Peer) *wire.MsgGetData {
  	// Return early if the peer is nil.
  	if peer == nil {
- 		return wire.NewMsgGetDataSizeHint(0)
-@@ -898,18 +2210,75 @@ func (sm *SyncManager) buildBlockRequest(peer *peerpkg.Peer) *wire.MsgGetData {
+@@ -898,18 +2295,75 @@ func (sm *SyncManager) buildBlockRequest(peer *peerpkg.Peer) *wire.MsgGetData {
  		// that happens below.
  		return wire.NewMsgGetDataSizeHint(0)
  	}
@@ -1595,7 +1687,7 @@ index e6243e40..5441761b 100644
  		haveInv, err := sm.haveInventory(iv)
  		if err != nil {
  			log.Warnf("Unexpected failure when checking for "+
-@@ -932,24 +2301,141 @@ func (sm *SyncManager) buildBlockRequest(peer *peerpkg.Peer) *wire.MsgGetData {
+@@ -932,24 +2386,141 @@ func (sm *SyncManager) buildBlockRequest(peer *peerpkg.Peer) *wire.MsgGetData {
  			sm.requestedBlocks[*hash] = struct{}{}
  			peerState.requestedBlocks[*hash] = struct{}{}
  
@@ -1745,7 +1837,7 @@ index e6243e40..5441761b 100644
  // handleHeadersMsg handles block header messages from all peers.  Headers are
  // requested when performing the ibd and are propagated by peers once the ibd
  // is complete.
-@@ -964,18 +2450,36 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
+@@ -964,18 +2535,36 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
  	// Nothing to do for an empty headers message.
  	msg := hmsg.headers
  	numHeaders := len(msg.Headers)
@@ -1785,7 +1877,7 @@ index e6243e40..5441761b 100644
  			peer.Disconnect()
  			return
  		}
-@@ -1010,6 +2514,999 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
+@@ -1010,6 +2599,1021 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
  	sm.fetchHeaderBlocks(peer)
  }
  
@@ -2519,8 +2611,15 @@ index e6243e40..5441761b 100644
 +	log.Warnf("Rolled back fabricated header chain to height %d -- "+
 +		"restarting header/block download", rollbackHeight)
 +
-+	// 3. Tear down all in-flight download state so the next fetchHeaders
-+	// starts from a clean slate at the confirmed height.
++	// 3-4. Tear down in-flight download state and restart from the rebuilt
++	// best-header tip.
++	sm.resetDownloadState()
++}
++
++// resetDownloadState tears down all in-flight download state and restarts the
++// sync from the current best-header tip.  It is shared by the explicit
++// fork-point rollback and the generic fabricated-header-chain rollback.
++func (sm *SyncManager) resetDownloadState() {
 +	sm.headerSync = nil
 +	sm.blockSync = nil
 +	sm.blockSyncState = nil
@@ -2532,9 +2631,24 @@ index e6243e40..5441761b 100644
 +	}
 +	sm.syncPeer = nil
 +	sm.ibdMode = true
-+
-+	// 4. Restart the sync from the rebuilt best-header tip.
 +	sm.startSync()
++}
++
++// rollbackToForkPoint rolls the header chain back to an explicit fork height in
++// one step, mirroring umami's ActivateBestChain: the best-chain tip is known to
++// diverge from the (network-projected) header chain at forkHeight, so there is
++// no need to deepen the cut one block at a time through repeated stall timeouts.
++// It reuses InvalidateHeaderChain + the shared download-state reset, but jumps
++// straight to the fork instead of walking down from the tip.
++func (sm *SyncManager) rollbackToForkPoint(forkHeight int32) {
++	if err := sm.chain.InvalidateHeaderChain(forkHeight); err != nil {
++		log.Errorf("Failed to roll back header chain to fork height %d: %v",
++			forkHeight, err)
++		return
++	}
++	log.Warnf("Rolled back header chain to fork point %d -- "+
++		"restarting header/block download", forkHeight)
++	sm.resetDownloadState()
 +}
 +
 +// reissueStaleHeaderRanges reassigns any in-flight header range that has not
@@ -2785,7 +2899,7 @@ index e6243e40..5441761b 100644
  // handleNotFoundMsg handles notfound messages from all peers.
  func (sm *SyncManager) handleNotFoundMsg(nfmsg *notFoundMsg) {
  	peer := nfmsg.peer
-@@ -1300,6 +3797,8 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
+@@ -1300,6 +3904,8 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
  func (sm *SyncManager) blockHandler() {
  	stallTicker := time.NewTicker(stallSampleInterval)
  	defer stallTicker.Stop()
@@ -2794,7 +2908,7 @@ index e6243e40..5441761b 100644
  
  out:
  	for {
-@@ -1336,9 +3835,14 @@ out:
+@@ -1336,16 +3942,63 @@ out:
  				}
  				msg.reply <- peerID
  
@@ -2804,12 +2918,62 @@ index e6243e40..5441761b 100644
  			case processBlockMsg:
  				_, isOrphan, err := sm.chain.ProcessBlock(
  					msg.block, msg.flags)
-+				// TEMP DEBUG: trace block processing outcome / 临时调试
-+				log.Warnf("TEMP-DBG ProcessBlock hash=%s orphan=%v err=%v", msg.block.Hash(), isOrphan, err)
  				if err != nil {
++					// A miner-submitted block being rejected for not
++					// extending the network-confirmed chain is an
++					// immediate, authoritative signal that the local
++					// best-chain tip has forked or is fabricated (a lost
++					// block race): roll back at once instead of waiting
++					// for the orphan-flood counter or the next stall
++					// sample, so mining resumes on the real chain within
++					// seconds.
++					// 矿工提交的块因不扩展网络确认链而被拒,是本地 best
++					// chain tip 已分叉/伪造的即时权威信号(竞争失败):
++					// 立即回滚,而不是等孤儿洪流计数或下一次停滞采样,
++					// 让挖矿在数秒内回到真实链上继续。
++					if msg.flags&blockchain.BFMinerSubmit ==
++						blockchain.BFMinerSubmit {
++						if rerr, ok := err.(blockchain.RuleError); ok &&
++							rerr.ErrorCode ==
++								blockchain.ErrMinedBlockNotOnMainChain {
++							if sm.chain.HeaderChainDiverged() {
++								forkHeight :=
++									sm.chain.BestChainHeaderForkHeight()
++								log.Warnf("Miner-submitted block "+
++									"%v rejected: not on the "+
++									"network-confirmed chain -- "+
++									"rolling back to fork point %d",
++									msg.block.Hash(), forkHeight)
++								sm.rollbackToForkPoint(forkHeight)
++							} else {
++								bestTip := sm.chain.BestSnapshot()
++								if dbHash, derr := sm.chain.
++									MainChainHashByHeight(bestTip.Height); derr == nil &&
++									!dbHash.IsEqual(&bestTip.Hash) {
++									log.Warnf("Miner-submitted block "+
++										"%v rejected while best-chain "+
++										"tip %v (height %d) is not the "+
++										"main-chain block %v -- "+
++										"fabricated/forked tip, rolling "+
++										"back early",
++										msg.block.Hash(), bestTip.Hash,
++										bestTip.Height, dbHash)
++									sm.rollbackFabricatedHeaderChain()
++								}
++							}
++						}
++					}
  					msg.reply <- processBlockResponse{
  						isOrphan: false,
-@@ -1366,6 +3870,9 @@ out:
+ 						err:      err,
+ 					}
++					continue
+ 				}
+-
+ 				msg.reply <- processBlockResponse{
+ 					isOrphan: isOrphan,
+ 					err:      nil,
+@@ -1366,6 +4019,9 @@ out:
  		case <-stallTicker.C:
  			sm.handleStallSample()
  
@@ -2819,7 +2983,7 @@ index e6243e40..5441761b 100644
  		case <-sm.quit:
  			break out
  		}
-@@ -1390,6 +3897,11 @@ func (sm *SyncManager) handleBlockchainNotification(notification *blockchain.Not
+@@ -1390,6 +4046,11 @@ func (sm *SyncManager) handleBlockchainNotification(notification *blockchain.Not
  	case blockchain.NTBlockAccepted:
  		// Don't relay if we are not current. Other peers that are
  		// current should already know about it.
@@ -2831,7 +2995,7 @@ index e6243e40..5441761b 100644
  		if !sm.current() {
  			return
  		}
-@@ -1402,6 +3914,7 @@ func (sm *SyncManager) handleBlockchainNotification(notification *blockchain.Not
+@@ -1402,6 +4063,7 @@ func (sm *SyncManager) handleBlockchainNotification(notification *blockchain.Not
  
  		// Generate the inventory vector and relay it.
  		iv := wire.NewInvVect(wire.InvTypeBlock, block.Hash())
@@ -2839,7 +3003,7 @@ index e6243e40..5441761b 100644
  		sm.peerNotifier.RelayInventory(iv, block.MsgBlock().Header)
  
  	// A block has been connected to the main block chain.
-@@ -1591,6 +4104,83 @@ func (sm *SyncManager) SyncPeerID() int32 {
+@@ -1591,6 +4253,83 @@ func (sm *SyncManager) SyncPeerID() int32 {
  	return <-reply
  }
  
@@ -2923,7 +3087,7 @@ index e6243e40..5441761b 100644
  // ProcessBlock makes use of ProcessBlock on an internal instance of a block
  // chain.
  func (sm *SyncManager) ProcessBlock(block *btcutil.Block, flags blockchain.BehaviorFlags) (bool, error) {
-@@ -1622,18 +4212,21 @@ func (sm *SyncManager) Pause() chan<- struct{} {
+@@ -1622,18 +4361,21 @@ func (sm *SyncManager) Pause() chan<- struct{} {
  // block, tx, and inv updates.
  func New(config *Config) (*SyncManager, error) {
  	sm := SyncManager{
@@ -2958,7 +3122,7 @@ index e6243e40..5441761b 100644
  
  	if config.DisableCheckpoints {
 diff --git a/netsync/interface.go b/netsync/interface.go
-index 2e3ed543..c3c03a12 100644
+index 10c4c31d..fc2b4f57 100644
 --- a/netsync/interface.go
 +++ b/netsync/interface.go
 @@ -37,5 +37,11 @@ type Config struct {
@@ -2974,7 +3138,7 @@ index 2e3ed543..c3c03a12 100644
  	FeeEstimator *mempool.FeeEstimator
  }
 diff --git a/netsync/manager_test.go b/netsync/manager_test.go
-index 1e40dd82..c776644c 100644
+index 44702946..69a56d10 100644
 --- a/netsync/manager_test.go
 +++ b/netsync/manager_test.go
 @@ -1,12 +1,8 @@
@@ -4365,7 +4529,7 @@ index 1e40dd82..c776644c 100644
 +	require.LessOrEqual(t, sl.end-1, bestHeaderHeight)
 +}
 diff --git a/blockchain/chain.go b/blockchain/chain.go
-index fd110458..474e3885 100644
+index d497d904..00ebef0d 100644
 --- a/blockchain/chain.go
 +++ b/blockchain/chain.go
 @@ -7,6 +7,7 @@ package blockchain
@@ -5081,7 +5245,7 @@ index fd110458..474e3885 100644
  		log.Warnf("Error flushing block index changes to disk: %v", writeErr)
  	}
  
-@@ -2020,13 +2360,218 @@ func (b *BlockChain) InvalidateBlock(hash *chainhash.Hash) error {
+@@ -2020,13 +2360,313 @@ func (b *BlockChain) InvalidateBlock(hash *chainhash.Hash) error {
  	detachNodes, attachNodes := b.getReorganizeNodes(bestTip)
  	err = b.reorganizeChain(detachNodes, attachNodes)
  
@@ -5235,6 +5399,27 @@ index fd110458..474e3885 100644
 +	// prev 不匹配而成为孤儿,区块停止同步而区块头仍在前进(已观察到:分叉
 +	// tip 处孤儿洪流、block 下载冻结在高度 44060190)。回退 bestChain 后,
 +	// 重新派发的下载能从共享高度重连真实链。
++	//
++	// 用 reorganizeChain 正确断开 rollbackHeight 之上的错块,回滚其 UTXO。
++	// 原先直接 SetTip 的捷径会跳过 UTXO 回滚:本地挖错块若与网络主链块
++	// 包含相同交易(同一 mempool 选币),错块的花费会残留,导致重连主链块时
++	// input 已被花、连接失败。detach 顺序从 tip 往下,与 InvalidateBlock 一致。
++	detachNodes := list.New()
++	for n := b.bestChain.Tip(); n != nil && n.height > rollbackHeight; n = n.parent {
++		detachNodes.PushBack(n)
++	}
++	if detachNodes.Len() > 0 {
++		if err := b.reorganizeChain(detachNodes, list.New()); err != nil {
++			return err
++		}
++
++		// 断开后彻底删除这些错块:payload + blockheaderidx + 内存 node,对齐
++		// umami 把 BLOCK_FAILED_VALID 块从 m_block_index 移除。
++		if err := b.removeDisconnectedBlocks(detachNodes); err != nil {
++			return err
++		}
++	}
++
 +	b.bestChain.SetTip(rollbackNode)
 +
 +	// Rebuild the best-block state snapshot for the rolled-back tip.  The
@@ -5298,10 +5483,84 @@ index fd110458..474e3885 100644
 +	return b.index.flushToDB(false)
 +}
 +
++// removeDisconnectedBlocks fully deletes the blocks in the given list (which
++// must already have been disconnected from the best chain) by purging their
++// payload, block-index header row, and in-memory node.  This mirrors umami
++// (Bitcoin Core) removing a BLOCK_FAILED_VALID block from m_block_index: a
++// locally-mined block that no peer's chain contains can never join the main
++// chain, so it is reclaimed instead of lingering as a side-chain zombie that
++// costs disk and can be re-validated after a restart.
++//
++// The caller must hold the chain lock.
++func (b *BlockChain) removeDisconnectedBlocks(nodes *list.List) error {
++	// Delete all payloads and block-index header rows in ONE transaction
++	// instead of one db.Update per block: each Update is a full write
++	// transaction (sync/commit overhead), and the rollback runs while
++	// holding the chain write lock, so every extra transaction directly
++	// lengthens the RPC read-lock stall during a reorg rollback.
++	// 把所有 payload 与 block-index 表项放在**单个**事务里删除,而不是每块
++	// 一个 db.Update:每个 Update 都是一次完整写事务(同步/提交开销),而回滚
++	// 全程持有链写锁,多一个事务就多一段 RPC 读锁阻塞时间。
++	if err := b.db.Update(func(dbTx database.Tx) error {
++		for e := nodes.Front(); e != nil; e = e.Next() {
++			node := e.Value.(*blockNode)
++			hash := node.hash
++			if err := dbTx.DeleteBlock(&hash); err != nil {
++				return err
++			}
++			if err := dbRemoveBlockNode(dbTx, &hash, node.height); err != nil {
++				return err
++			}
++		}
++		return nil
++	}); err != nil {
++		return err
++	}
++
++	// Drop the in-memory nodes so they can never be re-validated or re-flushed,
++	// and purge any orphans whose parent was just deleted: those orphans can
++	// never connect (their parent is gone for good), so keeping them would
++	// waste memory until their 1-hour expiration and could re-materialize a
++	// stale orphan chain after a restart.
++	// 删除内存节点使其永远不会被重新校验或落盘,同时清出刚被删除块为父的
++	// 孤儿:这些孤儿永远无法连接(父块已彻底删除),保留它们只会占用内存
++	// 直到 1 小时过期,并可能在重启后重新物化一条过期的孤儿链。
++	for e := nodes.Front(); e != nil; e = e.Next() {
++		node := e.Value.(*blockNode)
++		b.index.RemoveNode(&node.hash)
++		b.removeOrphansWithParent(&node.hash)
++	}
++	return b.index.flushToDB(false)
++}
++
++// removeOrphansWithParent removes every orphan block whose parent is the
++// passed hash.  It is used after a reorg rollback deletes the disconnected
++// blocks: orphans hanging off a deleted block can never be connected (their
++// parent no longer exists), so they are purged immediately instead of
++// lingering in the pool until their expiration.
++//
++// The caller must hold the chain lock; this function takes the orphan lock.
++func (b *BlockChain) removeOrphansWithParent(parent *chainhash.Hash) {
++	// Snapshot the dependency list before removing so the traversal is
++	// unaffected by removeOrphanBlock mutating the shared slice underneath.
++	// removeOrphanBlock is idempotent, so re-processing an already removed
++	// orphan is harmless.
++	// 先快照依赖列表再逐个删除,避免 removeOrphanBlock 修改共享底层数组
++	// 干扰遍历;removeOrphanBlock 幂等,重复处理已删孤儿无害。
++	b.orphanLock.RLock()
++	orphans := make([]*orphanBlock, 0, len(b.prevOrphans[*parent]))
++	orphans = append(orphans, b.prevOrphans[*parent]...)
++	b.orphanLock.RUnlock()
++
++	for _, orphan := range orphans {
++		b.removeOrphanBlock(orphan)
++	}
++}
++
  // ReconsiderBlock reconsiders the validity of the block with the given hash.
  //
  // This function is safe for concurrent access.
-@@ -2104,7 +2649,7 @@ func (b *BlockChain) ReconsiderBlock(hash *chainhash.Hash) error {
+@@ -2104,7 +2744,7 @@ func (b *BlockChain) ReconsiderBlock(hash *chainhash.Hash) error {
  	// The block status changes here without being flushed so we immediately flush
  	// the blockindex after we call this function.
  	_, _, _, err := b.verifyReorganizationValidity(detachNodes, attachNodes)
@@ -5310,7 +5569,7 @@ index fd110458..474e3885 100644
  		log.Warnf("Error flushing block index changes to disk: %v", writeErr)
  	}
  	if err != nil {
-@@ -2154,6 +2699,22 @@ type Config struct {
+@@ -2154,6 +2794,22 @@ type Config struct {
  	// This field is required.
  	UtxoCacheMaxSize uint64
  
@@ -5333,7 +5592,7 @@ index fd110458..474e3885 100644
  	// Interrupt specifies a channel the caller can close to signal that
  	// long running operations, such as catching up indexes or performing
  	// database migrations, should be interrupted.
-@@ -2264,8 +2825,10 @@ func New(config *Config) (*BlockChain, error) {
+@@ -2264,8 +2920,10 @@ func New(config *Config) (*BlockChain, error) {
  		index:               newBlockIndex(config.DB, params),
  		utxoCache:           newUtxoCache(config.DB, config.UtxoCacheMaxSize),
  		hashCache:           config.HashCache,
@@ -5344,7 +5603,7 @@ index fd110458..474e3885 100644
  		orphans:             make(map[chainhash.Hash]*orphanBlock),
  		prevOrphans:         make(map[chainhash.Hash][]*orphanBlock),
  		warningCaches:       newThresholdCaches(vbNumBits),
-@@ -2273,6 +2836,26 @@ func New(config *Config) (*BlockChain, error) {
+@@ -2273,6 +2931,26 @@ func New(config *Config) (*BlockChain, error) {
  		pruneTarget:         config.Prune,
  	}
  
@@ -5371,7 +5630,7 @@ index fd110458..474e3885 100644
  	// Ensure all the deployments are synchronized with our clock if
  	// needed.
  	for _, deployment := range b.chainParams.Deployments {
-@@ -2294,6 +2877,10 @@ func New(config *Config) (*BlockChain, error) {
+@@ -2294,6 +2972,10 @@ func New(config *Config) (*BlockChain, error) {
  		return nil, err
  	}
  
@@ -5383,7 +5642,7 @@ index fd110458..474e3885 100644
  	if err := b.maybeUpgradeDbBuckets(config.Interrupt); err != nil {
  		return nil, err
 diff --git a/blockchain/blockindex.go b/blockchain/blockindex.go
-index b40dcdd9..e78229b0 100644
+index 7e53ab53..0cabf4e4 100644
 --- a/blockchain/blockindex.go
 +++ b/blockchain/blockindex.go
 @@ -19,6 +19,18 @@ import (
@@ -5548,10 +5807,35 @@ index b40dcdd9..e78229b0 100644
  	index map[chainhash.Hash]*blockNode
  	dirty map[*blockNode]struct{}
  }
-@@ -427,6 +515,264 @@ func (bi *blockIndex) addNode(node *blockNode) {
+@@ -427,6 +515,289 @@ func (bi *blockIndex) addNode(node *blockNode) {
  	bi.index[node.hash] = node
  }
  
++// removeNode removes the block node identified by the provided hash from the
++// in-memory index and the dirty set.  It is used to fully delete a disconnected
++// block (e.g. a locally-mined block no peer shares) after a reorg; unlike
++// evictWindow this is an explicit removal of one node, not a window prune.
++//
++// This function is NOT safe for concurrent access.
++func (bi *blockIndex) removeNode(hash *chainhash.Hash) {
++	node := bi.index[*hash]
++	if node == nil {
++		return
++	}
++	delete(bi.index, *hash)
++	delete(bi.dirty, node)
++}
++
++// RemoveNode removes the block node identified by the provided hash from the
++// in-memory index and the dirty set.
++//
++// This function is safe for concurrent access.
++func (bi *blockIndex) RemoveNode(hash *chainhash.Hash) {
++	bi.Lock()
++	bi.removeNode(hash)
++	bi.Unlock()
++}
++
 +// setWindow enables or disables the in-memory header window.  When windowSize
 +// is greater than zero, the block index keeps only the most recent windowSize
 +// blocks from each active chain tip in memory and evicts everything below that
@@ -5813,7 +6097,7 @@ index b40dcdd9..e78229b0 100644
  // NodeStatus provides concurrent-safe access to the status field of a node.
  //
  // This function is safe for concurrent access.
-@@ -476,7 +822,13 @@ func (bi *blockIndex) InactiveTips(bestChain *chainView) []*blockNode {
+@@ -476,7 +847,13 @@ func (bi *blockIndex) InactiveTips(bestChain *chainView) []*blockNode {
  		found := bestChain.Contains(node)
  		if !found {
  			orphans[hash] = node
@@ -5828,7 +6112,7 @@ index b40dcdd9..e78229b0 100644
  		}
  	}
  
-@@ -500,57 +852,109 @@ func (bi *blockIndex) InactiveTips(bestChain *chainView) []*blockNode {
+@@ -500,57 +877,109 @@ func (bi *blockIndex) InactiveTips(bestChain *chainView) []*blockNode {
  
  // flushToDB writes all dirty block nodes to the database. If all writes
  // succeed, this clears the dirty set.
@@ -5977,7 +6261,7 @@ index b40dcdd9..e78229b0 100644
 +	}
  }
 diff --git a/blockchain/blockindex_test.go b/blockchain/blockindex_test.go
-index 02209da7..1d949461 100644
+index fdb71cae..71636d2b 100644
 --- a/blockchain/blockindex_test.go
 +++ b/blockchain/blockindex_test.go
 @@ -5,11 +5,18 @@
@@ -7005,7 +7289,7 @@ index 02209da7..1d949461 100644
 +	}
 +}
 diff --git a/blockchain/chainview.go b/blockchain/chainview.go
-index dd70ab2d..dbd932c6 100644
+index 36b05d96..0f2cfbc6 100644
 --- a/blockchain/chainview.go
 +++ b/blockchain/chainview.go
 @@ -43,9 +43,17 @@ func fastLog2Floor(n uint32) uint8 {
@@ -7220,7 +7504,7 @@ index dd70ab2d..dbd932c6 100644
  			node = node.Ancestor(height)
  		}
 diff --git a/blockchain/chainview_test.go b/blockchain/chainview_test.go
-index d35383a5..138fa898 100644
+index 33e7e045..92a73d60 100644
 --- a/blockchain/chainview_test.go
 +++ b/blockchain/chainview_test.go
 @@ -413,6 +413,95 @@ testLoop:
@@ -7320,7 +7604,7 @@ index d35383a5..138fa898 100644
  // as expected.
  func TestChainViewNil(t *testing.T) {
 diff --git a/blockchain/common_test.go b/blockchain/common_test.go
-index 7b3bdc49..c78904fc 100644
+index 298390dc..5f8a0877 100644
 --- a/blockchain/common_test.go
 +++ b/blockchain/common_test.go
 @@ -453,10 +453,22 @@ func newBlock(chain *BlockChain, prev *btcutil.Block,
@@ -7349,7 +7633,7 @@ index 7b3bdc49..c78904fc 100644
  		ts = prev.MsgBlock().Header.Timestamp.Add(time.Second)
  	}
 diff --git a/blockchain/internal/testhelper/common.go b/blockchain/internal/testhelper/common.go
-index dedc9420..a0caf73d 100644
+index de90f596..38fc05d7 100644
 --- a/blockchain/internal/testhelper/common.go
 +++ b/blockchain/internal/testhelper/common.go
 @@ -8,6 +8,7 @@ import (

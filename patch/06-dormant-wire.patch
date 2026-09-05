@@ -1,5 +1,5 @@
 diff --git a/wire/blockheader.go b/wire/blockheader.go
-index dd0d716e..2905b144 100644
+index d357e3ee..76ad8793 100644
 --- a/wire/blockheader.go
 +++ b/wire/blockheader.go
 @@ -43,7 +43,7 @@ type BlockHeader struct {
@@ -12,7 +12,7 @@ index dd0d716e..2905b144 100644
  	return chainhash.DoubleHashRaw(func(w io.Writer) error {
  		return writeBlockHeader(w, 0, h)
 diff --git a/wire/msgversion.go b/wire/msgversion.go
-index 957bae39..f79995d7 100644
+index e6e5fe29..4f039ca3 100644
 --- a/wire/msgversion.go
 +++ b/wire/msgversion.go
 @@ -16,8 +16,10 @@ import (

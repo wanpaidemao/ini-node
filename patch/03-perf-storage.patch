@@ -1,5 +1,5 @@
 diff --git a/blockchain/utxocache.go b/blockchain/utxocache.go
-index a423ad43..10704e86 100644
+index 9aaf5406..116bdb4f 100644
 --- a/blockchain/utxocache.go
 +++ b/blockchain/utxocache.go
 @@ -5,7 +5,6 @@
@@ -217,7 +217,7 @@ index a423ad43..10704e86 100644
  	}
  	log.Debug("UTXO state reconstruction done")
 diff --git a/blockchain/utxocache_test.go b/blockchain/utxocache_test.go
-index f0cb76dc..f8ed6da0 100644
+index 693148d5..2f95bcbf 100644
 --- a/blockchain/utxocache_test.go
 +++ b/blockchain/utxocache_test.go
 @@ -961,3 +961,153 @@ func TestInitConsistentState(t *testing.T) {
@@ -375,7 +375,7 @@ index f0cb76dc..f8ed6da0 100644
 +	}
 +}
 diff --git a/blockchain/thresholdstate.go b/blockchain/thresholdstate.go
-index 68ba33e6..a1468598 100644
+index 39c606d7..413b851f 100644
 --- a/blockchain/thresholdstate.go
 +++ b/blockchain/thresholdstate.go
 @@ -210,7 +210,8 @@ func thresholdStateTransition(state ThresholdState, prevNode *blockNode,
@@ -428,7 +428,7 @@ index 68ba33e6..a1468598 100644
  	// block’s height is at or above that threshold, then force the state
  	// to Active.
 diff --git a/blockchain/checkpoints.go b/blockchain/checkpoints.go
-index 2ad17841..f59aa70d 100644
+index 796261bf..428b1b2b 100644
 --- a/blockchain/checkpoints.go
 +++ b/blockchain/checkpoints.go
 @@ -144,6 +144,13 @@ func (b *BlockChain) findPreviousCheckpoint() (*blockNode, error) {
@@ -446,7 +446,7 @@ index 2ad17841..f59aa70d 100644
  		return nil, AssertError(fmt.Sprintf("findPreviousCheckpoint "+
  			"failed lookup of known good block node %s",
 diff --git a/database/ffldb/db.go b/database/ffldb/db.go
-index caeb5fd2..57b6f47f 100644
+index a5f8efa6..44dbb1e7 100644
 --- a/database/ffldb/db.go
 +++ b/database/ffldb/db.go
 @@ -1230,6 +1230,34 @@ func (tx *transaction) HasBlocks(hashes []chainhash.Hash) ([]bool, error) {
@@ -659,7 +659,7 @@ index caeb5fd2..57b6f47f 100644
  
  	// Create the block store which includes scanning the existing flat
 diff --git a/database/ffldb/whitebox_test.go b/database/ffldb/whitebox_test.go
-index 2e164afe..63d13ec3 100644
+index fef40e7f..a85f2cf9 100644
 --- a/database/ffldb/whitebox_test.go
 +++ b/database/ffldb/whitebox_test.go
 @@ -703,3 +703,78 @@ func TestFailureScenarios(t *testing.T) {
@@ -742,7 +742,7 @@ index 2e164afe..63d13ec3 100644
 +	}
 +}
 diff --git a/database/interface.go b/database/interface.go
-index ec1d242c..bf1f356d 100644
+index 674b9962..f431500c 100644
 --- a/database/interface.go
 +++ b/database/interface.go
 @@ -239,6 +239,19 @@ type Tx interface {

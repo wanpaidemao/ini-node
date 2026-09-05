@@ -7,6 +7,7 @@ package cpuminer
 import (
 	"errors"
 	"fmt"
+	"math/big"
 	"math/rand"
 	"runtime"
 	"sync"
@@ -222,6 +223,18 @@ func (m *CPUMiner) solveBlock(msgBlock *wire.MsgBlock, blockHeight int32,
 	header := &msgBlock.Header
 	targetDifficulty := blockchain.CompactToBig(header.Bits)
 
+	// Reuse a single big.Int for the hash comparison instead of allocating
+	// one per nonce via blockchain.HashToBig: the miner runs one hash per
+	// nonce iteration, making this the hottest allocation site in the miner
+	// loop.  HashToBig allocates a fresh big.Int on every call; here the
+	// bytes are reversed in place (HashToBig's little-endian -> big-endian
+	// conversion) and SetBytes reuses the same instance.
+	// 复用一个 big.Int 做哈希比较,而不是像 blockchain.HashToBig 那样每个
+	// nonce 分配一个新的:矿工每个 nonce 迭代跑一次哈希,这是矿工循环里最
+	// 热的分配点。这里原地反转字节(HashToBig 的 little-endian -> big-endian
+	// 转换),SetBytes 复用同一实例。
+	hashNum := new(big.Int)
+
 	// Initial state.
 	lastGenerated := time.Now()
 	lastTxUpdate := m.g.TxSource().LastUpdated()
@@ -280,8 +293,16 @@ func (m *CPUMiner) solveBlock(msgBlock *wire.MsgBlock, blockHeight int32,
 			hashesCompleted += 2
 
 			// The block is solved when the new block hash is less
-			// than the target difficulty.  Yay!
-			if blockchain.HashToBig(&hash).Cmp(targetDifficulty) <= 0 {
+			// than the target difficulty.  Yay!  Reuse hashNum instead
+			// of allocating a fresh big.Int per nonce: reverse the
+			// little-endian hash into the big-endian byte order that
+			// big.Int.SetBytes expects, then compare against the target.
+			for j := 0; j < len(hash)/2; j++ {
+				hash[j], hash[len(hash)-1-j] =
+					hash[len(hash)-1-j], hash[j]
+			}
+			hashNum.SetBytes(hash[:])
+			if hashNum.Cmp(targetDifficulty) <= 0 {
 				m.updateHashes <- hashesCompleted
 				return true
 			}

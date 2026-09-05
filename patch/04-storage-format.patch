@@ -1,5 +1,5 @@
 diff --git a/blockchain/chainio.go b/blockchain/chainio.go
-index be5c9a20..0f7de111 100644
+index a2319469..7fcf2d54 100644
 --- a/blockchain/chainio.go
 +++ b/blockchain/chainio.go
 @@ -7,8 +7,11 @@ package blockchain
@@ -694,7 +694,7 @@ index be5c9a20..0f7de111 100644
 +					parent = lastNode
 +				} else if parent = b.index.LookupNode(&header.PrevBlock); parent != nil {
 +					// Side chain within the window.
-+				}
+ 				}
 +				node := new(blockNode)
 +				initBlockNode(node, header, parent)
 +				node.height = h
@@ -703,7 +703,7 @@ index be5c9a20..0f7de111 100644
 +					// Boundary anchor: seed with the snapshot's cumulative
 +					// work (initBlockNode allocated a pooled workSum).
 +					node.workSum = node.workSum.Set(snapWork)
- 				}
++				}
 +				b.index.addNode(node)
 +				lastNode = node
 +				i = h
@@ -1009,7 +1009,23 @@ index be5c9a20..0f7de111 100644
  func deserializeBlockRow(blockRow []byte) (*wire.BlockHeader, blockStatus, error) {
  	buffer := bytes.NewReader(blockRow)
  
-@@ -1468,12 +2270,109 @@ func blockIndexKey(blockHash *chainhash.Hash, blockHeight uint32) []byte {
+@@ -1445,6 +2247,15 @@ func dbStoreBlockNode(dbTx database.Tx, node *blockNode) error {
+ 	return blockIndexBucket.Put(key, value)
+ }
+ 
++// dbRemoveBlockNode removes a block header entry from the block index bucket.
++// It is used to fully delete a disconnected block (e.g. a locally-mined block
++// no peer shares) after a reorg, so a restart cannot re-materialize the header.
++func dbRemoveBlockNode(dbTx database.Tx, hash *chainhash.Hash, height int32) error {
++	blockIndexBucket := dbTx.Metadata().Bucket(blockIndexBucketName)
++	key := blockIndexKey(hash, uint32(height))
++	return blockIndexBucket.Delete(key)
++}
++
+ // dbStoreBlock stores the provided block in the database if it is not already
+ // there. The full block data is written to ffldb.
+ func dbStoreBlock(dbTx database.Tx, block *btcutil.Block) error {
+@@ -1468,12 +2279,109 @@ func blockIndexKey(blockHash *chainhash.Hash, blockHeight uint32) []byte {
  	return indexKey
  }
  
@@ -1121,7 +1137,7 @@ index be5c9a20..0f7de111 100644
  	if node == nil {
  		str := fmt.Sprintf("no block at height %d exists", blockHeight)
  		return nil, errNotInMainChain(str)
-@@ -1489,15 +2388,57 @@ func (b *BlockChain) BlockByHeight(blockHeight int32) (*btcutil.Block, error) {
+@@ -1489,15 +2397,57 @@ func (b *BlockChain) BlockByHeight(blockHeight int32) (*btcutil.Block, error) {
  	return block, err
  }
  
@@ -1181,7 +1197,7 @@ index be5c9a20..0f7de111 100644
  		str := fmt.Sprintf("block %s is not in the main chain", hash)
  		return nil, errNotInMainChain(str)
  	}
-@@ -1511,3 +2452,32 @@ func (b *BlockChain) BlockByHash(hash *chainhash.Hash) (*btcutil.Block, error) {
+@@ -1511,3 +2461,32 @@ func (b *BlockChain) BlockByHash(hash *chainhash.Hash) (*btcutil.Block, error) {
  	})
  	return block, err
  }

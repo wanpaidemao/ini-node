@@ -8,13 +8,16 @@
 
 | 补丁 | 内容 | 类别 |
 |------|------|------|
-| `01-consensus.patch` | 共识差异（difficulty/validate/merkle/process/accept/error/mining/txscript/chaincfg） | 共识 |
+| `01-consensus.patch` | 共识差异（difficulty/validate/merkle/process/accept/error/mining/pow/txscript/chaincfg） | 共识 |
 | `02-perf-sync.patch` | 性能自研-同步（netsync/chain/blockindex/chainview） | 性能 |
 | `03-perf-storage.patch` | 性能自研-存储（utxocache/ffldb/thresholdstate/checkpoints） | 性能 |
 | `04-storage-format.patch` | 存储/磁盘格式（chainio header 索引） | 存储 |
 | `05-assembly-rpc.patch` | 装配/RPC（server/config/btcd/rpcserver/log/signal/version…） | 装配 |
 | `06-dormant-wire.patch` | 休眠子模块修改（wire/blockheader、wire/msgversion） | 子模块 |
-| `07-misc.patch` | 项目杂项（.gitignore/README/Dockerfile/sample-conf/go.mod） | 杂项 |
+| `07-misc.patch` | 项目杂项（.gitignore/README/Dockerfile/sample-conf/go.mod/btcd-runtime.ini） | 杂项 |
+
+> fork 独有文件（上游无对应文件，如 `pow/pow.go`、`btcd-runtime.ini`）以
+> 标准 new-file 补丁存档，重放时由 `git apply` 创建。
 
 ## 重新生成 / Regenerate
 

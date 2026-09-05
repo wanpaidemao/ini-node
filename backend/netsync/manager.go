@@ -139,8 +139,24 @@ const (
 	// by the network; a forged chain's blocks either do not exist on any peer
 	// or do not link to the applied tip, so the download would spin forever.
 	// The window is deliberately much larger than blockSliceStallTimeout so a
-	// merely slow peer is never misjudged.
-	blockUnavailableTimeout = 10 * time.Minute
+	// merely slow peer is never misjudged.  It is, however, well below the old
+	// 10 minutes: the strong divergence detectors (best-tip-vs-header chain,
+	// peer-height, and the front-unreachable votes) typically fire first, but
+	// this block-side timer is the last-resort fallback for a lone/competing
+	// miner whose own block was orphaned -- leaving it at 10 minutes made a
+	// mining-loss stall last ~10 minutes before the node even attempted to
+	// recover.  At 90s (and with the fabricated blocks hard-deleted on rollback)
+	// a lost block race heals in ~1.5 minutes instead.
+	blockUnavailableTimeout = 90 * time.Second
+
+	// orphanFloodThreshold is how many consecutive orphan blocks must arrive
+	// before the orphan-flood divergence check runs immediately (rather than
+	// waiting for the next 30s stall sample).  A lost block race turns every
+	// real main-chain block above the fabricated tip into an orphan, so a
+	// flood is a strong early fingerprint; the check itself only rolls back
+	// when the DB height index disagrees with the tip, so a mere burst of
+	// out-of-order slices during a healthy parallel download cannot misfire.
+	orphanFloodThreshold = 50
 
 	// maxFabricatedRollbacks caps how many times the fabricated-header-chain
 	// rollback may target the same height before it is refused.  The rollback
@@ -581,6 +597,18 @@ type SyncManager struct {
 	// 10-minute block-side timer (P4).  Only touched from the blockHandler
 	// goroutine.
 	frontUnreachable map[int32]map[string]time.Time
+
+	// orphanFloodCount counts consecutive orphan blocks received while the
+	// block download has not advanced.  An orphan flood whose parents are all
+	// unknown is the classic fingerprint of a lost block race (a locally-mined
+	// block sits on the best-chain tip, so every real main-chain block above
+	// it arrives as an orphan).  Once the count crosses orphanFloodThreshold,
+	// run a divergence check immediately instead of waiting for the next stall
+	// sample, so the rollback fires within seconds even when the header chain
+	// has not yet advanced past the tip (the HeaderChainDiverged blind spot).
+	// Reset whenever the download makes progress.  Only touched from the
+	// blockHandler goroutine.
+	orphanFloodCount int32
 
 	// lastUtxoFlush is the last time the UTXO cache was asked to flush.
 	// It is used to trigger periodic flushes even while in initial block
@@ -1382,12 +1410,20 @@ func (sm *SyncManager) handleStallSample() {
 			peerHeight = sm.syncPeer.StartingHeight()
 		}
 		// Only fire once the download has demonstrably stalled (the front
-		// height has not moved for over a minute), so a normal catch-up that
-		// is merely behind the peer is not mistaken for a fork.
-		// 仅当下载确实停滞(front 高度超过一分钟未推进)才触发,避免把正常
-		// 追赶(只是落后于对等点)误判为分叉。
+		// height has not moved for 20s), so a normal catch-up that is merely
+		// behind the peer is not mistaken for a fork.  20s is well below the
+		// 1-minute window that predates the orphan-flood early signal: the
+		// peer-height detector is a pure network-side comparison (the peer's
+		// advertised height cannot be polluted by a local fork) and the
+		// stall sample runs every 30s, so a sub-sample window cannot misfire
+		// more often, while a lost block race is caught a full minute sooner.
+		// 仅当下载确实停滞(front 高度超过 20 秒未推进)才触发,避免把正常
+		// 追赶(只是落后于对等点)误判为分叉。20s 远低于原来的 1 分钟:peer
+		// 高度检测是纯网络侧比较(对等点通告高度不可能被本地分叉污染),且
+		// 停滞采样每 30s 才跑一次,子采样窗口不会增加误判,而竞争失败能
+		// 提前整整一分钟被捕获。
 		stalled := bestTip.Height == sm.blockMissingHeight &&
-			time.Since(sm.blockMissingSince) > time.Minute
+			time.Since(sm.blockMissingSince) > 20*time.Second
 		if peerHeight > bestTip.Height && stalled {
 			log.Warnf("Best chain tip (height %d) is %d blocks behind the "+
 				"sync peer (height %d) with the download stalled -- "+
@@ -1418,9 +1454,9 @@ func (sm *SyncManager) handleStallSample() {
 	if sm.headerSync != nil && sm.chain.HeaderChainDiverged() {
 		forkHeight := sm.chain.BestChainHeaderForkHeight()
 		log.Warnf("Best chain tip diverges from the header chain at height "+
-			"%d (fork at %d) -- fabricated/forked tip, rolling back early",
+			"%d (fork at %d) -- fabricated/forked tip, rolling back to fork",
 			sm.chain.BestSnapshot().Height, forkHeight)
-		sm.rollbackFabricatedHeaderChain()
+		sm.rollbackToForkPoint(forkHeight)
 	}
 
 	// Detect a fabricated or forked header chain: the block download has not
@@ -1880,6 +1916,50 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 
 	// Request the parents for the orphan block from the peer that sent it.
 	if isOrphan {
+		// Fast divergence detection: an orphan arriving while the best-chain
+		// tip diverges from the network-projected header chain means the
+		// local tip is a fabricated/forked block (e.g. a lost block race
+		// where the locally-mined sibling no peer's chain contains).  Roll
+		// back immediately instead of waiting for the next 30s stall sample
+		// so block download resumes within seconds, not ~1.5 minutes.
+		// 快速分叉检测:孤儿到达时若 best chain tip 已与(网络投影的)header
+		// 链分叉,说明本地 tip 是伪造/分叉块(如竞争失败,本地挖出的兄弟块
+		// 无对等点主链包含)。立即回滚,而不是等下一个 30 秒停滞采样——
+		// block 下载秒级恢复,而不是约 1.5 分钟。
+		if sm.chain.HeaderChainDiverged() {
+			forkHeight := sm.chain.BestChainHeaderForkHeight()
+			log.Warnf("Orphan %v received while best-chain tip diverges "+
+				"from header chain (fork at %d) -- fabricated/forked tip, "+
+				"rolling back to fork", blockHash, forkHeight)
+			sm.rollbackToForkPoint(forkHeight)
+		}
+
+		// Orphan-flood early signal: count consecutive orphans; once the
+		// threshold is crossed, compare the DB height index against the tip
+		// immediately.  This catches the lost-block-race fingerprint within
+		// seconds even when the header chain has not yet advanced past the
+		// tip (HeaderChainDiverged above requires the header chain to lead).
+		// The check only rolls back when the DB index disagrees, so a burst
+		// of out-of-order slices during a healthy parallel download cannot
+		// misfire.
+		// 孤儿洪流早期信号:累计连续孤儿数,越过阈值后立即把 DB 高度索引与
+		// tip 对比。这能在 header 链尚未越过 tip(上方 HeaderChainDiverged
+		// 需要 header 链领先)时,于数秒内捕获竞争失败的指纹。仅当 DB 索引
+		// 与 tip 不一致才回滚,正常并行下载的乱序突发不会误触发。
+		sm.orphanFloodCount++
+		if sm.orphanFloodCount >= orphanFloodThreshold {
+			sm.orphanFloodCount = 0
+			bestTip := sm.chain.BestSnapshot()
+			if dbHash, err := sm.chain.MainChainHashByHeight(bestTip.Height); err == nil &&
+				!dbHash.IsEqual(&bestTip.Hash) {
+				log.Warnf("Orphan flood (%d+) while best-chain tip %v (height "+
+					"%d) is not the main-chain block %v -- fabricated/forked "+
+					"tip, rolling back early", orphanFloodThreshold,
+					bestTip.Hash, bestTip.Height, dbHash)
+				sm.rollbackFabricatedHeaderChain()
+			}
+		}
+
 		// We've just received an orphan block from a peer. In order
 		// to update the height of the peer, we try to extract the
 		// block height from the scriptSig of the coinbase transaction.
@@ -1935,6 +2015,11 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 
 		// Clear the rejected transactions.
 		sm.rejectedTxns = make(map[chainhash.Hash]struct{})
+
+		// The download made progress (a block was connected): reset the
+		// orphan-flood counter so a healthy run never accumulates stale votes.
+		// 下载有进展(块被连接):重置孤儿洪流计数,正常运行的累计不会残留。
+		sm.orphanFloodCount = 0
 	}
 
 	// Update the block height for this peer. But only send a message to
@@ -3244,8 +3329,15 @@ func (sm *SyncManager) rollbackFabricatedHeaderChain() {
 	log.Warnf("Rolled back fabricated header chain to height %d -- "+
 		"restarting header/block download", rollbackHeight)
 
-	// 3. Tear down all in-flight download state so the next fetchHeaders
-	// starts from a clean slate at the confirmed height.
+	// 3-4. Tear down in-flight download state and restart from the rebuilt
+	// best-header tip.
+	sm.resetDownloadState()
+}
+
+// resetDownloadState tears down all in-flight download state and restarts the
+// sync from the current best-header tip.  It is shared by the explicit
+// fork-point rollback and the generic fabricated-header-chain rollback.
+func (sm *SyncManager) resetDownloadState() {
 	sm.headerSync = nil
 	sm.blockSync = nil
 	sm.blockSyncState = nil
@@ -3257,9 +3349,24 @@ func (sm *SyncManager) rollbackFabricatedHeaderChain() {
 	}
 	sm.syncPeer = nil
 	sm.ibdMode = true
-
-	// 4. Restart the sync from the rebuilt best-header tip.
 	sm.startSync()
+}
+
+// rollbackToForkPoint rolls the header chain back to an explicit fork height in
+// one step, mirroring umami's ActivateBestChain: the best-chain tip is known to
+// diverge from the (network-projected) header chain at forkHeight, so there is
+// no need to deepen the cut one block at a time through repeated stall timeouts.
+// It reuses InvalidateHeaderChain + the shared download-state reset, but jumps
+// straight to the fork instead of walking down from the tip.
+func (sm *SyncManager) rollbackToForkPoint(forkHeight int32) {
+	if err := sm.chain.InvalidateHeaderChain(forkHeight); err != nil {
+		log.Errorf("Failed to roll back header chain to fork height %d: %v",
+			forkHeight, err)
+		return
+	}
+	log.Warnf("Rolled back header chain to fork point %d -- "+
+		"restarting header/block download", forkHeight)
+	sm.resetDownloadState()
 }
 
 // reissueStaleHeaderRanges reassigns any in-flight header range that has not
@@ -3841,15 +3948,57 @@ out:
 			case processBlockMsg:
 				_, isOrphan, err := sm.chain.ProcessBlock(
 					msg.block, msg.flags)
-				// TEMP DEBUG: trace block processing outcome / 临时调试
-				log.Warnf("TEMP-DBG ProcessBlock hash=%s orphan=%v err=%v", msg.block.Hash(), isOrphan, err)
 				if err != nil {
+					// A miner-submitted block being rejected for not
+					// extending the network-confirmed chain is an
+					// immediate, authoritative signal that the local
+					// best-chain tip has forked or is fabricated (a lost
+					// block race): roll back at once instead of waiting
+					// for the orphan-flood counter or the next stall
+					// sample, so mining resumes on the real chain within
+					// seconds.
+					// 矿工提交的块因不扩展网络确认链而被拒,是本地 best
+					// chain tip 已分叉/伪造的即时权威信号(竞争失败):
+					// 立即回滚,而不是等孤儿洪流计数或下一次停滞采样,
+					// 让挖矿在数秒内回到真实链上继续。
+					if msg.flags&blockchain.BFMinerSubmit ==
+						blockchain.BFMinerSubmit {
+						if rerr, ok := err.(blockchain.RuleError); ok &&
+							rerr.ErrorCode ==
+								blockchain.ErrMinedBlockNotOnMainChain {
+							if sm.chain.HeaderChainDiverged() {
+								forkHeight :=
+									sm.chain.BestChainHeaderForkHeight()
+								log.Warnf("Miner-submitted block "+
+									"%v rejected: not on the "+
+									"network-confirmed chain -- "+
+									"rolling back to fork point %d",
+									msg.block.Hash(), forkHeight)
+								sm.rollbackToForkPoint(forkHeight)
+							} else {
+								bestTip := sm.chain.BestSnapshot()
+								if dbHash, derr := sm.chain.
+									MainChainHashByHeight(bestTip.Height); derr == nil &&
+									!dbHash.IsEqual(&bestTip.Hash) {
+									log.Warnf("Miner-submitted block "+
+										"%v rejected while best-chain "+
+										"tip %v (height %d) is not the "+
+										"main-chain block %v -- "+
+										"fabricated/forked tip, rolling "+
+										"back early",
+										msg.block.Hash(), bestTip.Hash,
+										bestTip.Height, dbHash)
+									sm.rollbackFabricatedHeaderChain()
+								}
+							}
+						}
+					}
 					msg.reply <- processBlockResponse{
 						isOrphan: false,
 						err:      err,
 					}
+					continue
 				}
-
 				msg.reply <- processBlockResponse{
 					isOrphan: isOrphan,
 					err:      nil,

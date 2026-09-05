@@ -2509,6 +2509,27 @@ func (b *BlockChain) InvalidateHeaderChain(rollbackHeight int32) error {
 	// prev 不匹配而成为孤儿,区块停止同步而区块头仍在前进(已观察到:分叉
 	// tip 处孤儿洪流、block 下载冻结在高度 44060190)。回退 bestChain 后,
 	// 重新派发的下载能从共享高度重连真实链。
+	//
+	// 用 reorganizeChain 正确断开 rollbackHeight 之上的错块,回滚其 UTXO。
+	// 原先直接 SetTip 的捷径会跳过 UTXO 回滚:本地挖错块若与网络主链块
+	// 包含相同交易(同一 mempool 选币),错块的花费会残留,导致重连主链块时
+	// input 已被花、连接失败。detach 顺序从 tip 往下,与 InvalidateBlock 一致。
+	detachNodes := list.New()
+	for n := b.bestChain.Tip(); n != nil && n.height > rollbackHeight; n = n.parent {
+		detachNodes.PushBack(n)
+	}
+	if detachNodes.Len() > 0 {
+		if err := b.reorganizeChain(detachNodes, list.New()); err != nil {
+			return err
+		}
+
+		// 断开后彻底删除这些错块:payload + blockheaderidx + 内存 node,对齐
+		// umami 把 BLOCK_FAILED_VALID 块从 m_block_index 移除。
+		if err := b.removeDisconnectedBlocks(detachNodes); err != nil {
+			return err
+		}
+	}
+
 	b.bestChain.SetTip(rollbackNode)
 
 	// Rebuild the best-block state snapshot for the rolled-back tip.  The
@@ -2570,6 +2591,80 @@ func (b *BlockChain) InvalidateHeaderChain(rollbackHeight int32) error {
 	// Persist the invalidated statuses so a restart keeps the bogus segment
 	// rejected instead of reapplying it.
 	return b.index.flushToDB(false)
+}
+
+// removeDisconnectedBlocks fully deletes the blocks in the given list (which
+// must already have been disconnected from the best chain) by purging their
+// payload, block-index header row, and in-memory node.  This mirrors umami
+// (Bitcoin Core) removing a BLOCK_FAILED_VALID block from m_block_index: a
+// locally-mined block that no peer's chain contains can never join the main
+// chain, so it is reclaimed instead of lingering as a side-chain zombie that
+// costs disk and can be re-validated after a restart.
+//
+// The caller must hold the chain lock.
+func (b *BlockChain) removeDisconnectedBlocks(nodes *list.List) error {
+	// Delete all payloads and block-index header rows in ONE transaction
+	// instead of one db.Update per block: each Update is a full write
+	// transaction (sync/commit overhead), and the rollback runs while
+	// holding the chain write lock, so every extra transaction directly
+	// lengthens the RPC read-lock stall during a reorg rollback.
+	// 把所有 payload 与 block-index 表项放在**单个**事务里删除,而不是每块
+	// 一个 db.Update:每个 Update 都是一次完整写事务(同步/提交开销),而回滚
+	// 全程持有链写锁,多一个事务就多一段 RPC 读锁阻塞时间。
+	if err := b.db.Update(func(dbTx database.Tx) error {
+		for e := nodes.Front(); e != nil; e = e.Next() {
+			node := e.Value.(*blockNode)
+			hash := node.hash
+			if err := dbTx.DeleteBlock(&hash); err != nil {
+				return err
+			}
+			if err := dbRemoveBlockNode(dbTx, &hash, node.height); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	// Drop the in-memory nodes so they can never be re-validated or re-flushed,
+	// and purge any orphans whose parent was just deleted: those orphans can
+	// never connect (their parent is gone for good), so keeping them would
+	// waste memory until their 1-hour expiration and could re-materialize a
+	// stale orphan chain after a restart.
+	// 删除内存节点使其永远不会被重新校验或落盘,同时清出刚被删除块为父的
+	// 孤儿:这些孤儿永远无法连接(父块已彻底删除),保留它们只会占用内存
+	// 直到 1 小时过期,并可能在重启后重新物化一条过期的孤儿链。
+	for e := nodes.Front(); e != nil; e = e.Next() {
+		node := e.Value.(*blockNode)
+		b.index.RemoveNode(&node.hash)
+		b.removeOrphansWithParent(&node.hash)
+	}
+	return b.index.flushToDB(false)
+}
+
+// removeOrphansWithParent removes every orphan block whose parent is the
+// passed hash.  It is used after a reorg rollback deletes the disconnected
+// blocks: orphans hanging off a deleted block can never be connected (their
+// parent no longer exists), so they are purged immediately instead of
+// lingering in the pool until their expiration.
+//
+// The caller must hold the chain lock; this function takes the orphan lock.
+func (b *BlockChain) removeOrphansWithParent(parent *chainhash.Hash) {
+	// Snapshot the dependency list before removing so the traversal is
+	// unaffected by removeOrphanBlock mutating the shared slice underneath.
+	// removeOrphanBlock is idempotent, so re-processing an already removed
+	// orphan is harmless.
+	// 先快照依赖列表再逐个删除,避免 removeOrphanBlock 修改共享底层数组
+	// 干扰遍历;removeOrphanBlock 幂等,重复处理已删孤儿无害。
+	b.orphanLock.RLock()
+	orphans := make([]*orphanBlock, 0, len(b.prevOrphans[*parent]))
+	orphans = append(orphans, b.prevOrphans[*parent]...)
+	b.orphanLock.RUnlock()
+
+	for _, orphan := range orphans {
+		b.removeOrphanBlock(orphan)
+	}
 }
 
 // ReconsiderBlock reconsiders the validity of the block with the given hash.

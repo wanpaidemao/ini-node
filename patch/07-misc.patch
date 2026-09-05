@@ -1,5 +1,5 @@
 diff --git a/.gitignore b/.gitignore
-index 6c5a1a77..02a1f7d3 100644
+index 605478ff..0f63facf 100644
 --- a/.gitignore
 +++ b/.gitignore
 @@ -6,8 +6,12 @@ btcd.db
@@ -16,7 +16,7 @@ index 6c5a1a77..02a1f7d3 100644
  # Compiled Object files, Static and Dynamic libs (Shared Objects)
  *.o
 diff --git a/README.md b/README.md
-index 53e7887c..6cd5a05b 100644
+index 74c29d05..e21f1f20 100644
 --- a/README.md
 +++ b/README.md
 @@ -1,121 +1,271 @@
@@ -373,7 +373,7 @@ index 53e7887c..6cd5a05b 100644
 +- `../../dev/sync-verification.md` — 主网 header 同步与交叉验证记录
 +- 参考实现：`../../backend/umami/`（C++，基于 Bitcoin Core 25）
 diff --git a/Dockerfile b/Dockerfile
-index 3ee61efc..e000ffb4 100644
+index a8d60db4..92207f27 100644
 --- a/Dockerfile
 +++ b/Dockerfile
 @@ -42,4 +42,4 @@ VOLUME ["/root/.btcd"]
@@ -383,7 +383,7 @@ index 3ee61efc..e000ffb4 100644
 -ENTRYPOINT ["btcd"]
 +ENTRYPOINT ["ini"]
 diff --git a/sample-btcd.conf b/sample-btcd.conf
-index 06521d01..0eda3bb6 100644
+index d12805ff..c35865f7 100644
 --- a/sample-btcd.conf
 +++ b/sample-btcd.conf
 @@ -107,7 +107,11 @@
@@ -400,22 +400,185 @@ index 06521d01..0eda3bb6 100644
  ; Disable banning of misbehaving peers.
  ; nobanning=1
 diff --git a/go.mod b/go.mod
-index 2bc5e307..eacc7b81 100644
+index feeb49b4..24456503 100644
 --- a/go.mod
 +++ b/go.mod
-@@ -2,10 +2,15 @@ module github.com/btcsuite/btcd
- 
- go 1.25.0
- 
+@@ -1,73 +1,87 @@
+-module github.com/btcsuite/btcd
+-
+-go 1.25.0
+-
+-require (
+-	github.com/btcsuite/btcd/address/v2 v2.0.0
+-	github.com/btcsuite/btcd/btcec/v2 v2.5.0
+-	github.com/btcsuite/btcd/btcutil/v2 v2.0.1
+-	github.com/btcsuite/btcd/chaincfg/v2 v2.0.0
+-	github.com/btcsuite/btcd/chainhash/v2 v2.0.0
+-	github.com/btcsuite/btcd/txscript/v2 v2.0.0
+-	github.com/btcsuite/btcd/v2transport v1.1.0
+-	github.com/btcsuite/btcd/wire/v2 v2.0.1
+-	github.com/btcsuite/btclog v1.0.0
+-	github.com/btcsuite/go-socks v0.0.0-20170105172521-4720035b7bfd
+-	github.com/btcsuite/websocket v0.0.0-20150119174127-31079b680792
+-	github.com/btcsuite/winsvc v1.0.0
+-	github.com/davecgh/go-spew v1.1.1
+-	github.com/decred/dcrd/lru v1.1.3
+-	github.com/gorilla/websocket v1.5.3
+-	github.com/jessevdk/go-flags v1.6.1
+-	github.com/jrick/logrotate v1.1.2
+-	github.com/stretchr/testify v1.10.0
+-	github.com/syndtr/goleveldb v1.0.1-0.20210819022825-2ae1ddf74ef7
+-	golang.org/x/crypto v0.40.0
+-	golang.org/x/sys v0.35.0
+-	golang.org/x/time v0.15.0
+-	pgregory.net/rapid v1.2.0
+-)
+-
+-require (
+-	github.com/aead/siphash v1.0.1 // indirect
+-	github.com/decred/dcrd/crypto/blake256 v1.1.0 // indirect
+-	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0 // indirect
+-	github.com/golang/snappy v1.0.0 // indirect
+-	github.com/kcalvinalvin/anet v0.0.0-20251112173137-d8ddc1f6dbee // indirect
+-	github.com/kkdai/bstream v1.0.0 // indirect
+-	github.com/pmezard/go-difflib v1.0.0 // indirect
+-	github.com/stretchr/objx v0.5.2 // indirect
+-	gopkg.in/yaml.v3 v3.0.1 // indirect
+-)
+-
+-// The retract statements below fixes an accidental push of the tags of a btcd
+-// fork.
+-retract (
+-	v0.18.1
+-	v0.18.0
+-	v0.17.1
+-	v0.17.0
+-	v0.16.5
+-	v0.16.4
+-	v0.16.3
+-	v0.16.2
+-	v0.16.1
+-	v0.16.0
+-
+-	v0.15.2
+-	v0.15.1
+-	v0.15.0
+-
+-	v0.14.7
+-	v0.14.6
+-	v0.14.6
+-	v0.14.5
+-	v0.14.4
+-	v0.14.3
+-	v0.14.2
+-	v0.14.1
+-
+-	v0.14.0
+-	v0.13.0-beta2
+-	v0.13.0-beta
+-)
++module github.com/btcsuite/btcd
++
++go 1.25.0
++
 +replace github.com/btcsuite/btcd/chaincfg/v2 => ./chaincfg
 +
 +replace github.com/btcsuite/btcd/txscript/v2 => ./txscript
 +
- require (
- 	github.com/btcsuite/btcd/address/v2 v2.0.0
- 	github.com/btcsuite/btcd/btcec/v2 v2.5.0
- 	github.com/btcsuite/btcd/btcutil/v2 v2.0.1
++// Local wire override: upstream btcd/wire keeps DefaultUserAgent="/btcwire:0.5.0/",
++// which would leak into every version handshake (AddUserAgent appends, it does
++// not replace). Our ./wire sets it to "/" so we advertise /ini:0.0.1/.
++// 本地 wire 覆盖:上游 btcd/wire 的 DefaultUserAgent 仍是 "/btcwire:0.5.0/",
++// 而 AddUserAgent 是追加不是替换,会导致广播值带 btcwire;本地 ./wire 已改为
++// "/",使本节点对外上报 /ini:0.0.1/。
++replace github.com/btcsuite/btcd/wire/v2 => ./wire
++
++require (
++	github.com/btcsuite/btcd/address/v2 v2.0.0
++	github.com/btcsuite/btcd/btcec/v2 v2.5.0
++	github.com/btcsuite/btcd/btcutil/v2 v2.0.1
 +	github.com/btcsuite/btcd/chaincfg/chainhash v1.2.0
- 	github.com/btcsuite/btcd/chaincfg/v2 v2.0.0
- 	github.com/btcsuite/btcd/chainhash/v2 v2.0.0
- 	github.com/btcsuite/btcd/txscript/v2 v2.0.0
++	github.com/btcsuite/btcd/chaincfg/v2 v2.0.0
++	github.com/btcsuite/btcd/chainhash/v2 v2.0.0
++	github.com/btcsuite/btcd/txscript/v2 v2.0.0
++	github.com/btcsuite/btcd/v2transport v1.1.0
++	github.com/btcsuite/btcd/wire/v2 v2.0.1
++	github.com/btcsuite/btclog v1.0.0
++	github.com/btcsuite/go-socks v0.0.0-20170105172521-4720035b7bfd
++	github.com/btcsuite/websocket v0.0.0-20150119174127-31079b680792
++	github.com/btcsuite/winsvc v1.0.0
++	github.com/davecgh/go-spew v1.1.1
++	github.com/decred/dcrd/lru v1.1.3
++	github.com/gorilla/websocket v1.5.3
++	github.com/jessevdk/go-flags v1.6.1
++	github.com/jrick/logrotate v1.1.2
++	github.com/stretchr/testify v1.10.0
++	github.com/syndtr/goleveldb v1.0.1-0.20210819022825-2ae1ddf74ef7
++	golang.org/x/crypto v0.40.0
++	golang.org/x/sys v0.35.0
++	golang.org/x/time v0.15.0
++	pgregory.net/rapid v1.2.0
++)
++
++require (
++	github.com/aead/siphash v1.0.1 // indirect
++	github.com/decred/dcrd/crypto/blake256 v1.1.0 // indirect
++	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0 // indirect
++	github.com/golang/snappy v1.0.0 // indirect
++	github.com/kcalvinalvin/anet v0.0.0-20251112173137-d8ddc1f6dbee // indirect
++	github.com/kkdai/bstream v1.0.0 // indirect
++	github.com/pmezard/go-difflib v1.0.0 // indirect
++	github.com/stretchr/objx v0.5.2 // indirect
++	github.com/tyler-smith/go-bip39 v1.1.0 // indirect
++	gopkg.in/yaml.v3 v3.0.1 // indirect
++)
++
++// The retract statements below fixes an accidental push of the tags of a btcd
++// fork.
++retract (
++	v0.18.1
++	v0.18.0
++	v0.17.1
++	v0.17.0
++	v0.16.5
++	v0.16.4
++	v0.16.3
++	v0.16.2
++	v0.16.1
++	v0.16.0
++
++	v0.15.2
++	v0.15.1
++	v0.15.0
++
++	v0.14.7
++	v0.14.6
++	v0.14.6
++	v0.14.5
++	v0.14.4
++	v0.14.3
++	v0.14.2
++	v0.14.1
++
++	v0.14.0
++	v0.13.0-beta2
++	v0.13.0-beta
++)
+diff --git a/dev/null b/btcd-runtime.ini
+new file mode 100644
+--- /dev/null
++++ b/btcd-runtime.ini
+@@ -0,0 +1,13 @@
++[Application Options]
++datadir=F:\dev\sugar\data
++headerwindow=50000
++maxpeers=8
++rpcuser=sugar
++rpcpass=sugar
++rpclisten=127.0.0.1:8334
++rpcmaxclients=32
++notls=1
++profile=6000
++upnp=1
++addcheckpoint=43760164:5765dce5eae082ee1e9a84bdff460979147117c0ffe5650dde5280585d40b883
++sugarindex=1

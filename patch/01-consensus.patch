@@ -1,5 +1,5 @@
 diff --git a/blockchain/difficulty.go b/blockchain/difficulty.go
-index a2117d72..f5ac97b5 100644
+index 5a73a48b..9b1b845c 100644
 --- a/blockchain/difficulty.go
 +++ b/blockchain/difficulty.go
 @@ -5,6 +5,7 @@
@@ -284,7 +284,7 @@ index a2117d72..f5ac97b5 100644
 +	return calcNextRequiredDifficulty(prevNode, timestamp, b)
 +}
 diff --git a/blockchain/validate.go b/blockchain/validate.go
-index 15f90086..abb05800 100644
+index 9902a765..4993f402 100644
 --- a/blockchain/validate.go
 +++ b/blockchain/validate.go
 @@ -15,15 +15,28 @@ import (
@@ -469,7 +469,7 @@ index 15f90086..abb05800 100644
  }
  
 diff --git a/blockchain/merkle.go b/blockchain/merkle.go
-index 8249e2ff..1f7251a6 100644
+index 991386cc..983c24b2 100644
 --- a/blockchain/merkle.go
 +++ b/blockchain/merkle.go
 @@ -245,14 +245,16 @@ func ValidateWitnessCommitment(blk *btcutil.Block) error {
@@ -517,7 +517,7 @@ index 8249e2ff..1f7251a6 100644
  	witnessNonce := coinbaseWitness[0]
  	if len(witnessNonce) != CoinbaseWitnessDataLen {
 diff --git a/blockchain/process.go b/blockchain/process.go
-index 87f4deb4..d78e244b 100644
+index ae07cd46..35d76807 100644
 --- a/blockchain/process.go
 +++ b/blockchain/process.go
 @@ -30,8 +30,29 @@ const (
@@ -550,10 +550,42 @@ index 87f4deb4..d78e244b 100644
  )
  
  // blockExists determines whether a block with the given hash exists either in
-@@ -165,9 +186,59 @@ func (b *BlockChain) ProcessBlock(block *btcutil.Block, flags BehaviorFlags) (bo
+@@ -165,9 +186,91 @@ func (b *BlockChain) ProcessBlock(block *btcutil.Block, flags BehaviorFlags) (bo
  		return false, false, ruleError(ErrDuplicateBlock, str)
  	}
  
++	// Handle orphan blocks before any expensive validation: a block whose
++	// parent is unknown cannot be connected yet, so defer the full
++	// proof-of-work check (the most expensive per-block validation, ~29ms of
++	// yespower) until the orphan is actually connected by
++	// processOrphans/maybeAcceptBlock below.  Only the cheap structural
++	// sanity checks run here (with the PoW check skipped), so an orphan
++	// flood (e.g. after a lost block race) cannot hold the chain write lock
++	// for ~29ms per block and stall every RPC reader.
++	// 在昂贵的校验之前先处理孤儿:父块未知的块无法立即连接,因此把最贵的
++	// PoW 检查(yespower,每次约 29ms)推迟到 processOrphans/maybeAcceptBlock
++	// 真正接入该孤儿时再做。这里只跑廉价的结构 sanity 检查并跳过 PoW,这样
++	// 孤儿洪流(如竞争失败后)不会以每块约 29ms 占用链写锁、阻塞所有 RPC 读。
++	prevHash := &block.MsgBlock().Header.PrevBlock
++	prevHashExists, err := b.blockExists(prevHash)
++	if err != nil {
++		return false, false, err
++	}
++	if !prevHashExists {
++		if err := checkBlockSanity(block, b.chainParams.PowLimit,
++			b.timeSource, flags|BFNoPoWCheck); err != nil {
++			// TEMP DEBUG: log the sanity-check rejection reason.
++			log.Warnf("TEMP-DBG checkBlockSanity-fail(orphan) hash=%s err=%v",
++				blockHash, err)
++			return false, false, err
++		}
++
++		log.Infof("Adding orphan block %v with parent %v", blockHash, prevHash)
++		b.addOrphanBlock(block)
++
++		return false, true, nil
++	}
++
 +	// Consensus-anchor fast path.  A block that connects to an already
 +	// known parent more than consensusPowSkipDepth below the header tip the
 +	// peers agreed on is in deep history: its hash is fixed by the shared
@@ -567,7 +599,7 @@ index 87f4deb4..d78e244b 100644
 +	// agreed header chain and its PoW was validated when the corresponding
 +	// block was processed at connect time; a mismatch (side chain / re-org
 +	// candidate) keeps the block fully validated.
-+	parentHash := &block.MsgBlock().Header.PrevBlock
++	parentHash := prevHash
 +	if prevNode := b.index.LookupNode(parentHash); prevNode != nil {
 +		height := prevNode.height + 1
 +		bestHeader := b.bestHeader.Tip()
@@ -610,8 +642,28 @@ index 87f4deb4..d78e244b 100644
  		return false, false, err
  	}
  
+@@ -211,19 +314,6 @@ func (b *BlockChain) ProcessBlock(block *btcutil.Block, flags BehaviorFlags) (bo
+ 		}
+ 	}
+ 
+-	// Handle orphan blocks.
+-	prevHash := &blockHeader.PrevBlock
+-	prevHashExists, err := b.blockExists(prevHash)
+-	if err != nil {
+-		return false, false, err
+-	}
+-	if !prevHashExists {
+-		log.Infof("Adding orphan block %v with parent %v", blockHash, prevHash)
+-		b.addOrphanBlock(block)
+-
+-		return false, true, nil
+-	}
+-
+ 	// The block has passed all context independent checks and appears sane
+ 	// enough to potentially accept it into the block chain.
+ 	isMainChain, err := b.maybeAcceptBlock(block, flags)
 diff --git a/blockchain/accept.go b/blockchain/accept.go
-index 57dffc18..c3106319 100644
+index cdc35cb0..51d188c5 100644
 --- a/blockchain/accept.go
 +++ b/blockchain/accept.go
 @@ -6,12 +6,50 @@ package blockchain
@@ -692,7 +744,7 @@ index 57dffc18..c3106319 100644
  		str := fmt.Sprintf("previous block %s is known to be invalid", prevHash)
  		return false, ruleError(ErrInvalidAncestorBlock, str)
  	}
-@@ -38,6 +92,21 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
+@@ -38,6 +92,65 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
  	blockHeight := prevNode.height + 1
  	block.SetHeight(blockHeight)
  
@@ -702,6 +754,50 @@ index 57dffc18..c3106319 100644
 +	// from displacing the real main-chain tip (observed: local block a23e7e62
 +	// vs network main-chain 44060189 b345517e).
 +	if flags&BFMinerSubmit == BFMinerSubmit {
++		// The mined block must extend a parent that is itself on the
++		// network-confirmed header chain.  This closes the timing blind spot
++		// where the header chain has not yet synced past the mined height (so
++		// NodeByHeight below returns nil and the block would otherwise be
++		// accepted): right after a fabricated-chain rollback the previous
++		// locally-mined siblings are removed from the header chain, and the
++		// miner must wait for peers to re-confirm the parent before minting
++		// another block on it.  Without this guard a lone/competing miner
++		// keeps re-minting the same-height sibling on the discarded parent,
++		// re-fabricating the tip every ~10 minutes (observed: block download
++		// stuck at the mined height forever).
++		// 挖出的块必须extend一个自身已在(网络确认的)header 链上的父块。这堵上
++		// 了"header 链尚未同步到挖矿高度、NodeByHeight 返回 nil 因而该块被接受"
++		// 的时序盲点:伪造链回滚后,先前本地挖出的兄弟块已从 header 链移除,矿工
++		// 必须等对等点重新确认父块后才能在其上继续挖,否则单独/竞争的矿工会反复
++		// 在废弃父块上挖同一高度的兄弟块,每约 10 分钟重新伪造一次 tip。
++		//
++		// The bestHeader view only advances during header downloads; once the
++		// node is synced it stops updating while bestChain keeps accepting new
++		// network blocks, so the view can lag the connected chain (observed:
++		// a miner block whose prev was a main-chain block accepted 0.8s earlier
++		// was rejected).  Therefore only reject when the view actually covers
++		// the parent's height AND holds a different block there (a forged or
++		// forked parent); when the view has not covered the height yet (lag or
++		// window eviction) accept and let the orphan/divergence detectors
++		// (HeaderChainDiverged, orphan flood, DB height-index comparison)
++		// handle a genuinely fabricated tip.
++		// bestHeader 视图只在 header 下载时推进;节点同步后它停止更新,而
++		// bestChain 持续接受新的网络块,视图会滞后于连接链(实测:矿工提交
++		// 块的 prev 是 0.8 秒前刚被接受的主链块,原检查却拒绝)。因此只在
++		// 视图**已覆盖**父块高度且该高度是另一个块(伪造/分叉父块)时拒绝;
++		// 视图尚未覆盖(滞后或窗口驱逐)时放行,由孤儿/分叉检测
++		// (HeaderChainDiverged、孤儿洪流、DB 高度索引对比)兜底真正的伪造 tip。
++		headerTip := b.bestHeader.Tip()
++		if headerTip != nil && prevNode.height <= headerTip.height {
++			if headerNode := b.bestHeader.NodeByHeight(prevNode.height); headerNode != nil &&
++				!headerNode.hash.IsEqual(&prevNode.hash) {
++				str := fmt.Sprintf("miner-submitted block %v builds on parent %v "+
++					"which is not on the network-confirmed header chain -- "+
++					"waiting for re-sync", block.Hash(), prevHash)
++				return false, ruleError(ErrMinedBlockNotOnMainChain, str)
++			}
++		}
++
 +		if headerNode := b.bestHeader.NodeByHeight(blockHeight); headerNode != nil &&
 +			!headerNode.hash.IsEqual(block.Hash()) {
 +			str := fmt.Sprintf("miner-submitted block %v is not on the "+
@@ -714,7 +810,7 @@ index 57dffc18..c3106319 100644
  	// The block must pass all of the validation rules which depend on the
  	// position of the block within the block chain.
  	err := b.checkBlockContext(block, prevNode, flags)
-@@ -55,7 +124,21 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
+@@ -55,7 +168,21 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
  	// such as making blocks that never become part of the main chain or
  	// blocks that fail to connect available for further analysis.
  	err = b.db.Update(func(dbTx database.Tx) error {
@@ -737,7 +833,7 @@ index 57dffc18..c3106319 100644
  	})
  	if err != nil {
  		return false, err
-@@ -72,13 +155,28 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
+@@ -72,13 +199,28 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
  	newNode := b.index.LookupNode(block.Hash())
  	if newNode != nil {
  		b.index.SetStatusFlags(newNode, statusDataStored)
@@ -767,7 +863,7 @@ index 57dffc18..c3106319 100644
  	if err != nil {
  		return false, err
  	}
-@@ -91,6 +189,20 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
+@@ -91,6 +233,20 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
  		return false, err
  	}
  
@@ -788,7 +884,7 @@ index 57dffc18..c3106319 100644
  	// Notify the caller that the new block was accepted into the block
  	// chain.  The caller would typically want to react by relaying the
  	// inventory to other peers.
-@@ -103,6 +215,42 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
+@@ -103,6 +259,42 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
  	return isMainChain, nil
  }
  
@@ -831,7 +927,7 @@ index 57dffc18..c3106319 100644
  // maybeAcceptBlockHeader potentially accepts the header to the block index and,
  // if accepted, returns a bool indicating if the header extended the best chain
  // of headers.  It also performs several context independent checks as well as
-@@ -132,8 +280,16 @@ func (b *BlockChain) maybeAcceptBlockHeader(header *wire.BlockHeader,
+@@ -132,8 +324,16 @@ func (b *BlockChain) maybeAcceptBlockHeader(header *wire.BlockHeader,
  		return false, ruleError(ErrPreviousBlockUnknown, str)
  	}
  
@@ -850,7 +946,7 @@ index 57dffc18..c3106319 100644
  		str := fmt.Sprintf(
  			"previous block %s is known to be invalid", prevHash)
  		return false, ruleError(ErrInvalidAncestorBlock, str)
-@@ -147,11 +303,40 @@ func (b *BlockChain) maybeAcceptBlockHeader(header *wire.BlockHeader,
+@@ -147,11 +347,40 @@ func (b *BlockChain) maybeAcceptBlockHeader(header *wire.BlockHeader,
  	if node != nil {
  		nodeStatus := b.index.NodeStatus(node)
  		if nodeStatus&statusValidateFailed != 0 {
@@ -895,7 +991,7 @@ index 57dffc18..c3106319 100644
  		}
  
  		// If the node is in the bestHeaders chainview, it's in the main chain.
-@@ -186,13 +371,6 @@ func (b *BlockChain) maybeAcceptBlockHeader(header *wire.BlockHeader,
+@@ -186,13 +415,6 @@ func (b *BlockChain) maybeAcceptBlockHeader(header *wire.BlockHeader,
  		b.index.AddNode(node)
  	}
  
@@ -909,7 +1005,7 @@ index 57dffc18..c3106319 100644
  	// Check if the header extends the best header tip.
  	isMainChain := false
  	parentHash := &header.PrevBlock
-@@ -202,35 +380,64 @@ func (b *BlockChain) maybeAcceptBlockHeader(header *wire.BlockHeader,
+@@ -202,35 +424,64 @@ func (b *BlockChain) maybeAcceptBlockHeader(header *wire.BlockHeader,
  		// This header is now the end of the best headers.
  		b.bestHeader.SetTip(node)
  		isMainChain = true
@@ -993,7 +1089,7 @@ index 57dffc18..c3106319 100644
  	return isMainChain, nil
  }
 diff --git a/blockchain/error.go b/blockchain/error.go
-index 6104e7ab..a9a22485 100644
+index dd3bd230..4213f42a 100644
 --- a/blockchain/error.go
 +++ b/blockchain/error.go
 @@ -229,6 +229,11 @@ const (
@@ -1017,7 +1113,7 @@ index 6104e7ab..a9a22485 100644
  
  // String returns the ErrorCode as a human-readable name.
 diff --git a/blockchain/internal/workmath/difficulty.go b/blockchain/internal/workmath/difficulty.go
-index 9afff408..3db0431c 100644
+index d5fe7b78..6f53b42a 100644
 --- a/blockchain/internal/workmath/difficulty.go
 +++ b/blockchain/internal/workmath/difficulty.go
 @@ -151,3 +151,21 @@ func CalcWork(bits uint32) *big.Int {
@@ -1043,7 +1139,7 @@ index 9afff408..3db0431c 100644
 +	return result.Div(oneLsh256, denominator)
 +}
 diff --git a/txscript/engine.go b/txscript/engine.go
-index 682924f7..56ac4bb5 100644
+index 2101c529..40382e56 100644
 --- a/txscript/engine.go
 +++ b/txscript/engine.go
 @@ -577,6 +577,18 @@ func (vm *Engine) verifyWitnessProgram(witness wire.TxWitness) error {
@@ -1066,7 +1162,7 @@ index 682924f7..56ac4bb5 100644
  					"items in witness, instead have %v", len(witness))
  				return scriptError(ErrWitnessProgramMismatch, err)
 diff --git a/chaincfg/params.go b/chaincfg/params.go
-index 14056d71..bfd82825 100644
+index ed80666e..2d072ca2 100644
 --- a/chaincfg/params.go
 +++ b/chaincfg/params.go
 @@ -301,101 +301,59 @@ type Params struct {
@@ -1668,7 +1764,7 @@ index 14056d71..bfd82825 100644
  	mustRegister(&SimNetParams)
  }
 diff --git a/mining/mining.go b/mining/mining.go
-index 9a496de2..650b7eec 100644
+index bad8dfc8..c422e663 100644
 --- a/mining/mining.go
 +++ b/mining/mining.go
 @@ -812,7 +812,24 @@ mempoolLoop:
@@ -1698,10 +1794,18 @@ index 9a496de2..650b7eec 100644
  		return nil, err
  	}
 diff --git a/mining/cpuminer/cpuminer.go b/mining/cpuminer/cpuminer.go
-index 838a162d..e65013bc 100644
+index c2afad59..fb04b1ad 100644
 --- a/mining/cpuminer/cpuminer.go
 +++ b/mining/cpuminer/cpuminer.go
-@@ -18,6 +18,7 @@ import (
+@@ -7,6 +7,7 @@ package cpuminer
+ import (
+ 	"errors"
+ 	"fmt"
++	"math/big"
+ 	"math/rand"
+ 	"runtime"
+ 	"sync"
+@@ -18,6 +19,7 @@ import (
  	"github.com/btcsuite/btcd/chaincfg/v2"
  	"github.com/btcsuite/btcd/chainhash/v2"
  	"github.com/btcsuite/btcd/mining"
@@ -1709,7 +1813,26 @@ index 838a162d..e65013bc 100644
  	"github.com/btcsuite/btcd/wire/v2"
  )
  
-@@ -275,7 +276,7 @@ func (m *CPUMiner) solveBlock(msgBlock *wire.MsgBlock, blockHeight int32,
+@@ -221,6 +223,18 @@ func (m *CPUMiner) solveBlock(msgBlock *wire.MsgBlock, blockHeight int32,
+ 	header := &msgBlock.Header
+ 	targetDifficulty := blockchain.CompactToBig(header.Bits)
+ 
++	// Reuse a single big.Int for the hash comparison instead of allocating
++	// one per nonce via blockchain.HashToBig: the miner runs one hash per
++	// nonce iteration, making this the hottest allocation site in the miner
++	// loop.  HashToBig allocates a fresh big.Int on every call; here the
++	// bytes are reversed in place (HashToBig's little-endian -> big-endian
++	// conversion) and SetBytes reuses the same instance.
++	// 复用一个 big.Int 做哈希比较,而不是像 blockchain.HashToBig 那样每个
++	// nonce 分配一个新的:矿工每个 nonce 迭代跑一次哈希,这是矿工循环里最
++	// 热的分配点。这里原地反转字节(HashToBig 的 little-endian -> big-endian
++	// 转换),SetBytes 复用同一实例。
++	hashNum := new(big.Int)
++
+ 	// Initial state.
+ 	lastGenerated := time.Now()
+ 	lastTxUpdate := m.g.TxSource().LastUpdated()
+@@ -275,12 +289,20 @@ func (m *CPUMiner) solveBlock(msgBlock *wire.MsgBlock, blockHeight int32,
  			// increment the number of hashes completed for each
  			// attempt accordingly.
  			header.Nonce = i
@@ -1718,8 +1841,57 @@ index 838a162d..e65013bc 100644
  			hashesCompleted += 2
  
  			// The block is solved when the new block hash is less
+-			// than the target difficulty.  Yay!
+-			if blockchain.HashToBig(&hash).Cmp(targetDifficulty) <= 0 {
++			// than the target difficulty.  Yay!  Reuse hashNum instead
++			// of allocating a fresh big.Int per nonce: reverse the
++			// little-endian hash into the big-endian byte order that
++			// big.Int.SetBytes expects, then compare against the target.
++			for j := 0; j < len(hash)/2; j++ {
++				hash[j], hash[len(hash)-1-j] =
++					hash[len(hash)-1-j], hash[j]
++			}
++			hashNum.SetBytes(hash[:])
++			if hashNum.Cmp(targetDifficulty) <= 0 {
+ 				m.updateHashes <- hashesCompleted
+ 				return true
+ 			}
+diff --git a/dev/null b/pow/pow.go
+new file mode 100644
+--- /dev/null
++++ b/pow/pow.go
+@@ -0,0 +1,29 @@
++package pow
++
++import (
++	"bytes"
++
++	"github.com/btcsuite/btcd/chainhash/v2"
++	"github.com/btcsuite/btcd/wire/v2"
++	"github.com/btcsuite/btcd/yespower"
++)
++
++func BlockPoWHash(header *wire.BlockHeader) chainhash.Hash {
++	// Serialize the 80-byte header into a stack buffer instead of a
++	// heap-allocated bytes.Buffer: the miner calls this once per nonce,
++	// so a per-call allocation would add constant GC pressure on the
++	// hottest path in the codebase.  BtcEncode writes exactly 80 bytes,
++	// so the stack array is never grown.
++	// 把 80 字节头序列化进栈缓冲而不是堆分配的 bytes.Buffer:矿工每个
++	// nonce 调用一次本函数,每次调用都分配会给最热路径带来持续 GC 压力。
++	// BtcEncode 恰好写 80 字节,栈数组不会扩容。
++	var buf [80]byte
++	w := bytes.NewBuffer(buf[:0])
++	header.BtcEncode(w, 0, wire.BaseEncoding)
++
++	yespowerHash := yespower.Hash(buf[:])
++
++	var hash chainhash.Hash
++	copy(hash[:], yespowerHash[:])
++	return hash
++}
 diff --git a/blockchain/validate_test.go b/blockchain/validate_test.go
-index 7e698ce0..6184d9c0 100644
+index dbb3a849..2ae1697c 100644
 --- a/blockchain/validate_test.go
 +++ b/blockchain/validate_test.go
 @@ -122,11 +122,28 @@ func TestCheckConnectBlockTemplate(t *testing.T) {
@@ -1755,7 +1927,7 @@ index 7e698ce0..6184d9c0 100644
  
  	// Block 4 should connect even if proof of work is invalid.
 diff --git a/chaincfg/genesis_test.go b/chaincfg/genesis_test.go
-index b2975ffb..a4b89c01 100644
+index 6833957b..00e9a3cd 100644
 --- a/chaincfg/genesis_test.go
 +++ b/chaincfg/genesis_test.go
 @@ -1,418 +1,81 @@
@@ -2232,7 +2404,7 @@ index b2975ffb..a4b89c01 100644
 -	0xac, 0x00, 0x00, 0x00, 0x00, /* |.....| */
 -}
 diff --git a/chaincfg/register_test.go b/chaincfg/register_test.go
-index eb2c8893..884854b9 100644
+index 35414c91..c41c51f8 100644
 --- a/chaincfg/register_test.go
 +++ b/chaincfg/register_test.go
 @@ -68,11 +68,6 @@ func TestRegister(t *testing.T) {

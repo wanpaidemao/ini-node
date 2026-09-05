@@ -98,6 +98,50 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
 	// from displacing the real main-chain tip (observed: local block a23e7e62
 	// vs network main-chain 44060189 b345517e).
 	if flags&BFMinerSubmit == BFMinerSubmit {
+		// The mined block must extend a parent that is itself on the
+		// network-confirmed header chain.  This closes the timing blind spot
+		// where the header chain has not yet synced past the mined height (so
+		// NodeByHeight below returns nil and the block would otherwise be
+		// accepted): right after a fabricated-chain rollback the previous
+		// locally-mined siblings are removed from the header chain, and the
+		// miner must wait for peers to re-confirm the parent before minting
+		// another block on it.  Without this guard a lone/competing miner
+		// keeps re-minting the same-height sibling on the discarded parent,
+		// re-fabricating the tip every ~10 minutes (observed: block download
+		// stuck at the mined height forever).
+		// 挖出的块必须extend一个自身已在(网络确认的)header 链上的父块。这堵上
+		// 了"header 链尚未同步到挖矿高度、NodeByHeight 返回 nil 因而该块被接受"
+		// 的时序盲点:伪造链回滚后,先前本地挖出的兄弟块已从 header 链移除,矿工
+		// 必须等对等点重新确认父块后才能在其上继续挖,否则单独/竞争的矿工会反复
+		// 在废弃父块上挖同一高度的兄弟块,每约 10 分钟重新伪造一次 tip。
+		//
+		// The bestHeader view only advances during header downloads; once the
+		// node is synced it stops updating while bestChain keeps accepting new
+		// network blocks, so the view can lag the connected chain (observed:
+		// a miner block whose prev was a main-chain block accepted 0.8s earlier
+		// was rejected).  Therefore only reject when the view actually covers
+		// the parent's height AND holds a different block there (a forged or
+		// forked parent); when the view has not covered the height yet (lag or
+		// window eviction) accept and let the orphan/divergence detectors
+		// (HeaderChainDiverged, orphan flood, DB height-index comparison)
+		// handle a genuinely fabricated tip.
+		// bestHeader 视图只在 header 下载时推进;节点同步后它停止更新,而
+		// bestChain 持续接受新的网络块,视图会滞后于连接链(实测:矿工提交
+		// 块的 prev 是 0.8 秒前刚被接受的主链块,原检查却拒绝)。因此只在
+		// 视图**已覆盖**父块高度且该高度是另一个块(伪造/分叉父块)时拒绝;
+		// 视图尚未覆盖(滞后或窗口驱逐)时放行,由孤儿/分叉检测
+		// (HeaderChainDiverged、孤儿洪流、DB 高度索引对比)兜底真正的伪造 tip。
+		headerTip := b.bestHeader.Tip()
+		if headerTip != nil && prevNode.height <= headerTip.height {
+			if headerNode := b.bestHeader.NodeByHeight(prevNode.height); headerNode != nil &&
+				!headerNode.hash.IsEqual(&prevNode.hash) {
+				str := fmt.Sprintf("miner-submitted block %v builds on parent %v "+
+					"which is not on the network-confirmed header chain -- "+
+					"waiting for re-sync", block.Hash(), prevHash)
+				return false, ruleError(ErrMinedBlockNotOnMainChain, str)
+			}
+		}
+
 		if headerNode := b.bestHeader.NodeByHeight(blockHeight); headerNode != nil &&
 			!headerNode.hash.IsEqual(block.Hash()) {
 			str := fmt.Sprintf("miner-submitted block %v is not on the "+

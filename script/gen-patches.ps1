@@ -35,13 +35,13 @@ New-Item -ItemType Directory -Force -Path $patchDir | Out-Null
 
 # 类别 → 被修改文件列表（相对 backend/ 的路径）/ category -> modified file list
 $categories = [ordered]@{
-  '01-consensus'       = @('blockchain/difficulty.go','blockchain/validate.go','blockchain/merkle.go','blockchain/process.go','blockchain/accept.go','blockchain/error.go','blockchain/internal/workmath/difficulty.go','txscript/engine.go','chaincfg/params.go','mining/mining.go','mining/cpuminer/cpuminer.go','blockchain/validate_test.go','chaincfg/genesis_test.go','chaincfg/register_test.go')
+  '01-consensus'       = @('blockchain/difficulty.go','blockchain/validate.go','blockchain/merkle.go','blockchain/process.go','blockchain/accept.go','blockchain/error.go','blockchain/internal/workmath/difficulty.go','txscript/engine.go','chaincfg/params.go','mining/mining.go','mining/cpuminer/cpuminer.go','pow/pow.go','blockchain/validate_test.go','chaincfg/genesis_test.go','chaincfg/register_test.go')
   '02-perf-sync'       = @('netsync/manager.go','netsync/interface.go','netsync/manager_test.go','blockchain/chain.go','blockchain/blockindex.go','blockchain/blockindex_test.go','blockchain/chainview.go','blockchain/chainview_test.go','blockchain/common_test.go','blockchain/internal/testhelper/common.go')
   '03-perf-storage'    = @('blockchain/utxocache.go','blockchain/utxocache_test.go','blockchain/thresholdstate.go','blockchain/checkpoints.go','database/ffldb/db.go','database/ffldb/whitebox_test.go','database/interface.go')
   '04-storage-format'  = @('blockchain/chainio.go')
   '05-assembly-rpc'    = @('server.go','config.go','config_test.go','btcd.go','rpcserver.go','rpcserver_test.go','rpcserverhelp.go','rpcadapters.go','log.go','signal.go','service_windows.go','upgrade.go','version.go','cmd/btcctl/version.go','doc.go')
   '06-dormant-wire'    = @('wire/blockheader.go','wire/msgversion.go')
-  '07-misc'            = @('.gitignore','README.md','Dockerfile','sample-btcd.conf','go.mod')
+  '07-misc'            = @('.gitignore','README.md','Dockerfile','sample-btcd.conf','go.mod','btcd-runtime.ini')
 }
 
 # 把 git diff 输出里的绝对路径前缀替换为相对路径（可重放）/ strip absolute path prefixes
@@ -49,6 +49,11 @@ $categories = [ordered]@{
 # git quotes doubled-backslash paths on Windows; strip them with literal replace.
 $upEsc   = ($up   + '\').Replace('\','\\')   # 例/ e.g. d:\\dev\\AI\\btcd-ref\\
 $forkEsc = ($fork + '\').Replace('\','\\')   # 例/ e.g. d:\\dev\\AI\\ini-node\\backend\\
+
+# 空文件哨兵：fork 独有文件（上游无对应文件）用它生成标准 new-file 补丁。
+# Empty sentinel: fork-only files (absent upstream) become standard new-file patches.
+$tmpEmpty = Join-Path $env:TEMP 'btcd-patch-empty'
+[System.IO.File]::WriteAllBytes($tmpEmpty, [byte[]]@())
 
 function Normalize-PatchLines {
   param([string[]]$Lines)
@@ -72,7 +77,24 @@ foreach ($cat in $categories.Keys) {
   foreach ($rel in $categories[$cat]) {
     $a = Join-Path $up   ($rel -replace '/','\')
     $b = Join-Path $fork ($rel -replace '/','\')
-    if (-not (Test-Path $a)) { Write-Warning "上游缺失(跳过): $rel"; continue }
+    if (-not (Test-Path $a)) {
+      if (-not (Test-Path $b)) { Write-Warning "fork 缺失(跳过): $rel"; continue }
+      # fork 独有文件（上游无对应文件）→ 标准 new-file 补丁，重放时 git apply 创建该文件
+      # fork-only file (absent upstream) -> standard new-file patch so git apply creates it
+      $bytes = [System.IO.File]::ReadAllBytes($b)
+      $text  = [System.Text.Encoding]::UTF8.GetString($bytes) -replace "`r`n", "`n"
+      $lines = $text -split "`n"
+      $n = $lines.Count
+      if ($n -gt 0 -and $lines[$n-1] -eq '') { $n = $n - 1 }   # 去掉结尾换行的空元素 / drop trailing newline element
+      $collected += "diff --git a/dev/null b/$rel"
+      $collected += "new file mode 100644"
+      $collected += "--- /dev/null"
+      $collected += "+++ b/$rel"
+      $collected += ("@@ -0,0 +1,{0} @@" -f $n)
+      for ($i = 0; $i -lt $n; $i++) { $collected += "+" + $lines[$i] }
+      $fileCount++
+      continue
+    }
     if (-not (Test-Path $b)) { Write-Warning "fork 缺失(跳过): $rel"; continue }
     $diff = git diff --no-index --src-prefix=a/ --dst-prefix=b/ $a $b 2>$null
     if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1) { continue }  # 1 = 有差异，0/1 都正常
