@@ -139,8 +139,15 @@ const (
 	// by the network; a forged chain's blocks either do not exist on any peer
 	// or do not link to the applied tip, so the download would spin forever.
 	// The window is deliberately much larger than blockSliceStallTimeout so a
-	// merely slow peer is never misjudged.
-	blockUnavailableTimeout = 10 * time.Minute
+	// merely slow peer is never misjudged.  It is, however, well below the old
+	// 10 minutes: the strong divergence detectors (best-tip-vs-header chain,
+	// peer-height, and the front-unreachable votes) typically fire first, but
+	// this block-side timer is the last-resort fallback for a lone/competing
+	// miner whose own block was orphaned -- leaving it at 10 minutes made a
+	// mining-loss stall last ~10 minutes before the node even attempted to
+	// recover.  At 90s (and with the fabricated blocks hard-deleted on rollback)
+	// a lost block race heals in ~1.5 minutes instead.
+	blockUnavailableTimeout = 90 * time.Second
 
 	// maxFabricatedRollbacks caps how many times the fabricated-header-chain
 	// rollback may target the same height before it is refused.  The rollback
@@ -1418,9 +1425,9 @@ func (sm *SyncManager) handleStallSample() {
 	if sm.headerSync != nil && sm.chain.HeaderChainDiverged() {
 		forkHeight := sm.chain.BestChainHeaderForkHeight()
 		log.Warnf("Best chain tip diverges from the header chain at height "+
-			"%d (fork at %d) -- fabricated/forked tip, rolling back early",
+			"%d (fork at %d) -- fabricated/forked tip, rolling back to fork",
 			sm.chain.BestSnapshot().Height, forkHeight)
-		sm.rollbackFabricatedHeaderChain()
+		sm.rollbackToForkPoint(forkHeight)
 	}
 
 	// Detect a fabricated or forked header chain: the block download has not
@@ -3244,8 +3251,15 @@ func (sm *SyncManager) rollbackFabricatedHeaderChain() {
 	log.Warnf("Rolled back fabricated header chain to height %d -- "+
 		"restarting header/block download", rollbackHeight)
 
-	// 3. Tear down all in-flight download state so the next fetchHeaders
-	// starts from a clean slate at the confirmed height.
+	// 3-4. Tear down in-flight download state and restart from the rebuilt
+	// best-header tip.
+	sm.resetDownloadState()
+}
+
+// resetDownloadState tears down all in-flight download state and restarts the
+// sync from the current best-header tip.  It is shared by the explicit
+// fork-point rollback and the generic fabricated-header-chain rollback.
+func (sm *SyncManager) resetDownloadState() {
 	sm.headerSync = nil
 	sm.blockSync = nil
 	sm.blockSyncState = nil
@@ -3257,9 +3271,24 @@ func (sm *SyncManager) rollbackFabricatedHeaderChain() {
 	}
 	sm.syncPeer = nil
 	sm.ibdMode = true
-
-	// 4. Restart the sync from the rebuilt best-header tip.
 	sm.startSync()
+}
+
+// rollbackToForkPoint rolls the header chain back to an explicit fork height in
+// one step, mirroring umami's ActivateBestChain: the best-chain tip is known to
+// diverge from the (network-projected) header chain at forkHeight, so there is
+// no need to deepen the cut one block at a time through repeated stall timeouts.
+// It reuses InvalidateHeaderChain + the shared download-state reset, but jumps
+// straight to the fork instead of walking down from the tip.
+func (sm *SyncManager) rollbackToForkPoint(forkHeight int32) {
+	if err := sm.chain.InvalidateHeaderChain(forkHeight); err != nil {
+		log.Errorf("Failed to roll back header chain to fork height %d: %v",
+			forkHeight, err)
+		return
+	}
+	log.Warnf("Rolled back header chain to fork point %d -- "+
+		"restarting header/block download", forkHeight)
+	sm.resetDownloadState()
 }
 
 // reissueStaleHeaderRanges reassigns any in-flight header range that has not
@@ -3841,15 +3870,13 @@ out:
 			case processBlockMsg:
 				_, isOrphan, err := sm.chain.ProcessBlock(
 					msg.block, msg.flags)
-				// TEMP DEBUG: trace block processing outcome / 临时调试
-				log.Warnf("TEMP-DBG ProcessBlock hash=%s orphan=%v err=%v", msg.block.Hash(), isOrphan, err)
 				if err != nil {
 					msg.reply <- processBlockResponse{
 						isOrphan: false,
 						err:      err,
 					}
+					continue
 				}
-
 				msg.reply <- processBlockResponse{
 					isOrphan: isOrphan,
 					err:      nil,

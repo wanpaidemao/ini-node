@@ -515,6 +515,31 @@ func (bi *blockIndex) addNode(node *blockNode) {
 	bi.index[node.hash] = node
 }
 
+// removeNode removes the block node identified by the provided hash from the
+// in-memory index and the dirty set.  It is used to fully delete a disconnected
+// block (e.g. a locally-mined block no peer shares) after a reorg; unlike
+// evictWindow this is an explicit removal of one node, not a window prune.
+//
+// This function is NOT safe for concurrent access.
+func (bi *blockIndex) removeNode(hash *chainhash.Hash) {
+	node := bi.index[*hash]
+	if node == nil {
+		return
+	}
+	delete(bi.index, *hash)
+	delete(bi.dirty, node)
+}
+
+// RemoveNode removes the block node identified by the provided hash from the
+// in-memory index and the dirty set.
+//
+// This function is safe for concurrent access.
+func (bi *blockIndex) RemoveNode(hash *chainhash.Hash) {
+	bi.Lock()
+	bi.removeNode(hash)
+	bi.Unlock()
+}
+
 // setWindow enables or disables the in-memory header window.  When windowSize
 // is greater than zero, the block index keeps only the most recent windowSize
 // blocks from each active chain tip in memory and evicts everything below that

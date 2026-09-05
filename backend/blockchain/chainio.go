@@ -2247,6 +2247,15 @@ func dbStoreBlockNode(dbTx database.Tx, node *blockNode) error {
 	return blockIndexBucket.Put(key, value)
 }
 
+// dbRemoveBlockNode removes a block header entry from the block index bucket.
+// It is used to fully delete a disconnected block (e.g. a locally-mined block
+// no peer shares) after a reorg, so a restart cannot re-materialize the header.
+func dbRemoveBlockNode(dbTx database.Tx, hash *chainhash.Hash, height int32) error {
+	blockIndexBucket := dbTx.Metadata().Bucket(blockIndexBucketName)
+	key := blockIndexKey(hash, uint32(height))
+	return blockIndexBucket.Delete(key)
+}
+
 // dbStoreBlock stores the provided block in the database if it is not already
 // there. The full block data is written to ffldb.
 func dbStoreBlock(dbTx database.Tx, block *btcutil.Block) error {
