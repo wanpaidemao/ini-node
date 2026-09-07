@@ -333,7 +333,18 @@
 
   <!-- Startup params / 启动参数 -->
   <div class="card" style="border:1px solid var(--c-border);border-radius:10px;padding:14px">
-    <div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer" onclick={() => paramsOpen = !paramsOpen}>
+    <div
+      style="display:flex;justify-content:space-between;align-items:center;cursor:pointer"
+      role="button"
+      tabindex="0"
+      onclick={() => (paramsOpen = !paramsOpen)}
+      onkeydown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          paramsOpen = !paramsOpen;
+        }
+      }}
+    >
       <span style="font-weight:600">Startup params / 启动参数</span>
       <span class="dim" style="font-size:12px">{paramsOpen ? '▾ 收起' : '▸ 展开'}</span>
     </div>
@@ -396,10 +407,20 @@
   {#if logsModalOpen}
     <div
       style="position:fixed;inset:0;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;z-index:100"
+      role="button"
+      tabindex="0"
+      aria-label="Close / 关闭"
       onclick={closeLogs}
+      onkeydown={(e) => {
+        if (e.key === "Enter" || e.key === " " || e.key === "Escape") {
+          e.preventDefault();
+          closeLogs();
+        }
+      }}
     >
       <div
         style="background:var(--ink);border:1px solid var(--line);border-radius:10px;padding:14px;max-width:680px;width:90%;max-height:72vh;display:flex;flex-direction:column"
+        role="presentation"
         onclick={(e) => e.stopPropagation()}
       >
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
@@ -416,7 +437,18 @@
 
   <!-- DB params / 数据库参数 -->
   <div class="card" style="border:1px solid var(--c-border);border-radius:10px;padding:14px">
-    <div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer" onclick={() => dbParamsOpen = !dbParamsOpen}>
+    <div
+      style="display:flex;justify-content:space-between;align-items:center;cursor:pointer"
+      role="button"
+      tabindex="0"
+      onclick={() => (dbParamsOpen = !dbParamsOpen)}
+      onkeydown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          dbParamsOpen = !dbParamsOpen;
+        }
+      }}
+    >
       <span style="font-weight:600">DB params / 数据库参数</span>
       <span class="dim" style="font-size:12px">{dbParamsOpen ? '▾ 收起' : '▸ 展开'}</span>
     </div>

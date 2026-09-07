@@ -587,6 +587,11 @@
         <p class="empty">{t("wal.tab_consolidate_hint")}</p>
       {/if}
     </div>
+  {:else}
+    <!-- w is null without an error: initial load still in flight → show a
+         loading placeholder instead of a blank page body / w 为 null 且无
+         错误:初次加载进行中 → 显示加载占位而非空白页面主体 -->
+    <div class="card"><p class="empty">{t("wal.loading")}</p></div>
   {/if}
 </section>
 

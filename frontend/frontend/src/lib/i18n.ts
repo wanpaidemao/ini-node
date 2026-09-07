@@ -166,7 +166,15 @@ function dtFmt(lang: Lang) {
 
 /** compact date + time, e.g. 08-10 12:03 per locale. */
 export function fmtDateTime(ts: number): string {
-  return dtFmt(current).format(new Date(ts));
+  // getblock / gethistory timestamps are Unix SECONDS; the JS Date
+  // constructor expects milliseconds.  Detect seconds (< 1e12) and scale,
+  // so every caller (explorer blocks/txs, wallet history) renders the real
+  // time instead of a constant 1970-looking value (observed: every block
+  // showing the same time in the explorer).
+  // getblock/gethistory 的时间戳是 Unix 秒;JS Date 构造需要毫秒。识别秒级
+  // (< 1e12)并放大,让所有调用方(浏览器区块/交易、钱包历史)显示真实时间,
+  // 而不是 1970 附近的固定值(实测:浏览器里所有区块时间一致)。
+  return dtFmt(current).format(new Date(ts < 1e12 ? ts * 1000 : ts));
 }
 
 /** human relative "3 min ago" etc.; returns ~"x min" for gap text. */

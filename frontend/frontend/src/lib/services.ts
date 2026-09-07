@@ -956,33 +956,44 @@ export const Services = {
   // (verbosity 1 保证列表轻量——只含交易 id)。
   async getExplorerBlocks(count = 12): Promise<ExplorerBlock[]> {
     const info = await rpc<{ blocks: number }>("getblockchaininfo");
-    const out: ExplorerBlock[] = [];
+    // Fetch each block's hash + header in parallel instead of serially: the
+    // old loop did 2 RPC round-trips per height in sequence (24 round-trips
+    // for 12 blocks), which stalls the explorer list for seconds on a slow
+    // link.  Promise.all keeps the same deterministic height order.
+    // 每个区块的 hash + 头并行获取,取代原先逐高度串行(12 块 = 24 次
+    // 串行 RPC 往返,慢链路下浏览器列表要卡好几秒)。Promise.all 保持
+    // 高度顺序不变。
+    const heights: number[] = [];
     for (let h = info.blocks; h > Math.max(-1, info.blocks - count); h--) {
-      const hash = await rpc<string>("getblockhash", h);
-      const b = await rpc<{
-        hash: string;
-        height: number;
-        confirmations: number;
-        time: number;
-        size: number;
-        nonce: number;
-        bits: string;
-        difficulty: number;
-        tx: string[];
-      }>("getblock", hash, 1);
-      out.push({
-        hash: b.hash,
-        height: b.height,
-        confirmations: b.confirmations,
-        time: b.time,
-        size: b.size,
-        txCount: (b.tx ?? []).length,
-        nonce: b.nonce,
-        bits: b.bits,
-        difficulty: b.difficulty,
-      });
+      heights.push(h);
     }
-    return out;
+    return Promise.all(
+      heights.map(async (h) => {
+        const hash = await rpc<string>("getblockhash", h);
+        const b = await rpc<{
+          hash: string;
+          height: number;
+          confirmations: number;
+          time: number;
+          size: number;
+          nonce: number;
+          bits: string;
+          difficulty: number;
+          tx: string[];
+        }>("getblock", hash, 1);
+        return {
+          hash: b.hash,
+          height: b.height,
+          confirmations: b.confirmations,
+          time: b.time,
+          size: b.size,
+          txCount: (b.tx ?? []).length,
+          nonce: b.nonce,
+          bits: b.bits,
+          difficulty: b.difficulty,
+        };
+      }),
+    );
   },
 
   // Block detail: verbosity 2 carries full transactions (ids + summaries).
@@ -1127,14 +1138,6 @@ export const Services = {
   // 在系统文件管理器中打开数据目录(Go binding)。
   async openDataDir(path: string): Promise<void> {
     await LocalGreet.OpenDataDir(path);
-  },
-
-  async estimateFee(_target: number): Promise<number> {
-    try {
-      return await rpc<number>("estimatesmartfee", _target);
-    } catch {
-      return 0;
-    }
   },
 
   async buildPsbt(_to: string, _amountS: number, _feeS: number) {

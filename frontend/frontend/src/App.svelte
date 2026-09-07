@@ -379,14 +379,6 @@
     user-select: none;
     -webkit-user-select: none;
   }
-  .titlebar-title {
-    font-family: var(--font-display);
-    font-size: 12px;
-    font-weight: 800;
-    letter-spacing: 0.6px;
-    color: var(--ink-dim);
-    white-space: nowrap;
-  }
   .titlebar-drag {
     flex: 1;
     align-self: stretch;

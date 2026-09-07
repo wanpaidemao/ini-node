@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, onDestroy } from "svelte";
   import { fmtDateTime, t } from "../lib/i18n";
   import { Services } from "../lib/services";
   import { app } from "../lib/store.svelte";
@@ -23,6 +23,8 @@
   let search = $state("");
   let loadErr = $state<string | null>(null);
   let busy = $state(false);
+  // Auto-refresh timer for the chain view (see onMount). / 链视图自动刷新定时器。
+  let autoRefresh: ReturnType<typeof setInterval> | undefined;
 
   // fmtBase renders a satoshi-ish big number readably (supply figures).
   // fmtBase 可读地渲染聪级大数(供应量等)。
@@ -119,7 +121,18 @@
     } else {
       loadChain();
     }
+
+    // Auto-refresh the chain view every 30s while it is visible (matches the
+    // reference sugar-wallet behavior), so recent blocks stay current without
+    // a manual reload.  Block/tx drill views are static by nature — a reorg
+    // would just re-render them on next navigation.
+    // 链视图可见时每 30 秒自动刷新(与参考 sugar-wallet 一致),近期区块
+    // 无需手动刷新即可保持最新;block/tx 下钻视图本身静态,不刷新。
+    autoRefresh = setInterval(() => {
+      if (view === "chain" && !busy) loadChain();
+    }, 30000);
   });
+  onDestroy(() => clearInterval(autoRefresh));
 </script>
 
 <section class="exp">
@@ -287,8 +300,8 @@
         <div class="kv">
           <span>{t("exp.col_blockhash")}</span>
           <span class="mono kv-v link" translate="no" title={tx.blockhash} role="button" tabindex="0"
-            onclick={() => openBlock(tx.blockhash!)}
-            onkeydown={(e) => e.key === "Enter" && openBlock(tx.blockhash!)}
+            onclick={() => tx && openBlock(tx.blockhash!)}
+            onkeydown={(e) => e.key === "Enter" && tx && openBlock(tx.blockhash!)}
           >{tx.blockhash}</span>
         </div>
       {/if}
