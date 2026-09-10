@@ -4376,6 +4376,20 @@ func (sm *SyncManager) handleBlockchainNotification(notification *blockchain.Not
 			break
 		}
 
+		// A reorganize disconnected blocks from the best chain, which
+		// rewrites the height→hash mapping above the fork point.  Drop the
+		// O2 request-window cache here: entries cached before the reorg now
+		// hold stale hashes and would fail every prev-connection check (and
+		// headerLocator) until a fabricated-header rollback re-populates
+		// them, stalling the header/block download.  The next getheaders and
+		// prev checks refill from the reorged chain.
+		// 普通 REORGANIZE 会断开主链块并重写分叉点以上的 高度→hash 映射。
+		// 这里清空 O2 请求窗口缓存:reorg 前缓存的条目已是过期 hash,若不清理,
+		// 每次 prev 连接校验(及 headerLocator)都会失败,直到 fabricated 回滚
+		// 才重新填充,导致 header/block 下载卡死。后续 getheaders/prev 校验
+		// 会从重组后的链重新填充。
+		sm.reqWindow.reset()
+
 		// Reinsert all of the transactions (except the coinbase) into
 		// the transaction pool.
 		for _, tx := range block.Transactions()[1:] {
