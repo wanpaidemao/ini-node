@@ -1961,9 +1961,7 @@ func (b *BlockChain) initChainState() error {
 		// Set the best chain view and the best header to the stored best state.
 		tip := b.index.LookupNode(&state.hash)
 		if tip == nil {
-			// TEMP-DBG: dump the load context so we can see why no node was
-			// materialized / why lastNode is nil.
-			log.Warnf("TEMP-DBG tip-missing state.hash=%s state.height=%d "+
+			log.Warnf("tip-missing state.hash=%s state.height=%d "+
 				"useSnapshot=%v lastNodeNil=%v i=%d chainBoundary=%d "+
 				"headerBoundary=%d headerTipHeight=%d",
 				state.hash, state.height, useSnapshot, lastNode == nil, i,

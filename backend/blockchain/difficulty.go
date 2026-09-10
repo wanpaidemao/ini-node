@@ -241,16 +241,13 @@ func calcNextRequiredDifficulty(lastNode HeaderCtx, newBlockTime time.Time,
 		}
 	}
 	if pindexFirst == nil {
-		// TEMP DEBUG: this is the suspected root-cause path (severed
-		// parent chain -> difficulty walk stops early -> PowLimitBits).
-		// Log the height of the last node and how many steps we walked.
 		var lastH int32 = -1
 		var lastB uint32
 		if bn, ok := lastNode.(*blockNode); ok {
 			lastH = bn.height
 			lastB = bn.bits
 		}
-		log.Warnf("TEMP-DBG calcNextRequiredDifficulty walk stopped early: "+
+		log.Warnf("calcNextRequiredDifficulty walk stopped early: "+
 			"lastNode height=%d bits=%08x -> returning PowLimitBits=%08x "+
 			"(window=%d)", lastH, lastB,
 			c.ChainParams().PowLimitBits, SugarPowAveragingWindow)

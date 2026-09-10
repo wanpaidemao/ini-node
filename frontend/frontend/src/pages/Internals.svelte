@@ -12,6 +12,13 @@ let metric = $state("height");
 let timer: ReturnType<typeof setInterval> | undefined;
 // Auto-refresh interval in seconds; the user can change it in the page header.
 // Persisted in localStorage so the choice survives navigating away and back.
+// Default 3s: the internals view polls getblocksyncstatus, which on a busy
+// writer (block processing / UTXO flush) used to queue behind block handling
+// and freeze the whole page; 3s keeps the page responsive while still showing
+// live progress.
+// 自动刷新间隔(秒),用户可在页头调整,并持久化到 localStorage。
+// 默认 3s:该页轮询 getblocksyncstatus,在忙碌写入期(块处理/UTXO flush)
+// 曾会排队在块处理之后导致整页卡死;3s 让页面保持响应同时仍显示实时进度。
 const REFRESH_KEY = "int.refreshSec";
 function loadRefreshSec(): number {
   try {
@@ -20,7 +27,7 @@ function loadRefreshSec(): number {
   } catch {
     /* keep default */
   }
-  return 1;
+  return 3;
 }
 let refreshSec = $state(loadRefreshSec());
 

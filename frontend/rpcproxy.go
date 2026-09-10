@@ -36,7 +36,17 @@ const (
 var (
 	iniKeyRe    = regexp.MustCompile(`^\s*([a-zA-Z0-9]+)\s*=\s*(.*)$`)
 	iniUpdateRe = regexp.MustCompile(`^([a-zA-Z0-9]+)\s*=`)
-	rpcHTTP     = &http.Client{}
+	// rpcProxyTimeout bounds every proxied node RPC call.  Without it a wedged
+	// node (e.g. mid UTXO flush) makes the frontend's requests hang until the
+	// client-side 5s abort, piling connections up behind rpcmaxclients.  The
+	// node-side handlers for the UI's polling RPCs all return from lock-free
+	// snapshots (see D2/netsync.SyncStatus), so sub-second is expected.
+	// rpcProxyTimeout 限制每个被代理的节点 RPC 调用时长。没有它时,节点
+	// 卡死(如 UTXO flush 期间)会让前端请求一直挂到客户端 5s 中断,
+	// 连接会堆积在 rpcmaxclients 后面。UI 轮询类 RPC 的节点侧 handler 均
+	// 从无锁快照返回(见 D2/netsync.SyncStatus),预期亚秒级。
+	rpcProxyTimeout = 10 * time.Second
+	rpcHTTP        = &http.Client{Timeout: rpcProxyTimeout}
 )
 
 // findIniPath locates btcd-runtime.ini. Prefers an explicit INI_NODE_INI

@@ -140,6 +140,55 @@ async function chainSample(): Promise<{ height: number; rate: number }> {
   return { height: info.blocks, rate: lastRate };
 }
 
+// Short-lived in-flight cache for getSyncStatus.  The app shell's nav health
+// check and the Dashboard poll run on the same 5s cadence and would otherwise
+// issue the same getblockchaininfo/getpeerinfo pair twice per tick; the cache
+// window stays below one poll interval so results are never older than one
+// cadence.  A rejected fetch clears the cache so the next call retries.
+// getSyncStatus 的短生命周期在飞缓存。应用外壳的导航健康检查与 Dashboard
+// 轮询都按 5s 节拍运行,若无缓存每个周期会重复发出相同的
+// getblockchaininfo/getpeerinfo 各两次;缓存窗口低于一个轮询周期,因此
+// 结果不会超过一个节拍旧。请求失败会清空缓存以便下次重试。
+const SYNC_STATUS_TTL = 2000; // ms
+let syncStatusCache: { at: number; p: Promise<SyncStatus> } | null = null;
+
+async function loadSyncStatus(): Promise<SyncStatus> {
+  const [info, peers] = await Promise.all([
+    rpc<{
+      chain: string;
+      blocks: number;
+      headers: number;
+      bestblockhash: string;
+      difficulty: number;
+      verificationprogress?: number;
+    }>("getblockchaininfo"),
+    rpc<Array<{ currentheight: number }>>("getpeerinfo").catch(() => []),
+  ]);
+  const { rate } = await chainSample();
+  // This fork keeps its own headers within a window (headerwindow=50000), so
+  // local headers ≈ blocks even mid-sync. The real target is the network tip
+  // as reported by peers.
+  const networkTip = peers.reduce((m, p) => Math.max(m, p.currentheight ?? 0), 0);
+  const target = Math.max(info.headers, networkTip);
+  const gap = Math.max(0, target - info.blocks);
+  const etaMinutes = rate > 0 ? gap / rate / 60 : null;
+  const syncedPct =
+    info.verificationprogress !== undefined && info.headers >= target
+      ? info.verificationprogress * 100
+      : target > 0
+        ? Math.min(100, (info.blocks / target) * 100)
+        : 0;
+  return {
+    blocks: info.blocks,
+    headers: target,
+    bestBlockHash: info.bestblockhash,
+    difficulty: String(info.difficulty),
+    rateBlPerSec: Math.max(0, rate),
+    etaMinutes,
+    syncedPct,
+  };
+}
+
 export const Services = {
   // ── Node ──────────────────────────────────────────────────────
   /** Index rebuild progress (served by the app's own /api/index-progress,
@@ -159,40 +208,17 @@ export const Services = {
   },
 
   async getSyncStatus(): Promise<SyncStatus> {
-    const [info, peers] = await Promise.all([
-      rpc<{
-        chain: string;
-        blocks: number;
-        headers: number;
-        bestblockhash: string;
-        difficulty: number;
-        verificationprogress?: number;
-      }>("getblockchaininfo"),
-      rpc<Array<{ currentheight: number }>>("getpeerinfo").catch(() => []),
-    ]);
-    const { rate } = await chainSample();
-    // This fork keeps its own headers within a window (headerwindow=50000), so
-    // local headers ≈ blocks even mid-sync. The real target is the network tip
-    // as reported by peers.
-    const networkTip = peers.reduce((m, p) => Math.max(m, p.currentheight ?? 0), 0);
-    const target = Math.max(info.headers, networkTip);
-    const gap = Math.max(0, target - info.blocks);
-    const etaMinutes = rate > 0 ? gap / rate / 60 : null;
-    const syncedPct =
-      info.verificationprogress !== undefined && info.headers >= target
-        ? info.verificationprogress * 100
-        : target > 0
-          ? Math.min(100, (info.blocks / target) * 100)
-          : 0;
-    return {
-      blocks: info.blocks,
-      headers: target,
-      bestBlockHash: info.bestblockhash,
-      difficulty: String(info.difficulty),
-      rateBlPerSec: Math.max(0, rate),
-      etaMinutes,
-      syncedPct,
-    };
+    const now = Date.now();
+    if (syncStatusCache && now - syncStatusCache.at < SYNC_STATUS_TTL) {
+      return syncStatusCache.p;
+    }
+    const p = loadSyncStatus().catch((err) => {
+      // A failed fetch must never poison the shared cache for later callers.
+      syncStatusCache = null;
+      throw err;
+    });
+    syncStatusCache = { at: now, p };
+    return p;
   },
 
   async getNodeInfo(): Promise<NodeInfo> {

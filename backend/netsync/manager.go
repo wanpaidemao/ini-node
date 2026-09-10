@@ -102,7 +102,19 @@ const (
 	// or catch-up sync).  It reports the current height, the per-interval
 	// delta, the average blocks/sec, the share of the chain synced and an
 	// ETA based on the best known header height.
+	// statusSnapshotInterval is the minimum time between rebuilds of the
+	// atomically-published sync status snapshot.  Rebuilding on every
+	// processed message would add O(peers) work per block to the hot path;
+	// throttling to half a second keeps RPC reads fresh enough (a UI poll
+	// at 1-5s granularity sees at most one snapshot of lag) while the
+	// snapshot itself is served lock-free without queueing behind block
+	// processing.
+	// statusSnapshotInterval 是原子发布同步状态快照的最小重建间隔。
+	// 若每条消息都重建,O(peers) 的开销会进入块处理热路径;
+	// 节流到半秒既能保证 RPC 读到足够新鲜的数据(1-5s 轮询最多滞后一个
+	// 快照周期),快照本身又能无锁直读、无需排队等待块处理。
 	syncProgressLogInterval = time.Minute
+	statusSnapshotInterval  = 500 * time.Millisecond
 
 	// blockInFlightTarget is the number of blocks each participating peer in
 	// the parallel block download keeps in flight at a time.  A single
@@ -512,6 +524,22 @@ type SyncManager struct {
 	// the blockHandler goroutine.
 	headerSync *headerSyncState
 
+	// statusSnapshot is an atomically-published snapshot of the parallel sync
+	// state (see syncStatusSnapshot).  The blockHandler goroutine rebuilds it
+	// on a throttle (statusSnapshotInterval) so the RPC layer can serve
+	// getblocksyncstatus without queueing behind block processing; a nil
+	// snapshot means none has been published yet (startup only).
+	// statusSnapshot 是并行同步状态的原子发布快照(见 syncStatusSnapshot)。
+	// blockHandler goroutine 按节流周期(statusSnapshotInterval)重建它,
+	// 使 RPC 层无需排队等待块处理即可提供 getblocksyncstatus;nil 表示
+	// 尚未发布(仅启动初期)。
+	statusSnapshot atomic.Pointer[SyncStatus]
+	// lastStatusAt is the last time statusSnapshot was rebuilt.  Only touched
+	// from the blockHandler goroutine.
+	// lastStatusAt 记录 statusSnapshot 最近一次重建时间,仅由
+	// blockHandler goroutine 访问。
+	lastStatusAt time.Time
+
 	// headerRecent keeps the last few completed parallel header download
 	// windows (which peer fetched which [start, end) range) after the header
 	// download itself has finished, so an operator can still see how the
@@ -569,7 +597,7 @@ type SyncManager struct {
 	// count, since reaching a new height means the download made progress
 	// after the previous rollback.  Only touched from the blockHandler
 	// goroutine.
-	fabricatedRollbackCount int
+	fabricatedRollbackCount  int
 	fabricatedRollbackHeight int32
 	lastRollbackRefusalAt    time.Time
 
@@ -581,13 +609,6 @@ type SyncManager struct {
 	// the cut by one more block until the download resumes from a height the
 	// network actually shares.  Only touched from the blockHandler goroutine.
 	fabricatedRollbackDepth int32
-
-	// suspiciousHeaders remembers the first-header hashes of header ranges
-	// that failed to apply and were rolled back as fabricated or forked, so a
-	// peer that keeps re-serving the same bogus chain is detected immediately.
-	// Bounded to avoid unbounded growth.  Only touched from the blockHandler
-	// goroutine.
-	suspiciousHeaders map[chainhash.Hash]struct{}
 
 	// frontUnreachable counts, per front range start height, how many distinct
 	// peers have returned a response that does not extend the range (the
@@ -2931,19 +2952,10 @@ func (sm *SyncManager) processReadyHeaderRanges() {
 				// height rows feeding misattributed ranges) the peer
 				// carrying the real chain is the one whose response
 				// fails, and disconnecting it accelerates peer loss
-				// (P3).  Record the range's first hash as suspicious,
-				// roll the header chain back so the polluted segment
-				// is discarded, and let the fresh download proceed --
-				// the peer stays connected.
+				// (P3).  Roll the header chain back so the polluted
+				// segment is discarded, and let the fresh download
+				// proceed -- the peer stays connected.
 				if errors.As(err, &ruleErr) {
-					if hash, e2 := sm.chain.HeaderHashByHeight(front.start); e2 == nil {
-						if sm.suspiciousHeaders == nil {
-							sm.suspiciousHeaders = make(map[chainhash.Hash]struct{})
-						}
-						if len(sm.suspiciousHeaders) < 100 {
-							sm.suspiciousHeaders[*hash] = struct{}{}
-						}
-					}
 					log.Warnf("Header range at height %d failed to "+
 						"apply: %v -- rolling back header chain "+
 						"(peer %v stays connected)", front.start, err,
@@ -3907,6 +3919,11 @@ func (sm *SyncManager) blockHandler() {
 	progressTicker := time.NewTicker(syncProgressLogInterval)
 	defer progressTicker.Stop()
 
+	// Publish an initial sync status snapshot before processing any message so
+	// lock-free RPC reads never observe a nil snapshot.
+	// 在处理任何消息前先发布一次同步状态快照,保证无锁 RPC 读永不遇到 nil。
+	sm.refreshStatusSnapshot()
+
 out:
 	for {
 		select {
@@ -3943,7 +3960,18 @@ out:
 				msg.reply <- peerID
 
 			case getSyncStatusMsg:
-				msg.reply <- sm.syncStatusSnapshot()
+				st := sm.statusSnapshot.Load()
+				if st == nil {
+					// Startup race only: this message type used to build the
+					// snapshot inline, so keep a well-formed response even if
+					// the first refresh somehow has not run.
+					// 仅启动竞态:该消息类型原先在此内联构建快照,
+					// 即使首次刷新尚未执行也返回完整响应。
+					st = sm.syncStatusSnapshot()
+					sm.statusSnapshot.Store(st)
+					sm.lastStatusAt = time.Now()
+				}
+				msg.reply <- st
 
 			case processBlockMsg:
 				_, isOrphan, err := sm.chain.ProcessBlock(
@@ -4016,8 +4044,21 @@ out:
 					"handler: %T", msg)
 			}
 
+			// Top up the lock-free sync status snapshot on a throttle so RPC
+			// readers see fresh progress without paying per-message rebuild
+			// cost.
+			// 按节流刷新无锁同步状态快照,让 RPC 读者看到新鲜进度,
+			// 而无需为每条消息付出重建成本。
+			sm.refreshStatusSnapshot()
+
 		case <-stallTicker.C:
 			sm.handleStallSample()
+			// A stalled download may idle with no messages arriving for a long
+			// while (nothing re-triggers the msgChan branch above); refresh the
+			// snapshot here so RPC readers never see a stale HeaderTip.
+			// 下载停滞时可能长时间无消息到达(上面的 msgChan 分支不会触发),
+			// 在此刷新快照,避免 RPC 读到过期的 HeaderTip。
+			sm.refreshStatusSnapshot()
 
 		case <-progressTicker.C:
 			sm.logSyncProgress()
@@ -4046,11 +4087,6 @@ func (sm *SyncManager) handleBlockchainNotification(notification *blockchain.Not
 	case blockchain.NTBlockAccepted:
 		// Don't relay if we are not current. Other peers that are
 		// current should already know about it.
-		// TEMP DEBUG: log the relay gate decision / 临时调试:记录 relay 门控决策
-		block, _ := notification.Data.(*btcutil.Block)
-		if block != nil {
-			log.Warnf("TEMP-DBG NTBlockAccepted hash=%s current=%v (relay gate)", block.Hash(), sm.current())
-		}
 		if !sm.current() {
 			return
 		}
@@ -4063,7 +4099,6 @@ func (sm *SyncManager) handleBlockchainNotification(notification *blockchain.Not
 
 		// Generate the inventory vector and relay it.
 		iv := wire.NewInvVect(wire.InvTypeBlock, block.Hash())
-		log.Warnf("TEMP-DBG relaying block inv %s", block.Hash())
 		sm.peerNotifier.RelayInventory(iv, block.MsgBlock().Header)
 
 	// A block has been connected to the main block chain.
@@ -4256,12 +4291,50 @@ func (sm *SyncManager) SyncPeerID() int32 {
 // SyncStatus returns a snapshot of the sync manager's parallel initial
 // download state, including the header range and block slice assigned to each
 // participating peer.  It is safe for concurrent access: the snapshot is built
-// inside the blockHandler goroutine so it does not require any locking and does
-// not perturb the download path beyond a single extra channel message.
+// inside the blockHandler goroutine on a throttle and atomically published, so
+// concurrent RPC reads never queue behind block processing (a long UTXO flush
+// or a burst of blocks cannot stall the sync-status poll).  A nil snapshot can
+// only be observed at startup before the first rebuild; the few callers that
+// must avoid a nil pointer (the RPC handler) fall back to a live build via the
+// channel.
+// SyncStatus 返回同步管理器并行初始下载状态的快照,含每个参与 peer 分到的
+// header 区间与 block 切片。并发安全:快照在 blockHandler goroutine 内按
+// 节流重建并原子发布,并发 RPC 读永不排队等待块处理(长时间 UTXO flush 或
+// 块突发都不会卡住同步状态轮询)。nil 快照只可能出现在启动初期首次重建
+// 之前;需要避免空指针的调用方(RPC handler)会回退到经 channel 的实时构建。
 func (sm *SyncManager) SyncStatus() *SyncStatus {
+	if st := sm.statusSnapshot.Load(); st != nil {
+		return st
+	}
+
+	// Very early startup: no snapshot published yet.  Fall back to the
+	// historical synchronous path so a caller still gets a well-formed state.
+	// While the manager is shutting down the channel path may never run; an
+	// empty snapshot keeps RPC handlers nil-pointer safe.
+	// 极早期启动:尚未发布快照,回退到历史同步路径以返回完整状态;
+	// 管理器关闭时 channel 路径可能永不执行,返回空快照以保证
+	// RPC handler 不会空指针。
 	reply := make(chan *SyncStatus)
-	sm.msgChan <- getSyncStatusMsg{reply: reply}
-	return <-reply
+	select {
+	case sm.msgChan <- getSyncStatusMsg{reply: reply}:
+		return <-reply
+	case <-sm.quit:
+		return &SyncStatus{}
+	}
+}
+
+// refreshStatusSnapshot rebuilds and atomically publishes the sync status
+// snapshot, throttled to at most one build per statusSnapshotInterval.  It
+// MUST be called from the blockHandler goroutine.
+// refreshStatusSnapshot 重建并原子发布同步状态快照,节流限制为每个
+// statusSnapshotInterval 最多一次,必须从 blockHandler goroutine 调用。
+func (sm *SyncManager) refreshStatusSnapshot() {
+	if now := time.Now(); now.Sub(sm.lastStatusAt) < statusSnapshotInterval {
+		return
+	} else {
+		sm.lastStatusAt = now
+	}
+	sm.statusSnapshot.Store(sm.syncStatusSnapshot())
 }
 
 // syncStatusSnapshot builds the per-peer SyncStatus snapshot.  It must be
@@ -4369,7 +4442,6 @@ func New(config *Config) (*SyncManager, error) {
 		requestedTxns:      make(map[chainhash.Hash]struct{}),
 		requestedBlocks:    make(map[chainhash.Hash]struct{}),
 		peerStates:         make(map[*peerpkg.Peer]*peerSyncState),
-		suspiciousHeaders:  make(map[chainhash.Hash]struct{}),
 		frontUnreachable:   make(map[int32]map[string]time.Time),
 		progressLogger:     newBlockProgressLogger("Processed", log),
 		msgChan:            make(chan interface{}, config.MaxPeers*3),

@@ -1240,10 +1240,30 @@ func handleGetBlockChainInfo(s *rpcServer, cmd interface{}, closeChan <-chan str
 	chain := s.cfg.Chain
 	chainSnapshot := chain.BestSnapshot()
 
+	// Report the true applied header tip, not the connected block height.
+	// During a header-first sync the header chain is far ahead of the
+	// connected best chain, so "headers" used to be reported as equal to
+	// "blocks" and the frontend's syncing/catch-up display had to infer the
+	// tip from the sync manager instead.  The sync status snapshot is served
+	// lock-free (see netsync.SyncManager.SyncStatus), so this adds no chain
+	// lock contention; fall back to the connected height when the manager is
+	// unavailable.
+	// 上报真实的已应用 header tip,而非已连接区块高度。headers-first 同步期
+	// header 链远超已连接 best chain,此前 "headers" 恒等于 "blocks",前端
+	// 的同步/追赶显示只能从 sync manager 推断 tip。sync 状态快照为无锁直读
+	// (见 netsync.SyncManager.SyncStatus),因此这里不引入链锁竞争;
+	// 管理器不可用时回退到已连接高度。
+	headers := chainSnapshot.Height
+	if s.cfg.SyncMgr != nil {
+		if st := s.cfg.SyncMgr.SyncStatus(); st != nil && st.HeaderTip > headers {
+			headers = st.HeaderTip
+		}
+	}
+
 	chainInfo := &btcjson.GetBlockChainInfoResult{
 		Chain:         params.Name,
 		Blocks:        chainSnapshot.Height,
-		Headers:       chainSnapshot.Height,
+		Headers:       headers,
 		BestBlockHash: chainSnapshot.Hash.String(),
 		Difficulty:    getDifficultyRatio(chainSnapshot.Bits, params),
 		MedianTime:    chainSnapshot.MedianTime.Unix(),
@@ -3761,11 +3781,10 @@ func handleSubmitBlock(s *rpcServer, cmd interface{}, closeChan <-chan struct{})
 
 	// Process this block using the same rules as blocks coming from other
 	// nodes.  This will in turn relay it to the network like normal.
-	// TEMP DEBUG: trace submitblock lifecycle / 临时调试:追踪 submitblock 生命周期
 	hdr := block.MsgBlock().Header
-	rpcsLog.Warnf("TEMP-DBG submitblock received hash=%s prev=%s time=%d bits=%08x", block.Hash(), hdr.PrevBlock, hdr.Timestamp.Unix(), hdr.Bits)
+	rpcsLog.Tracef("submitblock received hash=%s prev=%s time=%d bits=%08x", block.Hash(), hdr.PrevBlock, hdr.Timestamp.Unix(), hdr.Bits)
 	isOrphan, err := s.cfg.SyncMgr.SubmitBlock(block, blockchain.BFMinerSubmit)
-	rpcsLog.Warnf("TEMP-DBG submitblock processed hash=%s orphan=%v err=%v", block.Hash(), isOrphan, err)
+	rpcsLog.Tracef("submitblock processed hash=%s orphan=%v err=%v", block.Hash(), isOrphan, err)
 	if err != nil {
 		return fmt.Sprintf("rejected: %s", err.Error()), nil
 	}
