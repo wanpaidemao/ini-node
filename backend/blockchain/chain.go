@@ -3,6 +3,7 @@
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
+// Asher_Mod_Start_20260910_123842
 // Asher_Mod_Start_20260910_112851
 package blockchain
 
@@ -11,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/btcsuite/btcd/btcutil/v2"
@@ -124,7 +126,7 @@ type BlockChain struct {
 
 	// chainLock protects concurrent access to the vast majority of the
 	// fields in this struct below this point.
-	chainLock sync.RWMutex
+	chainLock trackedRWMutex
 
 	// pruneTarget is the size in bytes the database targets for when the node
 	// is pruned.
@@ -245,6 +247,17 @@ type BlockChain struct {
 	notifyQuit    chan struct{}
 	notifyDone    chan struct{} // closed when the notify loop exits
 	notifyStopped sync.Once
+
+	// utxoFlushLastMs and utxoFlushCount feed the A6 metrics layer: the most
+	// recent UTXO cache flush duration in milliseconds and the total number of
+	// flushes since process start.  Updated at the FlushUtxoCache entry, so
+	// they cover both the background periodic flush and the shutdown flush.
+	// Written with atomic stores; readable lock-free from any goroutine.
+	// utxoFlushLastMs/utxoFlushCount 供 A6 指标层使用:最近一次 UTXO 缓存
+	// 落盘耗时(毫秒)与进程启动以来落盘总次数。在 FlushUtxoCache 入口更新,
+	// 覆盖后台周期落盘与关闭时落盘。原子写入,任意 goroutine 无锁可读。
+	utxoFlushLastMs atomic.Int64
+	utxoFlushCount  atomic.Int64
 }
 
 // HaveBlock returns whether or not the chain instance has the block data
@@ -3038,3 +3051,4 @@ func (b *BlockChain) CachedStateSize() uint64 {
 	defer b.chainLock.Unlock()
 	return b.utxoCache.totalMemoryUsage()
 }
+// Asher_Mod_End_20260910_123842

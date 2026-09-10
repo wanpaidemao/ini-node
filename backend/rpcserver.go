@@ -3,6 +3,7 @@
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
+// Asher_Mod_Start_20260910_123842
 package main
 
 import (
@@ -2680,6 +2681,17 @@ func handleGetBlockSyncStatus(s *rpcServer, cmd interface{}, closeChan <-chan st
 		HeaderSliceLen:     st.HeaderSliceLen,
 		HeaderRecentRanges: make([]btcjson.HeaderRecentRangeResult, 0, len(st.HeaderRecentRanges)),
 		Peers:              make([]btcjson.PeerSyncStatusResult, 0, len(st.Peers)),
+		// A6 unified atomic metrics.  log_bytes is read here because the log
+		// rotator lives in package main (LogFileSize); the rest arrive in the
+		// lock-free snapshot from the blockHandler goroutine.
+		// A6 统一原子指标。log_bytes 在此读取(日志 rotator 在 package main,
+		// 经 LogFileSize);其余字段随无锁快照由 blockHandler goroutine 提供。
+		BlocksPerSec:    st.BlocksPerSec,
+		ChainLockWaitMs: st.ChainLockWaitMs,
+		UtxoFlushLastMs: st.UtxoFlushLastMs,
+		UtxoFlushCount:  st.UtxoFlushCount,
+		MsgQueueDepth:   st.MsgQueueDepth,
+		LogBytes:        LogFileSize(),
 	}
 	for _, w := range st.HeaderRecentRanges {
 		result.HeaderRecentRanges = append(result.HeaderRecentRanges, btcjson.HeaderRecentRangeResult{
@@ -5079,3 +5091,4 @@ func init() {
 	rpcHandlers = rpcHandlersBeforeInit
 	rand.Seed(time.Now().UnixNano())
 }
+// Asher_Mod_End_20260910_123842

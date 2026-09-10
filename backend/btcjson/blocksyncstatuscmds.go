@@ -2,6 +2,7 @@
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
+// Asher_Mod_Start_20260910_123842
 package btcjson
 
 // GetBlockSyncStatusCmd defines the getblocksyncstatus JSON-RPC command.
@@ -57,9 +58,19 @@ type GetBlockSyncStatusResult struct {
 	BlockNextAssign  int32                 `json:"block_next_assign"`
 	BlockWindow      int32                 `json:"block_window"`
 	Peers            []PeerSyncStatusResult `json:"peers"`
+
+	// A6 unified atomic metrics (see the project performance plan).
+	// A6 统一原子指标(见项目性能方案)。
+	BlocksPerSec     float64 `json:"blocks_per_sec"`
+	ChainLockWaitMs  int64   `json:"chain_lock_wait_ms"`
+	UtxoFlushLastMs  int64   `json:"utxo_flush_last_ms"`
+	UtxoFlushCount   int64   `json:"utxo_flush_count"`
+	MsgQueueDepth    int     `json:"msg_queue_depth"`
+	LogBytes         int64   `json:"log_bytes"`
 }
 
 func init() {
 	flags := UsageFlag(0)
 	MustRegisterCmd("getblocksyncstatus", (*GetBlockSyncStatusCmd)(nil), flags)
 }
+// Asher_Mod_End_20260910_123842

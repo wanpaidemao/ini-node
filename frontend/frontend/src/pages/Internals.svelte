@@ -1,4 +1,5 @@
 <script lang="ts">
+  // Asher_Mod_Start_20260910_123842
   import { onMount, onDestroy } from "svelte";
   import { flip } from "svelte/animate";
   import { fade } from "svelte/transition";
@@ -866,6 +867,24 @@ onDestroy(() => clearInterval(timer));
           <text class="chart-axis" x="348" y="148" text-anchor="end">{chartSeries.xTicks.t1}</text>
         </svg>
       </div>
+
+      <!-- A6 node metrics: node-native block rate, chain-lock wait, UTXO flush,
+           message queue depth and log size (from getblocksyncstatus).  Labels
+           stay literal technical terms shared across languages, like "KB/s". -->
+      <!-- A6 节点指标:节点原生块速率、链锁等待、UTXO 落盘、消息队列深度与
+           日志大小(来自 getblocksyncstatus)。标签使用各语言通用的技术术语,
+           与 "KB/s" 一致。 -->
+      <div class="card">
+        <div class="card-head">
+          <span class="h-card">A6 · 节点指标</span>
+        </div>
+        <div class="chart-num mono">
+          <span class="lg fwd">{dat ? dat.blocksPerSec.toFixed(1) : "0.0"} blk/s</span>
+          <span class="lg dim">锁 {dat ? dat.chainLockWaitMs : 0} ms</span>
+          <span class="lg dim">flush {dat ? dat.utxoFlushLastMs : 0} ms ×{dat ? dat.utxoFlushCount : 0}</span>
+          <span class="lg dim">队列 {dat ? dat.msgQueueDepth : 0} · 日志 {dat ? fmtBytes(dat.logBytes) : "0 B"}</span>
+        </div>
+      </div>
     </div>
 
     <!-- per-peer quality (bottom of page): numbered by the persistent
@@ -1662,3 +1681,4 @@ onDestroy(() => clearInterval(timer));
     }
   }
 </style>
+<!-- Asher_Mod_End_20260910_123842 -->

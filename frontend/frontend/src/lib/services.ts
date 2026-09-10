@@ -6,6 +6,7 @@
 //
 // Design docs: NodeService / WalletService / ConfigService / TxBuilder /
 // RpcService / UTXO (§06-umami-go-gui-detailed.md).
+// Asher_Mod_Start_20260910_123842
 
 import type {
   AppConfig,
@@ -328,6 +329,12 @@ export const Services = {
           in_flight_blocks: number;
           last_block_at: number;
         }>;
+        blocks_per_sec: number;
+        chain_lock_wait_ms: number;
+        utxo_flush_last_ms: number;
+        utxo_flush_count: number;
+        msg_queue_depth: number;
+        log_bytes: number;
       }>("getblocksyncstatus"),
       // Low-cadence per-peer connection stats for the quality / traffic cards.
       // Sampled here (every poll) but the UI refreshes them at its own pace
@@ -526,6 +533,17 @@ export const Services = {
         syncNode: p.syncnode ?? false,
         inbound: p.inbound ?? false,
       })),
+      // A6 unified atomic metrics from the node (see the performance plan):
+      // node-native block rate, average chain-lock wait, UTXO flush stats,
+      // message queue depth and current log size.
+      // A6 统一原子指标(见性能方案):节点原生块速率、平均链锁等待、
+      // UTXO 落盘统计、消息队列深度与当前日志大小。
+      blocksPerSec: sync.blocks_per_sec ?? 0,
+      chainLockWaitMs: sync.chain_lock_wait_ms ?? 0,
+      utxoFlushLastMs: sync.utxo_flush_last_ms ?? 0,
+      utxoFlushCount: sync.utxo_flush_count ?? 0,
+      msgQueueDepth: sync.msg_queue_depth ?? 0,
+      logBytes: sync.log_bytes ?? 0,
       debugLevel: await Services.getDebugLevel().catch(() => "info"),
     };
   },
@@ -1188,3 +1206,4 @@ export const Services = {
     };
   },
 };
+// Asher_Mod_End_20260910_123842

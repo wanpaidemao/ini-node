@@ -2,6 +2,7 @@
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
+// Asher_Mod_Start_20260910_123842
 package blockchain
 
 import (
@@ -588,12 +589,23 @@ func (s *utxoCache) flush(dbTx database.Tx, mode FlushMode, bestState *BestState
 //
 // This function is safe for concurrent access.
 func (b *BlockChain) FlushUtxoCache(mode FlushMode) error {
+	start := time.Now()
 	b.chainLock.Lock()
 	defer b.chainLock.Unlock()
 
-	return b.db.Update(func(dbTx database.Tx) error {
+	err := b.db.Update(func(dbTx database.Tx) error {
 		return b.utxoCache.flush(dbTx, mode, b.BestSnapshot())
 	})
+
+	// Feed the A6 metrics layer: record the most recent flush duration and the
+	// running flush count.  Timed from the entry so it covers the full flush
+	// (chain lock + database write) for both the background periodic flush and
+	// the shutdown flush.
+	// 为 A6 指标层记录最近一次落盘耗时与累计落盘次数。从入口计时,
+	// 覆盖完整落盘(链锁+数据库写入),对后台周期落盘与关闭时落盘均生效。
+	b.utxoFlushLastMs.Store(time.Since(start).Milliseconds())
+	b.utxoFlushCount.Add(1)
+	return err
 }
 
 // PurgeUtxosAboveHeight removes every UTXO entry whose block height exceeds the
@@ -854,3 +866,4 @@ func (b *BlockChain) flushNeededAfterPrune(deletedBlockHashes []chainhash.Hash) 
 
 	return highestDeletedHeight >= lastFlushHeight, nil
 }
+// Asher_Mod_End_20260910_123842

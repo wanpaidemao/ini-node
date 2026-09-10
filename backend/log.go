@@ -3,6 +3,7 @@
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
+// Asher_Mod_Start_20260910_123842
 package main
 
 import (
@@ -55,6 +56,12 @@ var (
 	// logRotator is one of the logging outputs.  It should be closed on
 	// application shutdown.
 	logRotator *rotator.Rotator
+
+	// logFilePath is the path of the active log file, recorded by
+	// initLogRotator and used by LogFileSize to feed the A6 metrics layer.
+	// logFilePath 是当前日志文件路径,由 initLogRotator 记录,
+	// LogFileSize 用它为 A6 指标层提供日志字节数。
+	logFilePath string
 
 	adxrLog = backendLog.Logger("ADXR")
 	amgrLog = backendLog.Logger("AMGR")
@@ -128,6 +135,25 @@ func initLogRotator(logFile string) {
 	}
 
 	logRotator = r
+	logFilePath = logFile
+}
+
+// LogFileSize returns the current size in bytes of the active log file, or 0
+// if the rotator has not been initialized or the file cannot be statted.  It
+// feeds the A6 log_bytes metric; the rotator renames the file on rotation, so
+// statting the recorded path always reflects the live log.
+// LogFileSize 返回当前日志文件的字节大小,未初始化或 stat 失败时返回 0。
+// 它为 A6 log_bytes 指标供数;轮转时 rotator 会重命名文件,因此 stat 记录的
+// 路径始终反映实时日志。
+func LogFileSize() int64 {
+	if logFilePath == "" {
+		return 0
+	}
+	st, err := os.Stat(logFilePath)
+	if err != nil {
+		return 0
+	}
+	return st.Size()
 }
 
 // setLogLevel sets the logging level for provided subsystem.  Invalid
@@ -190,3 +216,4 @@ func pickNoun(n uint64, singular, plural string) string {
 	}
 	return plural
 }
+// Asher_Mod_End_20260910_123842

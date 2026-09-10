@@ -2,6 +2,7 @@
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
+// Asher_Mod_Start_20260910_123842
 // Asher_Mod_Start_20260910_112851
 package netsync
 
@@ -488,6 +489,25 @@ type SyncStatus struct {
 	HeaderPaused bool `json:"header_paused"`
 	// Peers lists every connected peer with its sync role and assigned work.
 	Peers []PeerSyncStatus `json:"peers"`
+
+	// A6 unified atomic metrics (see the project performance plan).  All of
+	// them are computed inside the blockHandler goroutine and published with
+	// the snapshot, so the RPC layer reads them lock-free.
+	// A6 统一原子指标(见项目性能方案)。全部在 blockHandler goroutine 内
+	// 计算并随快照发布,RPC 层无锁读取。
+	// BlocksPerSec is the instantaneous block processing rate since the
+	// previous snapshot build (blocks processed per second).
+	BlocksPerSec float64 `json:"blocks_per_sec"`
+	// ChainLockWaitMs is the average chain-lock acquisition wait in
+	// milliseconds since process start (cumulative wait / acquisitions).
+	ChainLockWaitMs int64 `json:"chain_lock_wait_ms"`
+	// UtxoFlushLastMs is the duration of the most recent UTXO cache flush.
+	UtxoFlushLastMs int64 `json:"utxo_flush_last_ms"`
+	// UtxoFlushCount is the total number of UTXO cache flushes since start.
+	UtxoFlushCount int64 `json:"utxo_flush_count"`
+	// MsgQueueDepth is the current number of queued messages in the sync
+	// manager's inbound channel.
+	MsgQueueDepth int `json:"msg_queue_depth"`
 }
 
 // limitAdd is a helper function for maps that require a maximum limit by
@@ -554,6 +574,22 @@ type SyncManager struct {
 	// lastStatusAt 记录 statusSnapshot 最近一次重建时间,仅由
 	// blockHandler goroutine 访问。
 	lastStatusAt time.Time
+
+	// blocksProcessed counts every block the blockHandler accepted from the
+	// network (including orphans, which still consume processing work) and
+	// feeds the A6 blocks_per_sec metric.  Written from the blockHandler
+	// goroutine, read atomically when building the snapshot.
+	// blocksProcessed 统计 blockHandler 从网络接受的每个块(含孤儿——它们
+	// 同样消耗处理工作),供 A6 blocks_per_sec 指标使用。由 blockHandler
+	// goroutine 写入,构建快照时原子读取。
+	blocksProcessed atomic.Int64
+	// lastBlocksProcessed and lastSnapshotBuiltAt track the previous sample
+	// for the instantaneous blocks-per-second rate.  Only touched from the
+	// blockHandler goroutine.
+	// lastBlocksProcessed/lastSnapshotBuiltAt 记录 blocks-per-second 瞬时
+	// 速率的上一次采样,仅由 blockHandler goroutine 访问。
+	lastBlocksProcessed int64
+	lastSnapshotBuiltAt time.Time
 
 	// headerRecent keeps the last few completed parallel header download
 	// windows (which peer fetched which [start, end) range) after the header
@@ -1931,6 +1967,13 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 		peer.PushRejectMsg(wire.CmdBlock, code, reason, blockHash, false)
 		return
 	}
+
+	// The block was accepted (or recognized as an orphan) without error:
+	// count it for the A6 blocks_per_sec metric.  Orphans count too because
+	// they still consume the same validation pipeline.
+	// 块已被接受(或识别为孤儿)且无错误:为 A6 blocks_per_sec 指标计数。
+	// 孤儿同样计入,因为它们消耗相同的校验流水线。
+	sm.blocksProcessed.Add(1)
 
 	// Meta-data about the new block this peer is reporting. We use this
 	// below to update this peer's latest block height and the heights of
@@ -4447,6 +4490,31 @@ func (sm *SyncManager) syncStatusSnapshot() *SyncStatus {
 		status.Peers = append(status.Peers, ps)
 	}
 
+	// A6 unified atomic metrics: instantaneous block rate since the previous
+	// snapshot build, average chain-lock wait, UTXO flush stats and the
+	// inbound message queue depth.  All reads here are lock-free (atomics and
+	// len on the channel), so building the snapshot adds no contention to the
+	// download path.  log_bytes is filled by the RPC layer (package main owns
+	// the log rotator).
+	// A6 统一原子指标:自上次快照以来的瞬时块速率、平均链锁等待、UTXO 落盘
+	// 统计与入站消息队列深度。此处全部为无锁读取(原子与 channel len),
+	// 构建快照不会给下载路径增加争用。log_bytes 由 RPC 层填充
+	// (日志 rotator 归 package main 所有)。
+	now := time.Now()
+	if elapsed := now.Sub(sm.lastSnapshotBuiltAt).Seconds(); elapsed > 0 {
+		if rate := float64(sm.blocksProcessed.Load()-sm.lastBlocksProcessed) / elapsed; rate > 0 {
+			status.BlocksPerSec = rate
+		}
+	}
+	sm.lastBlocksProcessed = sm.blocksProcessed.Load()
+	sm.lastSnapshotBuiltAt = now
+
+	if waitNanos, acqCount := sm.chain.ChainLockWaitStats(); acqCount > 0 {
+		status.ChainLockWaitMs = waitNanos / acqCount / int64(time.Millisecond)
+	}
+	status.UtxoFlushLastMs, status.UtxoFlushCount = sm.chain.UtxoFlushStats()
+	status.MsgQueueDepth = len(sm.msgChan)
+
 	return status
 }
 
@@ -4538,4 +4606,5 @@ func New(config *Config) (*SyncManager, error) {
 
 	return &sm, nil
 }
+// Asher_Mod_End_20260910_123842
 // Asher_Mod_End_20260910_112851

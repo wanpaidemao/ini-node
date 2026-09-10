@@ -1,4 +1,5 @@
 // ── ini-node shared types (mirror design docs §data binding) ──
+// Asher_Mod_Start_20260910_123842
 
 export type Route =
   | "dashboard"
@@ -125,6 +126,17 @@ export interface NodeInternals {
     nextAssign: number;
   };
   mem: { gap: number; window: number; inflight: number };
+  // A6 unified atomic metrics reported by the node (see the performance plan):
+  // node-native block rate, average chain-lock wait, UTXO flush stats, message
+  // queue depth and current log size.
+  // A6 统一原子指标(见性能方案):节点原生块速率、平均链锁等待、
+  // UTXO 落盘统计、消息队列深度与当前日志大小。
+  blocksPerSec: number;
+  chainLockWaitMs: number;
+  utxoFlushLastMs: number;
+  utxoFlushCount: number;
+  msgQueueDepth: number;
+  logBytes: number;
   debugLevel: string;
   // Per-peer connection stats from getpeerinfo, sampled at a low cadence
   // (5 min / manual refresh) so the quality cards do not churn every 2s poll.
@@ -227,3 +239,4 @@ export interface ExplorerTx {
   outputs: { n: number; value: number; address: string | null }[];
   inputs: { txid: string; vout: number; address: string | null }[];
 }
+// Asher_Mod_End_20260910_123842
