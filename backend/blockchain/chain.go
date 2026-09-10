@@ -3,6 +3,7 @@
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
+// Asher_Mod_Start_20260910_112851
 package blockchain
 
 import (
@@ -231,6 +232,19 @@ type BlockChain struct {
 	// certain blockchain events.
 	notificationsLock sync.RWMutex
 	notifications     []NotificationCallback
+
+	// notifyChan is the bounded queue of the asynchronous notification bus.
+	// sendNotification enqueues events here (falling back to an inline
+	// dispatch when the queue is full) and the notifyLoop goroutine invokes
+	// the registered callbacks, so block processing never waits for a
+	// subscriber (relay / mempool / websocket) to finish.
+	// notifyChan 是异步通知总线的有界队列:sendNotification 把事件入队
+	// (队列满时回退为内联派发),notifyLoop goroutine 依次调用已注册回调,
+	// 因此块处理永远不会等待订阅者(relay/mempool/websocket)完成。
+	notifyChan    chan Notification
+	notifyQuit    chan struct{}
+	notifyDone    chan struct{} // closed when the notify loop exits
+	notifyStopped sync.Once
 }
 
 // HaveBlock returns whether or not the chain instance has the block data
@@ -2929,7 +2943,15 @@ func New(config *Config) (*BlockChain, error) {
 		warningCaches:       newThresholdCaches(vbNumBits),
 		deploymentCaches:    newThresholdCaches(chaincfg.DefinedDeployments),
 		pruneTarget:         config.Prune,
+		notifyChan:          make(chan Notification, notifyQueueCapacity),
+		notifyQuit:          make(chan struct{}),
+		notifyDone:          make(chan struct{}),
 	}
+
+	// Start the asynchronous notification bus so block processing can publish
+	// chain events without waiting for subscribers.
+	// 启动异步通知总线,让块处理无需等待订阅者即可发布链事件。
+	go b.notifyLoop()
 
 	// Set the best header tip function so flushToDB persists the best header
 	// state alongside the block index writes.
@@ -3007,6 +3029,7 @@ func New(config *Config) (*BlockChain, error) {
 
 	return &b, nil
 }
+// Asher_Mod_End_20260910_112851
 
 // CachedStateSize returns the total size of the cached state of the blockchain
 // in bytes.

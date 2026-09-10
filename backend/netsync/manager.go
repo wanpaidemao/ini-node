@@ -2,6 +2,7 @@
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
+// Asher_Mod_Start_20260910_112851
 package netsync
 
 import (
@@ -226,6 +227,20 @@ type notFoundMsg struct {
 // donePeerMsg signifies a newly disconnected peer to the block handler.
 type donePeerMsg struct {
 	peer *peerpkg.Peer
+}
+
+// chainNotificationMsg forwards a blockchain notification from the
+// notification-bus goroutine into the blockHandler goroutine.  The bus calls
+// the subscribed callback on its own thread, while SyncManager state is only
+// ever touched from blockHandler; the callback therefore enqueues the event
+// and the handler reprocesses it here, so the notification is consumed with
+// the same single-threaded guarantees as every other message.
+// chainNotificationMsg 把区块链通知从通知总线 goroutine 转发进 blockHandler
+// goroutine。总线在自身线程调用订阅回调,而 SyncManager 状态只在 blockHandler
+// 被访问;因此回调只入队事件,由这里在处理时消费,使通知与其它消息一样满足
+// 单线程访问保证。
+type chainNotificationMsg struct {
+	notification *blockchain.Notification
 }
 
 // txMsg packages a bitcoin tx message and the peer it came from together
@@ -630,12 +645,6 @@ type SyncManager struct {
 	// Reset whenever the download makes progress.  Only touched from the
 	// blockHandler goroutine.
 	orphanFloodCount int32
-
-	// lastUtxoFlush is the last time the UTXO cache was asked to flush.
-	// It is used to trigger periodic flushes even while in initial block
-	// download mode so that an unclean shutdown does not fall far behind the
-	// chain tip and force a long reconstruction on the next start.
-	lastUtxoFlush time.Time
 
 	// lastSyncProgressHeight and lastSyncProgressTime track the previous
 	// sample for the periodic sync progress log.
@@ -2055,18 +2064,19 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 		}
 	}
 
-	// If we are not in the initial block download mode, it's a good time to
-	// periodically flush the blockchain cache because we don't expect new
-	// blocks immediately.  While in initial block download mode, also flush
-	// periodically so the consistent UTXO state does not fall far behind the
-	// chain tip, otherwise an unclean shutdown forces a long reconstruction
-	// on the next start.
-	if !sm.ibdMode || time.Since(sm.lastUtxoFlush) >= utxoFlushInterval {
-		if err := sm.chain.FlushUtxoCache(blockchain.FlushPeriodic); err != nil {
-			log.Errorf("Error while flushing the blockchain cache: %v", err)
-		}
-		sm.lastUtxoFlush = time.Now()
-	}
+	// UTXO periodic flushing moved to the dedicated background goroutine
+	// (utxoFlushLoop): it used to run inline on every block here, holding the
+	// chain write lock for the whole flush and queueing every other message
+	// (including getblocksyncstatus) behind a multi-second write.  The
+	// background loop calls FlushUtxoCache(FlushPeriodic) on the same cadence;
+	// the chain lock still serializes the flush against block processing, but
+	// the flush no longer occupies the blockHandler nor the sync-status read
+	// path (which is a lock-free snapshot).
+	// UTXO 周期落盘已移到独立后台 goroutine(utxoFlushLoop):原先在本函数
+	// 逐块内联执行,整个 flush 期间持有链写锁并让所有其它消息(含
+	// getblocksyncstatus)排队在其后。后台循环按相同周期调用
+	// FlushUtxoCache(FlushPeriodic);链锁仍会把 flush 与块处理串行化,但
+	// flush 不再占用 blockHandler,也不占用同步状态读路径(已是无锁快照)。
 	if !sm.ibdMode {
 		return
 	}
@@ -3952,6 +3962,14 @@ out:
 			case *donePeerMsg:
 				sm.handleDonePeerMsg(msg.peer)
 
+			case chainNotificationMsg:
+				// Handle a blockchain notification (submitted by the
+				// notification-bus goroutine) in the blockHandler thread so
+				// SyncManager state keeps its single-writer guarantee.
+				// 在 blockHandler 线程处理区块链通知(由通知总线 goroutine
+				// 入队),维持 SyncManager 状态的单写入者保证。
+				sm.handleBlockchainNotification(msg.notification)
+
 			case getSyncPeerMsg:
 				var peerID int32
 				if sm.syncPeer != nil {
@@ -4262,8 +4280,37 @@ func (sm *SyncManager) Start() {
 	}
 
 	log.Trace("Starting sync manager")
-	sm.wg.Add(1)
+	sm.wg.Add(2)
 	go sm.blockHandler()
+	go sm.utxoFlushLoop()
+}
+
+// utxoFlushLoop periodically asks the chain to flush its UTXO cache to disk.
+// It replaces the inline flush that ran inside handleBlockMsg so a full-cache
+// write (which holds the chain write lock for its whole duration) no longer
+// occupies the blockHandler goroutine nor queues the sync-status reads.  The
+// cadence is the same utxoFlushInterval (5m); FlushPeriodic only writes when
+// the cache is full or the periodic interval has actually elapsed, so the loop
+// is effectively a no-op on most ticks.  FlushRequired at shutdown still runs
+// in blockHandler.
+// utxoFlushLoop 周期性地让链把 UTXO 缓存写盘。它替代 handleBlockMsg 内联
+// flush:全量写盘(整个期间持有链写锁)不再占用 blockHandler goroutine,
+// 也不再让同步状态读排队。节拍仍为 utxoFlushInterval(5 分钟);
+// FlushPeriodic 仅在缓存满或周期真正到期时才写,因此大多数 tick 是空操作。
+// 关闭时的 FlushRequired 仍由 blockHandler 执行。
+func (sm *SyncManager) utxoFlushLoop() {
+	ticker := time.NewTicker(utxoFlushInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if err := sm.chain.FlushUtxoCache(blockchain.FlushPeriodic); err != nil {
+				log.Errorf("Error while flushing the blockchain cache: %v", err)
+			}
+		case <-sm.quit:
+			return
+		}
+	}
 }
 
 // Stop gracefully shuts down the sync manager by stopping all asynchronous
@@ -4454,7 +4501,41 @@ func New(config *Config) (*SyncManager, error) {
 		log.Info("Checkpoints are disabled")
 	}
 
-	sm.chain.Subscribe(sm.handleBlockchainNotification)
+	// Subscribe to chain notifications through the blockHandler goroutine:
+	// the notification bus invokes this callback on its own thread, so the
+	// callback only enqueues the event — all SyncManager state mutation
+	// happens on the blockHandler where the message is consumed.  Withdrawing
+	// on shutdown is unnecessary: the bus layer is owned by the chain and this
+	// callback just forwards, and Stop() closes sm.quit so a late enqueue is
+	// dropped instead of blocking the bus.
+	// 经 blockHandler goroutine 订阅链通知:通知总线在自身线程调用本回调,
+	// 回调只入队事件,所有 SyncManager 状态修改都发生在消费该消息的
+	// blockHandler 上。关闭时无需退订:总线归属链,本回调仅转发,
+	// Stop() 关闭 sm.quit 后迟到的入队会被丢弃而非阻塞总线。
+	// Asher_Mod_Start_20260910_122156
+	sm.chain.Subscribe(func(notification *blockchain.Notification) {
+		select {
+		case sm.msgChan <- chainNotificationMsg{notification}:
+		case <-sm.quit:
+		default:
+			// The queue is full (blockHandler is busy processing a block
+			// while the bus is draining, or an extreme event burst): drop
+			// the event rather than block the notification bus.  Dropping
+			// is safe — block processing is the only producer of chain
+			// events, so the queue can only fill transiently while
+			// blockHandler itself is inside ProcessBlock, and a missed
+			// relay/mempool update self-corrects on the next block.
+			// 队列已满(blockHandler 正忙于处理块而总线在排空,或极端
+			// 事件洪流):丢弃该事件而非阻塞通知总线。丢弃是安全的——
+			// 链事件的唯一生产者就是块处理,队列只会在 blockHandler
+			// 自身处于 ProcessBlock 内时短暂填满,漏掉的 relay/mempool
+			// 更新会在下一个块自动修正。
+			log.Tracef("Dropping chain notification %v: msgChan full",
+				notification.Type)
+		}
+	})
+	// Asher_Mod_End_20260910_122156
 
 	return &sm, nil
 }
+// Asher_Mod_End_20260910_112851

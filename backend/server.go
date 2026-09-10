@@ -3,6 +3,7 @@
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
+// Asher_Mod_Start_20260910_112851
 package main
 
 import (
@@ -2851,6 +2852,12 @@ func (s *server) Stop() error {
 		srvrLog.Errorf("Failed to flush block index: %v", err)
 	}
 
+	// Stop the asynchronous notification bus and deliver whatever is still
+	// queued so no subscriber misses a final chain event during shutdown.
+	// 停止异步通知总线并排空剩余队列,保证关闭期间订阅者不遗漏最后的
+	// 链事件。
+	s.chain.StopNotifications()
+
 	// Close the sugar index LevelDB if it was opened.
 	if s.sugarIndex != nil {
 		if err := s.sugarIndex.Close(); err != nil {
@@ -2871,6 +2878,7 @@ func (s *server) Stop() error {
 	close(s.quit)
 	return nil
 }
+// Asher_Mod_End_20260910_112851
 
 // WaitForShutdown blocks until the main listener and peer handlers are stopped.
 func (s *server) WaitForShutdown() {

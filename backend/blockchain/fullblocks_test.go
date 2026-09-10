@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/btcsuite/btcd/blockchain"
 	"github.com/btcsuite/btcd/blockchain/fullblocktests"
@@ -69,6 +70,7 @@ func chainSetup(dbName string, params *chaincfg.Params) (*blockchain.BlockChain,
 	// specific handling.
 	var db database.DB
 	var teardown func()
+	var chain *blockchain.BlockChain
 	if testDbType == "memdb" {
 		ndb, err := database.Create(testDbType)
 		if err != nil {
@@ -79,6 +81,9 @@ func chainSetup(dbName string, params *chaincfg.Params) (*blockchain.BlockChain,
 		// Setup a teardown function for cleaning up.  This function is
 		// returned to the caller to be invoked when it is done testing.
 		teardown = func() {
+			if chain != nil {
+				chain.StopNotifications()
+			}
 			db.Close()
 		}
 	} else {
@@ -103,6 +108,9 @@ func chainSetup(dbName string, params *chaincfg.Params) (*blockchain.BlockChain,
 		// Setup a teardown function for cleaning up.  This function is
 		// returned to the caller to be invoked when it is done testing.
 		teardown = func() {
+			if chain != nil {
+				chain.StopNotifications()
+			}
 			db.Close()
 			os.RemoveAll(dbPath)
 			os.RemoveAll(testDbRoot)
@@ -114,7 +122,8 @@ func chainSetup(dbName string, params *chaincfg.Params) (*blockchain.BlockChain,
 	paramsCopy := *params
 
 	// Create the main chain instance.
-	chain, err := blockchain.New(&blockchain.Config{
+	var err error
+	chain, err = blockchain.New(&blockchain.Config{
 		DB:          db,
 		ChainParams: &paramsCopy,
 		Checkpoints: nil,
@@ -146,68 +155,67 @@ func TestFullBlocks(t *testing.T) {
 	}
 	defer teardownFunc()
 
-	testBlockDisconnectExpectUTXO := func(item fullblocktests.BlockDisconnectExpectUTXO) {
-		expectedCallBack := func(notification *blockchain.Notification) {
-			switch notification.Type {
+	testBlockDisconnectExpectUTXO := func(item fullblocktests.BlockDisconnectExpectUTXO) <-chan error {
+		// Notifications are delivered asynchronously on the chain's
+		// notification-bus goroutine, so the check runs there and hands the
+		// result back to the test goroutine through this channel; the test
+		// drains it after each processed item.  This keeps the assertion in
+		// the test goroutine (t.Fatal is not safe from other goroutines)
+		// while the UTXO state is still inspected at the moment the
+		// disconnect is observed.
+		// 通知由通知总线 goroutine 异步投递,因此检查在该 goroutine 内执行,
+		// 结果经此通道交回测试 goroutine;测试线程在每处理完一个 item 后
+		// 排空结果。这样断言留在测试 goroutine(t.Fatal 在其它 goroutine
+		// 不安全),而 UTXO 状态仍在观察到断开的那一刻被检查。
+		results := make(chan error, 1)
+		chain.Subscribe(func(notification *blockchain.Notification) {
+			if notification.Type != blockchain.NTBlockDisconnected {
+				return
+			}
 
-			case blockchain.NTBlockDisconnected:
-				block, ok := notification.Data.(*btcutil.Block)
-				if !ok {
-					t.Fatalf("expected a block")
+			block, ok := notification.Data.(*btcutil.Block)
+			if !ok {
+				select {
+				case results <- fmt.Errorf("expected a block"):
+				default:
 				}
+				return
+			}
 
-				// Return early if the block we get isn't the relevant
-				// block.
-				if !block.Hash().IsEqual(&item.BlockHash) {
-					return
+			// Return early if the block we get isn't the relevant block.
+			if !block.Hash().IsEqual(&item.BlockHash) {
+				return
+			}
+
+			entry, err := chain.FetchUtxoEntry(item.OutPoint)
+			if err != nil {
+				select {
+				case results <- err:
+				default:
 				}
+				return
+			}
 
-				entry, err := chain.FetchUtxoEntry(item.OutPoint)
-				if err != nil {
-					t.Fatal(err)
-				}
-
+			if item.Expected {
 				if entry == nil || entry.IsSpent() {
-					t.Logf("expected utxo %v to exist but it's "+
-						"nil or spent\n", item.OutPoint.String())
-					t.Fatalf("expected utxo %v to exist but it's "+
-						"nil or spent", item.OutPoint.String())
+					select {
+					case results <- fmt.Errorf("expected utxo %v to exist "+
+						"but it's nil or spent", item.OutPoint.String()):
+					default:
+					}
 				}
-			}
-		}
-		unexpectedCallBack := func(notification *blockchain.Notification) {
-			switch notification.Type {
-			case blockchain.NTBlockDisconnected:
-				block, ok := notification.Data.(*btcutil.Block)
-				if !ok {
-					t.Fatalf("expected a block")
-				}
-
-				// Return early if the block we get isn't the relevant
-				// block.
-				if !block.Hash().IsEqual(&item.BlockHash) {
-					return
-				}
-
-				entry, err := chain.FetchUtxoEntry(item.OutPoint)
-				if err != nil {
-					t.Fatal(err)
-				}
-
+			} else {
 				if entry != nil && !entry.IsSpent() {
-					t.Logf("unexpected utxo %v to exist but it's "+
-						"not nil and not spent", item.OutPoint.String())
-					t.Fatalf("unexpected utxo %v exists but it's "+
-						"not nil and not spent\n", item.OutPoint.String())
+					select {
+					case results <- fmt.Errorf("unexpected utxo %v "+
+						"exists but it's not nil and not spent",
+						item.OutPoint.String()):
+					default:
+					}
 				}
 			}
-		}
-
-		if item.Expected {
-			chain.Subscribe(expectedCallBack)
-		} else {
-			chain.Subscribe(unexpectedCallBack)
-		}
+		})
+		return results
 	}
 
 	// testAcceptedBlock attempts to process the block in the provided test
@@ -351,6 +359,30 @@ func TestFullBlocks(t *testing.T) {
 		}
 	}
 
+	// drainDisconnectResults consumes any disconnect-check results that the
+	// notification bus has already delivered.  Asynchronous delivery means a
+	// result may arrive during a later item's processing, so the drain runs
+	// after every item and again after the loop with a final wait.
+	// drainDisconnectResults 消费通知总线已投递的断开检查结果。由于异步
+	// 投递,结果可能在后续 item 处理期间才到达,因此在每个 item 之后排空,
+	// 循环结束后再做一次带超时的最终等待。
+	var pendingResults []<-chan error
+	drainDisconnectResults := func(fatal bool) {
+		for _, r := range pendingResults {
+			select {
+			case err := <-r:
+				if err != nil {
+					if fatal {
+						t.Fatal(err)
+					}
+					t.Errorf("%v", err)
+					return
+				}
+			default:
+			}
+		}
+	}
+
 	for testNum, test := range tests {
 		for itemNum, item := range test {
 			switch item := item.(type) {
@@ -365,12 +397,23 @@ func TestFullBlocks(t *testing.T) {
 			case fullblocktests.ExpectedTip:
 				testExpectedTip(item)
 			case fullblocktests.BlockDisconnectExpectUTXO:
-				testBlockDisconnectExpectUTXO(item)
+				pendingResults = append(pendingResults,
+					testBlockDisconnectExpectUTXO(item))
 			default:
 				t.Fatalf("test #%d, item #%d is not one of "+
 					"the supported test instance types -- "+
 					"got type: %T", testNum, itemNum, item)
 			}
+
+			drainDisconnectResults(false)
 		}
 	}
+
+	// Give any final disconnect notifications a moment to be delivered by the
+	// bus before asserting a failure, so a pending-but-delivered result is
+	// not misreported as missing.
+	// 给最后的断开通知一点时间由总线投递,再将未消费结果判为失败以
+	// 避免把"已投递但未读取"误报为缺失。
+	time.Sleep(250 * time.Millisecond)
+	drainDisconnectResults(true)
 }

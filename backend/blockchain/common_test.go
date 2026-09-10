@@ -128,6 +128,7 @@ func chainSetup(dbName string, params *chaincfg.Params) (*BlockChain, func(), er
 	// specific handling.
 	var db database.DB
 	var teardown func()
+	var chain *BlockChain
 	if testDbType == "memdb" {
 		ndb, err := database.Create(testDbType)
 		if err != nil {
@@ -138,6 +139,9 @@ func chainSetup(dbName string, params *chaincfg.Params) (*BlockChain, func(), er
 		// Setup a teardown function for cleaning up.  This function is
 		// returned to the caller to be invoked when it is done testing.
 		teardown = func() {
+			if chain != nil {
+				chain.StopNotifications()
+			}
 			db.Close()
 		}
 	} else {
@@ -162,6 +166,9 @@ func chainSetup(dbName string, params *chaincfg.Params) (*BlockChain, func(), er
 		// Setup a teardown function for cleaning up.  This function is
 		// returned to the caller to be invoked when it is done testing.
 		teardown = func() {
+			if chain != nil {
+				chain.StopNotifications()
+			}
 			db.Close()
 			os.RemoveAll(dbPath)
 			os.RemoveAll(testDbRoot)
@@ -173,7 +180,8 @@ func chainSetup(dbName string, params *chaincfg.Params) (*BlockChain, func(), er
 	paramsCopy := *params
 
 	// Create the main chain instance.
-	chain, err := New(&Config{
+	var err error
+	chain, err = New(&Config{
 		DB:          db,
 		ChainParams: &paramsCopy,
 		Checkpoints: nil,
