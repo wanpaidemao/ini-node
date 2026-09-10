@@ -1554,6 +1554,16 @@ func (b *BlockChain) BestHeader() (chainhash.Hash, int32) {
 	return best.hash, best.height
 }
 
+// HeaderWindow returns the configured in-memory header window size: the number
+// of recent headers/blocks kept in memory at the tips of the best chain and
+// best header chain.  A zero value means the full block index is retained.
+// It is a read-only configuration value, so it is returned without taking the
+// chain lock.  The frontend uses it to render the window band on the sync
+// dashboard instead of hard-coding a window size.
+func (b *BlockChain) HeaderWindow() int32 {
+	return b.headerWindow
+}
+
 // BestDownloadState returns the hash and the height of the furthest block whose
 // data is present on disk.  A restart uses it to resume a block download from
 // that block instead of re-scanning every height below it.  A height of -1 is

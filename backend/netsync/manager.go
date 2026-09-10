@@ -421,6 +421,94 @@ type blockSyncState struct {
 	frontMissingHeight int32
 }
 
+// requestWindowCache is a height→hash sliding cache for the request window.
+// It caches the hashes of all heights that are ever needed for
+// HeaderHashByHeight(start-1) during getheaders requests, plus every header
+// applied to the chain.  Because the parallel download may assign ranges that
+// lead the applied tip (up to headerLeadLimit), entries can transiently sit
+// above the applied tip; the cache must therefore be slid explicitly from the
+// applied-tip benchmark (maybeSlide) rather than from every insertion.
+//
+// This eliminates repeated DB cold reads for heights that have already been
+// evicted from the in-memory header window but are still within the request
+// lead (the P8/P9 cold read bottleneck on re-download after a rollback).
+//
+// Snapping is a full sweep when the benchmark advances by > snapInterval
+// heights, so long IBD runs sweep at most once per snapInterval headers.
+//
+// Only accessed from the blockHandler goroutine (no locking needed).
+type requestWindowCache struct {
+	cache map[int32]*chainhash.Hash // height → hash
+	min   int32                     // minimum cached height (inclusive)
+	max   int32                     // maximum cached height (inclusive)
+	last  int32                     // benchmark height of the last sweep
+}
+
+// snapInterval is how often the cache finally sweeps stale entries: every
+// snapInterval heights of applied-tip progress.  A value larger than the
+// typical header batch keeps a sweep from running on every batch while still
+// bounding the map to roughly (headerLeadLimit + snapInterval) entries.
+const snapInterval = 2000
+
+// newRequestWindowCache creates an empty request window cache.
+func newRequestWindowCache() *requestWindowCache {
+	return &requestWindowCache{
+		cache: make(map[int32]*chainhash.Hash, headerLeadLimit+snapInterval),
+		min:   0x7fffffff,
+		max:   -0x7fffffff,
+	}
+}
+
+// get retrieves the cached hash for height, or nil if not cached.
+func (w *requestWindowCache) get(height int32) *chainhash.Hash {
+	return w.cache[height]
+}
+
+// put adds a height→hash entry to the cache.  Insertion only: eviction is the
+// job of maybeSlide, because a transient leading assignment may raise max far
+// above the applied tip and must not shrink the live window off the applied
+// tip itself.
+func (w *requestWindowCache) put(height int32, hash *chainhash.Hash) {
+	w.cache[height] = hash
+	if height < w.min {
+		w.min = height
+	}
+	if height > w.max {
+		w.max = height
+	}
+}
+
+// maybeSlide drops every entry below (bench - headerLeadLimit), where bench is
+// the applied-tip benchmark.  It sweeps at most once per snapInterval heights
+// of benchmark progress so a fast IBD does not rescan the map on every header.
+// Entries above bench are transient leading assignments and are kept: they map
+// the receive frontier, which the very next assignHeaderRange may re-ask.
+func (w *requestWindowCache) maybeSlide(bench int32) {
+	if w.max == -0x7fffffff || bench-w.last < snapInterval {
+		return
+	}
+	w.last = bench
+	cutoff := bench - headerLeadLimit
+	if cutoff <= w.min {
+		return
+	}
+	for h := range w.cache {
+		if h < cutoff {
+			delete(w.cache, h)
+		}
+	}
+	w.min = cutoff
+}
+
+// reset clears the entire cache (used after a rollback rewrites the
+// height→hash mapping above the cut height).
+func (w *requestWindowCache) reset() {
+	w.cache = make(map[int32]*chainhash.Hash, headerLeadLimit+snapInterval)
+	w.min = 0x7fffffff
+	w.max = -0x7fffffff
+	w.last = 0
+}
+
 // PeerSyncStatus describes one peer's role in an in-progress parallel initial
 // download.  It is an immutable snapshot built inside the blockHandler
 // goroutine for the RPC layer.
@@ -559,6 +647,15 @@ type SyncManager struct {
 	// performed across several peers in parallel.  It is only touched from
 	// the blockHandler goroutine.
 	headerSync *headerSyncState
+
+	// reqWindow caches height→hash for the request window (within
+	// headerLeadLimit of the applied tip).  getheaders locators and the
+	// receive-side prev-connection checks query it before falling back to the
+	// chain, so heights that were already evicted from the in-memory header
+	// window but are still within the request lead do not each trigger a DB
+	// cold read (the P8/P9 cold-read bottleneck during re-download after a
+	// rollback).  It is only touched from the blockHandler goroutine.
+	reqWindow *requestWindowCache
 
 	// statusSnapshot is an atomically-published snapshot of the parallel sync
 	// state (see syncStatusSnapshot).  The blockHandler goroutine rebuilds it
@@ -842,14 +939,23 @@ func (sm *SyncManager) fetchHeaders() {
 // height so that a getheaders request asks the peer for the headers immediately
 // after it.  A nil locator (request the whole chain) is only returned for a
 // negative height, which never happens during the normal initial block download.
+//
+// O2: Requests the hash from the request-window cache first; a miss goes to
+// the chain and is filled into the cache.  This eliminates DB cold reads for
+// heights that are within the request lead but have been evicted from the
+// in-memory header window (common on re-download after a rollback).
 func (sm *SyncManager) headerLocator(height int32) blockchain.BlockLocator {
 	if height < 0 {
 		return nil
+	}
+	if cached := sm.reqWindow.get(height); cached != nil {
+		return blockchain.BlockLocator([]*chainhash.Hash{cached})
 	}
 	hash, err := sm.chain.HeaderHashByHeight(height)
 	if err != nil {
 		return nil
 	}
+	sm.reqWindow.put(height, hash)
 	return blockchain.BlockLocator([]*chainhash.Hash{hash})
 }
 
@@ -2804,7 +2910,24 @@ func (sm *SyncManager) handleParallelHeadersMsg(peer *peerpkg.Peer,
 	// [6706690..6706692], offset by 53314) passes every other check, so
 	// skipping the prev test when the lookup fails lets the offset segment
 	// into the header index and pollutes the height→hash mapping.
-	expected, err := sm.chain.HeaderHashByHeight(rng.start - 1)
+	//
+	// O2: Query the request-window cache first for the prev hash; a miss goes
+	// to the chain and the result is filled back.  A re-download after a
+	// rollback re-issues the same leading ranges repeatedly, so caching the
+	// start-1 hash here (authoritative: verified against the applied chain in
+	// the very same check) makes every later re-issue hit memory instead of
+	// cold-reading the DB for the same height again.
+	var expected *chainhash.Hash
+	var err error
+	prevHeight := rng.start - 1
+	if cached := sm.reqWindow.get(prevHeight); cached != nil {
+		expected = cached
+	} else {
+		expected, err = sm.chain.HeaderHashByHeight(prevHeight)
+		if err == nil {
+			sm.reqWindow.put(prevHeight, expected)
+		}
+	}
 	if err != nil || !headers[0].PrevBlock.IsEqual(expected) {
 		log.Warnf("Peer %v returned headers that do not extend the "+
 			"range starting at %d (or could not be verified) -- ignoring "+
@@ -2924,9 +3047,23 @@ func (sm *SyncManager) processReadyHeaderRanges() {
 		// every earlier check, so this final connection test is what catches
 		// it: its prev does not equal the applied chain's hash at start-1.
 		// Discard the range and re-issue it rather than polluting the index.
+		//
+		// O2: Query the request-window cache first for the prev hash; a miss
+		// goes to the chain and the result is filled back, so a re-download
+		// after rollback does not cold-read the DB for every leading range.
 		if len(front.headers) > 0 {
-			if expected, err := sm.chain.HeaderHashByHeight(front.start - 1); err != nil ||
-				!front.headers[0].PrevBlock.IsEqual(expected) {
+			var expected *chainhash.Hash
+			var err error
+			prevHeight := front.start - 1
+			if cached := sm.reqWindow.get(prevHeight); cached != nil {
+				expected = cached
+			} else {
+				expected, err = sm.chain.HeaderHashByHeight(prevHeight)
+				if err == nil {
+					sm.reqWindow.put(prevHeight, expected)
+				}
+			}
+			if err != nil || !front.headers[0].PrevBlock.IsEqual(expected) {
 
 				log.Warnf("Header range at height %d does not extend the "+
 					"applied chain at %d (or could not be verified) -- "+
@@ -3029,7 +3166,24 @@ func (sm *SyncManager) processReadyHeaderRanges() {
 			}
 			front.applied++
 			sm.progressLogger.SetLastLogTime(time.Now())
+			// O2 backfill: the applied header now lives in the chain, so its
+			// height→hash mapping is authoritative.  Caching it here lets every
+			// subsequent launchHeaderRange/prev check for this window hit
+			// memory instead of cold-reading the DB for a height that has
+			// already been evicted from the in-memory header window.
+			// O2 回填:已应用的 header 高度→hash 是权威的,回填后后续
+			// getheaders/prev 校验直接命中,不再对已逐出内存窗口的高度冷读。
+			appliedHeight := front.start + front.applied - 1
+			appliedHash := blockHeader.BlockHash()
+			sm.reqWindow.put(appliedHeight, &appliedHash)
 		}
+
+		// O2 slide: the applied tip advanced, so drop the request-window
+		// cache entries that are now outside the lead.  Bounded by
+		// snapInterval so this scans at most once per 2000 applied headers.
+		// O2 滑动:应用前沿前进,清理请求窗口缓存中已超出 lead 的旧条目,
+		// 以 snapInterval 为界,每应用 2000 个 header 至多扫描一次。
+		sm.reqWindow.maybeSlide(hs.nextHeight - 1)
 
 		sm.recordHeaderWindow(front.start, front.start+int32(len(front.headers)), front.peer)
 
@@ -3404,6 +3558,12 @@ func (sm *SyncManager) rollbackFabricatedHeaderChain() {
 // sync from the current best-header tip.  It is shared by the explicit
 // fork-point rollback and the generic fabricated-header-chain rollback.
 func (sm *SyncManager) resetDownloadState() {
+	// A rollback rewrites the height→hash mapping above the cut height, so
+	// every cached request-window entry may now be stale.  Drop them all: the
+	// next getheaders/prev checks repopulate from the post-rollback chain.
+	// O2 缓存失效:回滚重写了切点以上的 高度→hash,全部缓存可能过期,
+	// 直接清空,后续 getheaders/prev 校验从回滚后的链上重新填充。
+	sm.reqWindow.reset()
 	sm.headerSync = nil
 	sm.blockSync = nil
 	sm.blockSyncState = nil
@@ -4565,6 +4725,7 @@ func New(config *Config) (*SyncManager, error) {
 		quit:               make(chan struct{}),
 		feeEstimator:       config.FeeEstimator,
 		blockSyncStartLead: config.BlockSyncStartLead,
+		reqWindow:          newRequestWindowCache(),
 	}
 
 	if config.DisableCheckpoints {

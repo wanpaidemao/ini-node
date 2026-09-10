@@ -61,6 +61,7 @@ export type ConnState = "online" | "syncing" | "offline";
 export interface SyncStatus {
   blocks: number;
   headers: number;
+  headerWindow: number;
   bestBlockHash: string;
   difficulty: string;
   rateBlPerSec: number;

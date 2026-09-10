@@ -2483,3 +2483,129 @@ func TestBlockSliceCappedByHeaderLead(t *testing.T) {
 	require.LessOrEqual(t, sl.end-1, bestHeaderHeight)
 }
 // Asher_Mod_End_20260910_135605
+
+// TestRequestWindowCache verifies the O2 request-window cache semantics:
+// storage, window sliding driven by the applied-tip benchmark, and full reset
+// after a rollback.  It is a pure unit test and does not touch the database.
+func TestRequestWindowCache(t *testing.T) {
+	w := newRequestWindowCache()
+
+	// Empty cache misses.
+	if w.get(1) != nil {
+		t.Fatal("empty cache must miss")
+	}
+
+	// put/get round-trip.
+	h0 := &chainhash.Hash{}
+	w.put(0, h0)
+	if got := w.get(0); got != h0 {
+		t.Fatalf("expected cached hash for height 0, got %v", got)
+	}
+
+	// Leading assignments above the applied tip are kept, not evicted: the
+	// cache must never shrink the live window against the applied tip.
+	for h := int32(1); h <= headerLeadLimit+100; h++ {
+		hh := chainhash.Hash{byte(h)}
+		w.put(h, &hh)
+	}
+	// Slide with the applied tip far below the leading entries.
+	w.maybeSlide(1)
+	if w.get(0) == nil {
+		t.Fatal("window must not evict below the applied-tip lead")
+	}
+	if w.get(headerLeadLimit) == nil {
+		t.Fatal("leading entry still within lead must survive")
+	}
+
+	// A slide past the lead drops the old low entries.
+	w.maybeSlide(20 + headerLeadLimit)
+	if w.get(0) != nil {
+		t.Fatal("entry older than the lead must be evicted once the tip advances")
+	}
+	if w.get(headerLeadLimit) == nil {
+		t.Fatal("entry at the lead boundary must survive")
+	}
+
+	// reset clears everything (rollback path).
+	w.reset()
+	if w.get(headerLeadLimit) != nil {
+		t.Fatal("reset must leave the cache empty")
+	}
+
+	// Re-populate and verify a fresh slide still works after reset.
+	hh := chainhash.Hash{0xff}
+	w.put(5, &hh)
+	w.maybeSlide(5)
+	if w.get(5) == nil {
+		t.Fatal("recent entry must survive a slide after reset")
+	}
+}
+
+// TestHeaderLocatorUsesRequestWindowCache verifies that headerLocator serves
+// heights from the request-window cache and fills it on a miss, so repeated
+// locators for heights outside the in-memory header window do not re-read the
+// database.
+func TestHeaderLocatorUsesRequestWindowCache(t *testing.T) {
+	params := chaincfg.RegressionNetParams
+	params.Checkpoints = nil
+	sm, tearDown := makeMockSyncManager(t, &params)
+	defer tearDown()
+
+	const headerHeight = 5
+	headers := makeTestHeaderChain(t, &params, headerHeight)
+	for _, h := range headers {
+		_, err := sm.chain.ProcessBlockHeader(h, blockchain.BFNoPoWCheck, false)
+		require.NoError(t, err)
+	}
+
+	// First call resolves through the chain and fills the cache.
+	loc := sm.headerLocator(headerHeight)
+	require.NotNil(t, loc)
+	require.Same(t, loc[0], sm.reqWindow.get(headerHeight),
+		"headerLocator must cache the resolved hash")
+	chainHash, chainErr := sm.chain.HeaderHashByHeight(headerHeight)
+	require.NoError(t, chainErr)
+	require.Equal(t, *loc[0], *chainHash)
+
+	// A second call for the same height must hit the cache without error.
+	loc2 := sm.headerLocator(headerHeight)
+	require.NotNil(t, loc2)
+	require.Equal(t, *loc[0], *loc2[0])
+
+	// Reset simulates a rollback: the cached entry must be gone and the
+	// locator must re-resolve through the chain.
+	sm.reqWindow.reset()
+	require.Nil(t, sm.reqWindow.get(headerHeight))
+	loc3 := sm.headerLocator(headerHeight)
+	require.NotNil(t, loc3)
+	require.Equal(t, *loc[0], *loc3[0])
+
+	// Negative height yields a nil locator as before.
+	require.Nil(t, sm.headerLocator(-1))
+}
+
+// Asher_Mod_Start_20260910_150300
+// TestRequestWindowCacheMaybeSlideThrottle verifies the slide sweep only runs
+// once the benchmark has advanced by snapInterval, keeping a fast IBD from
+// rescaming the map on every applied header.
+func TestRequestWindowCacheMaybeSlideThrottle(t *testing.T) {
+	w := newRequestWindowCache()
+
+	for h := int32(0); h < headerLeadLimit+snapInterval*3; h++ {
+		hh := chainhash.Hash{byte(h)}
+		w.put(h, &hh)
+	}
+
+	// A small advance below snapInterval must not trigger a sweep (the zero
+	// cached min means no eviction happens anyway).
+	w.maybeSlide(snapInterval - 1)
+	require.Equal(t, int32(0), int32(w.last))
+
+	// A full snapInterval advance triggers the sweep and drops entries below
+	// the lead.
+	w.maybeSlide(snapInterval + headerLeadLimit)
+	if w.get(0) != nil {
+		t.Fatal("benchmark-advanced slide must evict stale low entries")
+	}
+}
+// Asher_Mod_End_20260910_150300

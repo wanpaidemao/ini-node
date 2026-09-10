@@ -4,7 +4,7 @@
   import { flip } from "svelte/animate";
   import { fade } from "svelte/transition";
   import { t, fmt, fmtAgo, fmtBytes, fmtUptime } from "../lib/i18n";
-  import { Services } from "../lib/services";
+  import { Services, rpcBusyFlag } from "../lib/services";
   import type { NodeInternals } from "../lib/types";
 
 let dat = $state<NodeInternals | null>(null);
@@ -31,6 +31,10 @@ function loadRefreshSec(): number {
   return 3;
 }
 let refreshSec = $state(loadRefreshSec());
+// F3: true while the rpc layer is backing off consecutive failures (the node
+// is stall-writing to disk); the header shows a "disk busy" hint so a slower
+// refresh reads as intentional rather than a frozen page.
+let busy = $state(false);
 
 function restartTimer() {
   try {
@@ -242,6 +246,10 @@ function restartTimer() {
       }
     } catch {
       /* keep */
+    } finally {
+      // F3: reflect the rpc-layer backoff state so the header shows whether
+      // polling is slowing down because the node is stall-writing to disk.
+      busy = rpcBusyFlag();
     }
   }
 
@@ -634,6 +642,9 @@ onDestroy(() => clearInterval(timer));
     <span class="head-controls">
       <span class="live">
         <span class="dot" aria-hidden="true"></span> {refreshSec}s
+        {#if busy}
+          <span class="busy" title="node is stall-writing to disk; refresh is backed off">⏳ disk busy</span>
+        {/if}
       </span>
       <select class="refresh-select mono" aria-label="auto refresh interval" bind:value={refreshSec} onchange={restartTimer}>
         <option value={1}>1s</option>
@@ -1000,6 +1011,11 @@ onDestroy(() => clearInterval(timer));
     border: 1px solid var(--line);
     background: var(--ink);
     color: var(--ink-fg);
+  }
+  .busy {
+    color: var(--amber, #f5b23a);
+    font-size: 12px;
+    font-weight: 600;
   }
   .h-page {
     font-family: var(--font-display);

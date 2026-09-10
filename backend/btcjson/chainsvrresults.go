@@ -229,6 +229,7 @@ type GetBlockChainInfoResult struct {
 	Chain                string        `json:"chain"`
 	Blocks               int32         `json:"blocks"`
 	Headers              int32         `json:"headers"`
+	HeaderWindow         int32         `json:"headerwindow,omitempty"`
 	BestBlockHash        string        `json:"bestblockhash"`
 	Difficulty           float64       `json:"difficulty"`
 	MedianTime           int64         `json:"mediantime"`

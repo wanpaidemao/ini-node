@@ -57,11 +57,12 @@
     if (indexProgress && indexProgress.total > 0) return indexProgress.total;
     return status ? status.headers : 0;
   }
-  // chain ribbon width: window (50k) scaled to full chain
+  // chain ribbon width: window scaled to full chain (window size comes from
+  // the node, not hard-coded, so a config change stays in sync with reality)
   function ribbon() {
     if (!status || totalS() === 0) return { pct: 0, winPct: 0, caught: false };
     const p = Math.min(100, (status.blocks / totalS()) * 100);
-    const winPct = Math.max(1.2, (50000 / totalS()) * 100);
+    const winPct = Math.max(1.2, ((status.headerWindow || 50000) / totalS()) * 100);
     return { pct: p, winPct, caught: status.blocks >= status.headers - 1 };
   }
   function eta() {
@@ -93,8 +94,8 @@
   const syncingPeers = () => peers.filter((p) => p.syncBlPerSec != null).length;
 
   function absWin(i: number) {
-    // the 50000-block window ends near the tip; highlight ~those links
-    const zone = Math.max(2, (50000 / (status?.headers ?? 43_750_000)) * 100);
+    // the in-memory window ends near the tip; highlight ~those links
+    const zone = Math.max(2, ((status?.headerWindow || 50000) / (status?.headers ?? 43_750_000)) * 100);
     return i >= 100 - zone - 2 && i <= 100 - zone + 6 ? true : false;
   }
 </script>

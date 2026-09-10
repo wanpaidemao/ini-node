@@ -61,7 +61,30 @@ interface RpcEnvelope {
 // catch ignores it and the next poll simply retries.
 const rpcTimeout = 5000; // ms
 
+// F3: consecutive-RPC-failure backoff for the write-busy window.  When the
+// node stalls on disk (block processing / UTXO flush), every poll trips the
+// timeout and the page visibly freezes.  The next attempt is pushed out by
+// backoffDelay so a wedged server gets a few seconds of air instead of a
+// hammering retry loop; a success resets the backoff and the cadence resumes.
+// The "busy" flag lets the UI show a "disk busy, slower refresh" hint.
+const backoffDelay = 10_000; // ms
+let rpcFails = 0;
+let rpcLastFailAt = 0;
+let rpcBusy = false;
+
+// rpcBusyFlag is a lightweight signal for the UI: true while consecutive RPC
+// failures suggest the node is stall-writing to disk.  Read it from pages to
+// show a slower-refresh hint instead of blinding retrying.
+export function rpcBusyFlag(): boolean {
+  return rpcBusy;
+}
+
 async function rpc<T>(method: string, ...params: unknown[]): Promise<T> {
+  // F3 backoff gate: if the previous call just failed, hold the next attempt
+  // for backoffDelay so a wedged server is not hammered every poll tick.
+  if (rpcFails > 0 && Date.now() - rpcLastFailAt < backoffDelay) {
+    throw new Error(`RPC ${method}: backing off (${rpcFails} consecutive failures)`);
+  }
   const id = seq++;
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), rpcTimeout);
@@ -86,7 +109,18 @@ async function rpc<T>(method: string, ...params: unknown[]): Promise<T> {
     if (env?.error) throw new Error(`RPC ${method}: ${env.error.message}`);
     if (!res.ok) throw new Error(`RPC ${method}: HTTP ${res.status}`);
     if (!env) throw new Error(`RPC ${method}: HTTP ${res.status} (no JSON body)`);
+    // Success resets the failure/backoff state.
+    rpcFails = 0;
+    rpcBusy = false;
     return env.result as T;
+  } catch (e) {
+    // F3: count consecutive failures; the backoff gate above then spaces out
+    // retries.  A single transient error (e.g. a slow-but-successful call that
+    // crossed the abort) is not enough to mark the node busy.
+    if (rpcFails < 0x7fffffff) rpcFails++;
+    rpcLastFailAt = Date.now();
+    rpcBusy = rpcFails >= 3;
+    throw e;
   } finally {
     clearTimeout(timer);
   }
@@ -159,6 +193,7 @@ async function loadSyncStatus(): Promise<SyncStatus> {
       chain: string;
       blocks: number;
       headers: number;
+      headerwindow?: number;
       bestblockhash: string;
       difficulty: number;
       verificationprogress?: number;
@@ -182,6 +217,7 @@ async function loadSyncStatus(): Promise<SyncStatus> {
   return {
     blocks: info.blocks,
     headers: target,
+    headerWindow: info.headerwindow ?? 50000,
     bestBlockHash: info.bestblockhash,
     difficulty: String(info.difficulty),
     rateBlPerSec: Math.max(0, rate),
