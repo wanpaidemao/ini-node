@@ -2,6 +2,7 @@
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
+// Asher_Mod_Start_20260910_135605
 // Asher_Mod_Start_20260910_123842
 // Asher_Mod_Start_20260910_112851
 package netsync
@@ -4342,6 +4343,7 @@ func (sm *SyncManager) Start() {
 // FlushPeriodic 仅在缓存满或周期真正到期时才写,因此大多数 tick 是空操作。
 // 关闭时的 FlushRequired 仍由 blockHandler 执行。
 func (sm *SyncManager) utxoFlushLoop() {
+	defer sm.wg.Done()
 	ticker := time.NewTicker(utxoFlushInterval)
 	defer ticker.Stop()
 	for {
@@ -4606,5 +4608,6 @@ func New(config *Config) (*SyncManager, error) {
 
 	return &sm, nil
 }
+// Asher_Mod_End_20260910_135605
 // Asher_Mod_End_20260910_123842
 // Asher_Mod_End_20260910_112851

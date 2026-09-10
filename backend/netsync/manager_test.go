@@ -21,6 +21,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// Asher_Mod_Start_20260910_135605
+
 // The package-level log variable is nil by default. Set it to the
 // disabled logger so that log calls in the sync manager don't panic.
 func init() {
@@ -114,6 +116,36 @@ func makeMockSyncManager(t *testing.T,
 	require.NoError(t, err)
 
 	return sm, tearDown
+}
+
+// TestSyncManagerStop verifies that Stop() returns promptly once both goroutines
+// started by Start() (blockHandler and utxoFlushLoop) have exited.  This is a
+// regression test for the graceful-shutdown hang where utxoFlushLoop never
+// called wg.Done(), leaving Stop()'s wg.Wait() blocked forever even though both
+// goroutines were gone (diagnosed via the :6000 pprof goroutine dump).
+// TestSyncManagerStop 验证 Stop() 在 Start() 启动的两个 goroutine
+// (blockHandler 与 utxoFlushLoop)退出后能及时返回。这是优雅关闭卡住的
+// 回归测试:此前 utxoFlushLoop 从不调用 wg.Done(),即使两个 goroutine 都已
+// 退出,Stop() 的 wg.Wait() 也永久挂起(经 :6000 pprof goroutine dump 诊断)。
+func TestSyncManagerStop(t *testing.T) {
+	params := chaincfg.RegressionNetParams
+	sm, tearDown := makeMockSyncManager(t, &params)
+	defer tearDown()
+
+	sm.Start()
+
+	done := make(chan struct{})
+	go func() {
+		require.NoError(t, sm.Stop())
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("SyncManager.Stop() did not return within 5s — " +
+			"wait group was not drained")
+	}
 }
 
 func TestCheckHeadersList(t *testing.T) {
@@ -2450,3 +2482,4 @@ func TestBlockSliceCappedByHeaderLead(t *testing.T) {
 	require.Equal(t, int32(11), sl.end)
 	require.LessOrEqual(t, sl.end-1, bestHeaderHeight)
 }
+// Asher_Mod_End_20260910_135605

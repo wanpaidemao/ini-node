@@ -2,6 +2,7 @@
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
+// Asher_Mod_Start_20260910_131359
 // Asher_Mod_Start_20260910_123842
 package blockchain
 
@@ -148,10 +149,18 @@ func (ms *mapSlice) delete(op wire.OutPoint) {
 // This function is NOT safe for concurrent access and must be called with the
 // lock held.
 func (ms *mapSlice) makeNewMap(totalEntryMemory uint64) map[wire.OutPoint]*UtxoEntry {
-	// Get the size of the leftover memory.
-	memSize := ms.maxTotalMemoryUsage - totalEntryMemory
+	// Get the size of the leftover memory.  Compute in signed space and clamp to
+	// zero so a saturated cache (entries + existing maps already at the cap)
+	// never underflows uint64 into a gigantic allocation.
+	// 计算剩余内存。用有符号计算并 clamp 到 0,防止缓存饱和
+	// (条目+既有 map 已达上限)时 uint64 下溢为超大分配。
+	leftover := int64(ms.maxTotalMemoryUsage) - int64(totalEntryMemory)
 	for _, maxNum := range ms.maxEntries {
-		memSize -= uint64(calculateRoughMapSize(maxNum, bucketSize))
+		leftover -= int64(calculateRoughMapSize(maxNum, bucketSize))
+	}
+	memSize := uint64(0)
+	if leftover > 0 {
+		memSize = uint64(leftover)
 	}
 
 	// Get a new map that's sized to house inside the leftover memory.
@@ -498,8 +507,21 @@ func (s *utxoCache) connectTransactions(block *btcutil.Block, stxos *[]SpentTxOu
 	return nil
 }
 
-// writeCache writes all the entries that are cached in memory to the database atomically.
-func (s *utxoCache) writeCache(dbTx database.Tx, bestState *BestState) error {
+// writeCache writes all the entries that are cached in memory to the database
+// atomically.  When cleanCache is true the whole in-memory cache is cleared
+// after the write (historical behavior); when false the cache is retained —
+// dirty entries are persisted and their modified/fresh flags cleared, nil/spent
+// entries (whose deletes are now synced) are dropped from the cache, and clean
+// entries are left untouched.  Retaining the cache keeps subsequent UTXO reads
+// in memory instead of falling through to the database after every flush, and
+// keeps each flush incremental (only entries dirtied since the last flush are
+// written).
+// writeCache 把内存缓存中的条目原子写盘。cleanCache 为 true 时写盘后清空
+// 整个内存缓存(历史行为);为 false 时保留缓存——脏条目写盘并清除
+// modified/fresh 标记,nil/spent 条目(其删除已落盘)从缓存移除,干净条目
+// 不动。保留缓存使后续 UTXO 读取持续命中内存而非每次 flush 后落到数据库,
+// 且每次 flush 只写上次以来的脏条目(增量)。
+func (s *utxoCache) writeCache(dbTx database.Tx, bestState *BestState, cleanCache bool) error {
 	// Update commits and flushes the cache to the database.
 	// NOTE: The database has its own cache which gets atomically written
 	// to leveldb.
@@ -514,22 +536,44 @@ func (s *utxoCache) writeCache(dbTx database.Tx, bestState *BestState) error {
 				if err != nil {
 					return err
 				}
+				// The delete is now persisted; in incremental mode drop the
+				// local entry and unaccount its memory (the whole cache is
+				// cleared below in clean mode).
+				// 删除已落盘;增量模式下移除本地条目并扣减其内存
+				// (全量模式下方统一清空)。
+				if !cleanCache {
+					delete(s.cachedEntries.maps[i], outpoint)
+					s.totalEntryMemory -= entry.memoryUsage()
+				}
 
 			// No need to update the cache if the entry was not modified.
 			case !entry.isModified():
+
 			default:
 				// Entry is fresh and needs to be put into the database.
 				err := dbPutUtxoEntry(utxoBucket, outpoint, entry)
 				if err != nil {
 					return err
 				}
+				// Incremental mode keeps the entry resident: clear its
+				// modified/fresh flags so it stays consistent with the
+				// database and is not rewritten on the next flush.
+				// 增量模式保留条目:清除 modified/fresh 标记,使其与
+				// 数据库一致且下次 flush 不重复写。
+				if !cleanCache {
+					entry.clearModified()
+				}
 			}
 
-			delete(s.cachedEntries.maps[i], outpoint)
+			if cleanCache {
+				delete(s.cachedEntries.maps[i], outpoint)
+			}
 		}
 	}
-	s.cachedEntries.deleteMaps()
-	s.totalEntryMemory = 0
+	if cleanCache {
+		s.cachedEntries.deleteMaps()
+		s.totalEntryMemory = 0
+	}
 
 	// When done, store the best state hash in the database to indicate the state
 	// is consistent until that hash.
@@ -550,6 +594,18 @@ func (s *utxoCache) writeCache(dbTx database.Tx, bestState *BestState) error {
 // This function MUST be called with the chain state lock held (for writes).
 func (s *utxoCache) flush(dbTx database.Tx, mode FlushMode, bestState *BestState) error {
 	var threshold uint64
+	// cleanCache selects whether the whole in-memory cache is cleared after the
+	// write.  FlushRequired (shutdown/rollback/prune) always clears; a flush
+	// that is forced by a full cache also clears so memory is reclaimed and a
+	// saturated IBD path never pays a full scan per block.  Only the periodic
+	// background flush with headroom left performs an incremental flush that
+	// retains the cache (see writeCache).
+	// cleanCache 决定写盘后是否清空整个内存缓存。FlushRequired(关闭/回滚/
+	// prune)总是清空;因缓存已满而触发的 flush 也清空以回收内存,饱和 IBD
+	// 路径不会每块全扫。只有后台周期 flush 且仍有内存余量时才增量保留
+	// (见 writeCache)。
+	cleanCache := mode == FlushRequired
+
 	switch mode {
 	case FlushRequired:
 		threshold = 0
@@ -572,13 +628,23 @@ func (s *utxoCache) flush(dbTx database.Tx, mode FlushMode, bestState *BestState
 		}
 	}
 
-	if s.totalMemoryUsage() >= threshold {
-		// Add one to round up the integer division.
-		totalMiB := s.totalMemoryUsage() / ((1024 * 1024) + 1)
-		log.Infof("Flushing UTXO cache of %d MiB with %d entries to disk. For large sizes, "+
-			"this can take up to several minutes...", totalMiB, s.cachedEntries.length())
+	totalUsage := s.totalMemoryUsage()
+	if totalUsage >= s.maxTotalMemoryUsage {
+		cleanCache = true
+	}
 
-		return s.writeCache(dbTx, bestState)
+	if totalUsage >= threshold {
+		// Add one to round up the integer division.
+		totalMiB := totalUsage / ((1024 * 1024) + 1)
+		if cleanCache {
+			log.Infof("Flushing UTXO cache of %d MiB with %d entries to disk. For large sizes, "+
+				"this can take up to several minutes...", totalMiB, s.cachedEntries.length())
+		} else {
+			log.Infof("Incrementally flushing UTXO cache of %d MiB with %d entries to disk",
+				totalMiB, s.cachedEntries.length())
+		}
+
+		return s.writeCache(dbTx, bestState, cleanCache)
 	}
 
 	return nil
@@ -866,4 +932,5 @@ func (b *BlockChain) flushNeededAfterPrune(deletedBlockHashes []chainhash.Hash) 
 
 	return highestDeletedHeight >= lastFlushHeight, nil
 }
+// Asher_Mod_End_20260910_131359
 // Asher_Mod_End_20260910_123842

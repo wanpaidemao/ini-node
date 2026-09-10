@@ -1,6 +1,7 @@
 // Copyright (c) 2023 The btcsuite developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
+// Asher_Mod_Start_20260910_131359
 package blockchain
 
 import (
@@ -590,15 +591,34 @@ func TestUtxoCacheFlush(t *testing.T) {
 	// Arbitrarily set the last flush time to 6 minutes ago.
 	cache.lastFlushTime = time.Now().Add(-time.Minute * 6)
 
-	// Attempt to flush with flush periodic.  Should flush now.
+	// Attempt to flush with flush periodic.  Should flush now.  Because the
+	// cache has plenty of headroom this is an INCREMENTAL flush: the entries
+	// are persisted and kept resident (not cleared), and they must no longer
+	// be marked fresh or modified so a later spend deletes the database row
+	// instead of leaving a stale unspent row behind (double-spend hazard).
+	// FlushPeriodic 时间到期触发 flush。因缓存有大量余量,这是增量 flush:
+	// 条目写盘后保留在缓存(不清空),且必须不再带 fresh/modified 标记,
+	// 否则后续花费会只删本地而残留未花费行(双花风险)。
 	err = chain.db.Update(func(dbTx database.Tx) error {
 		return cache.flush(dbTx, FlushPeriodic, chain.stateSnapshot)
 	})
 	if err != nil {
 		t.Fatalf("unexpected error while flushing cache: %v", err)
 	}
-	if cache.cachedEntries.length() != 0 {
-		t.Fatalf("Expected 0 entries, has %d instead", cache.cachedEntries.length())
+	if cache.cachedEntries.length() != len(outPoints1) {
+		t.Fatalf("Expected %d resident entries after incremental flush, "+
+			"has %d instead", len(outPoints1), cache.cachedEntries.length())
+	}
+	for _, m := range cache.cachedEntries.maps {
+		for outpoint, elem := range m {
+			if elem == nil {
+				t.Fatalf("Unexpected nil entry found for %v", outpoint)
+			}
+			if elem.isFresh() || elem.isModified() {
+				t.Fatalf("Resident entry %v should not be fresh or modified "+
+					"after incremental flush", outpoint)
+			}
+		}
 	}
 
 	err = assertConsistencyState(chain, tip.Hash())
@@ -608,6 +628,47 @@ func TestUtxoCacheFlush(t *testing.T) {
 	err = assertNbEntriesOnDisk(chain, len(outPoints)+len(outPoints1))
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	// Regression for the double-spend hazard: spend one of the incrementally
+	// flushed resident entries, then flush again.  The spent entry's database
+	// row must be deleted (disk count drops by one) — it must not survive as
+	// an unspent row because the entry lost its fresh flag on the previous
+	// incremental flush.
+	// 双花回归:花费一个增量落盘后驻留的条目,再 flush 一次。该条目的
+	// 数据库行必须被删除(磁盘计数减一)——不能因上次增量 flush 已清除
+	// fresh 标记而残留为未花费行。
+	spendOp1 := outPoints1[0]
+	cache.addTxIn(&wire.TxIn{PreviousOutPoint: spendOp1}, nil)
+	cache.lastFlushTime = time.Now().Add(-time.Minute * 6)
+	err = chain.db.Update(func(dbTx database.Tx) error {
+		return cache.flush(dbTx, FlushPeriodic, chain.stateSnapshot)
+	})
+	if err != nil {
+		t.Fatalf("unexpected error while flushing cache: %v", err)
+	}
+	err = assertNbEntriesOnDisk(chain, len(outPoints)+len(outPoints1)-1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// When the cache is full, a periodic flush falls back to a FULL clear so
+	// memory is reclaimed instead of growing without bound.  Force "full" by
+	// setting the cap to zero: totalMemoryUsage >= 0 always holds, so the
+	// flush writes and then empties the cache.
+	// 缓存已满时,周期 flush 回退为全量清空以回收内存,而不是无限增长。
+	// 把上限置 0 强制"满":totalMemoryUsage >= 0 恒真,flush 写盘后清空缓存。
+	chain.utxoCache.maxTotalMemoryUsage = 0
+	chain.utxoCache.cachedEntries.maxTotalMemoryUsage = 0
+	err = chain.db.Update(func(dbTx database.Tx) error {
+		return cache.flush(dbTx, FlushPeriodic, chain.stateSnapshot)
+	})
+	if err != nil {
+		t.Fatalf("unexpected error while flushing cache: %v", err)
+	}
+	if cache.cachedEntries.length() != 0 {
+		t.Fatalf("Expected 0 entries after full-cache periodic flush, "+
+			"has %d instead", cache.cachedEntries.length())
 	}
 }
 
@@ -1111,3 +1172,4 @@ func TestPurgeUtxosAboveHeightCacheOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+// Asher_Mod_End_20260910_131359

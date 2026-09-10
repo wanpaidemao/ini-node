@@ -2,6 +2,7 @@
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
+// Asher_Mod_Start_20260910_131359
 package blockchain
 
 import (
@@ -69,6 +70,21 @@ func (entry *UtxoEntry) isModified() bool {
 // been stored in the database.
 func (entry *UtxoEntry) isFresh() bool {
 	return entry.packedFlags&tfFresh == tfFresh
+}
+
+// clearModified clears the modified and fresh flags after the entry has been
+// written to the database.  Both flags must be cleared together: a fresh entry
+// is one the database has never seen, so if it is spent while still marked
+// fresh the cache removes it locally without deleting a database row (see
+// utxoCache.addTxIn) — leaving a stale unspent row behind would allow a double
+// spend.  Clearing both flags after a flush keeps the cache entry in sync with
+// its persisted form.
+// clearModified 在条目写盘后清除 modified 与 fresh 标记。两个位必须一起清:
+// fresh 条目是数据库从未见过的,若仍带 fresh 标记就被花费,缓存会只删本地
+// 而不删数据库行(见 utxoCache.addTxIn)——残留未花费行会造成双花。
+// 落盘后同时清除两个位,使缓存条目与其持久化形态保持同步。
+func (entry *UtxoEntry) clearModified() {
+	entry.packedFlags &^= tfModified | tfFresh
 }
 
 // memoryUsage returns the memory usage in bytes of for the utxo entry.
@@ -701,3 +717,4 @@ func (b *BlockChain) FetchUtxoEntry(outpoint wire.OutPoint) (*UtxoEntry, error) 
 
 	return entries[0], nil
 }
+// Asher_Mod_End_20260910_131359
