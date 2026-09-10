@@ -244,6 +244,18 @@
     loadParams()
     loadLogLevel()
     loadDBParams()
+    // F10: honor the "start node on app launch" setting (runnodeonstart in
+    // frontend.ini).  The node boots async in the backend (cmd.Start), so
+    // this does not block the window; the backend's rpclisten probe makes
+    // node-start idempotent when the node is already up.
+    // F10: 尊重"应用启动时拉起节点"设置(runnodeonstart,存 frontend.ini)。
+    // 节点在后端异步启动(cmd.Start),不阻塞窗口;后端 rpclisten 探测保证
+    // 节点已在运行时 node-start 幂等。
+    Services.getConfig()
+      .then((cfg) => {
+        if (cfg.runNodeOnStart) setTimeout(startNode, 500)
+      })
+      .catch(() => { /* ignore config errors; user can start manually */ })
     const id = setInterval(poll, 5000)
     const wapiId = setInterval(pollWapi, 5000)
     return () => { clearInterval(id); clearInterval(wapiId) }

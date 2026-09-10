@@ -415,6 +415,19 @@ func handleNodeStart(opts map[string]string, w http.ResponseWriter, req *http.Re
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "running": true})
 		return
 	}
+
+	// Second line of defense against a double start: the rpclisten probe can
+	// miss a node that is still loading its database (RPC not bound yet), and
+	// that window used to let a second ini.exe start, colliding on :6000 and
+	// the data files.  If the backend process is already running, report it
+	// as running instead of launching another one.
+	// 双开第二道防线:rpclisten 探测可能漏掉仍在加载数据库(尚未监听 RPC)
+	// 的节点,这个窗口期曾导致第二个 ini.exe 被拉起,在 :6000 与数据文件上
+	// 冲突。后端进程已在运行时就报告 running,不再启动第二个。
+	if nodeProcessRunning() {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "running": true})
+		return
+	}
 	// Locate the backend via findIniPath (CWD or INI_NODE_INI); ini.exe
 	// lives next to the ini in backend/.  Do NOT rely on os.Args[0], which
 	// points at the Wails binary and is not reliably next to backend/.

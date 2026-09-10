@@ -4,7 +4,6 @@ import (
 	"embed"
 
 	"log"
-	"time"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
 )
@@ -17,16 +16,9 @@ import (
 //go:embed all:frontend/dist
 var assets embed.FS
 
-func init() {
-	// Register a custom event whose associated data type is string.
-	// This is not required, but the binding generator will pick up registered events
-	// and provide a strongly typed JS/TS API for them.
-	application.RegisterEvent[string]("time")
-}
-
-// main function serves as the application's entry point. It initializes the application, creates a window,
-// and starts a goroutine that emits a time-based event every second. It subsequently runs the application and
-// logs any error that might occur.
+// main function serves as the application's entry point: it initializes the
+// application, creates a window, and runs the app until it is exited.
+// main 函数是应用入口:初始化应用、创建窗口并运行直到退出。
 func main() {
 
 	// Create a new Wails application by providing the necessary options.
@@ -99,15 +91,15 @@ func main() {
 		URL:              "/",
 	})
 
-	// Create a goroutine that emits an event containing the current time every second.
-	// The frontend can listen to this event and update the UI accordingly.
-	go func() {
-		for {
-			now := time.Now().Format(time.RFC1123)
-			app.Event.Emit("time", now)
-			time.Sleep(time.Second)
-		}
-	}()
+	// (F8) The historical per-second "time" event emitter was removed: the
+	// frontend never listened to it (no Events.On("time") anywhere), so it was
+	// dead traffic across the Wails bridge every second.  Clock display, if
+	// any, is driven frontend-side.  Keep this spot as a marker in case a
+	// real event is needed later.
+	// (F8) 已移除历史上每秒一次的 "time" 事件发射:前端从未监听该事件
+	// (全仓库无 Events.On("time")),它只是每秒穿越 Wails 桥的死流量。
+	// 时钟显示(如有)由前端自行驱动。保留此位置作为日后需要真实事件
+	// 时的标记。
 
 	// Run the application. This blocks until the application has been exited.
 	err := app.Run()
