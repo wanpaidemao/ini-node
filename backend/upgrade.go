@@ -124,7 +124,7 @@ func upgradeDataPaths() error {
 			return err
 		}
 
-		// Move old btcd.conf into new location if needed.
+		// Move old ini.conf into new location if needed.
 		oldConfPath := filepath.Join(oldHomePath, defaultConfigFilename)
 		newConfPath := filepath.Join(newHomePath, defaultConfigFilename)
 		if fileExists(oldConfPath) && !fileExists(newConfPath) {

@@ -38,11 +38,11 @@ import (
 )
 
 const (
-	defaultConfigFilename        = "btcd.conf"
+	defaultConfigFilename        = "ini.conf"
 	defaultDataDirname           = "data"
 	defaultLogLevel              = "info"
 	defaultLogDirname            = "logs"
-	defaultLogFilename           = "btcd.log"
+	defaultLogFilename           = "ini.log"
 	defaultMaxPeers              = 32
 	defaultMaxPeersPerIP         = 8
 	defaultBanDuration           = time.Hour * 24
@@ -67,16 +67,36 @@ const (
 	defaultMaxOrphanTxSize       = 100000
 	defaultSigCacheMaxSize       = 100000
 	defaultUtxoCacheMaxSizeMiB   = 250
-	sampleConfigFilename         = "sample-btcd.conf"
+	sampleConfigFilename         = "sample-ini.conf"
 	defaultTxIndex               = false
 	defaultAddrIndex             = false
 	defaultSugarIndex            = false
-	defaultBlockSyncStartLead    = 20000
+	// defaultBlockSyncStartLead is the header lead at which the parallel block
+	// download starts overlapping the still-running header download.  It must
+	// stay at or below headerLeadLimit (netsync) -- otherwise the lead cap
+	// pauses header dispatch before the block download ever starts and IBD
+	// silently degrades to the sequential header-then-block path.  8000 equals
+	// maxBlockRequestWindow, so the block frontier is covered exactly as soon
+	// as the overlap begins.
+	// defaultBlockSyncStartLead 是并行块下载开始与仍在进行的 header 下载
+	// 重叠时的 header 领先高度。它必须 ≤ headerLeadLimit(netsync),否则
+	// lead 上限会在块下载启动前就暂停 header 派发,IBD 静默退化为先 header
+	// 后块的串行路径。8000 等于 maxBlockRequestWindow,重叠一开始块前沿
+	// 恰好被覆盖。
+	defaultBlockSyncStartLead    = 8000
 	pruneMinSize                 = 1536
 )
 
 var (
-	defaultHomeDir     = btcutil.AppDataDir("btcd", false)
+	// defaultHomeDir is the default application data directory.  It is a
+	// relative "ini" folder next to the executable / current working
+	// directory instead of the historical %LOCALAPPDATA%\Btcd, so the node
+	// never creates a BTCD folder under AppData by default.  An operator can
+	// still point --datadir / --homedir anywhere explicitly.
+	// defaultHomeDir 是默认应用数据目录:取可执行文件/当前工作目录下的相对
+	// ini 文件夹,而非历史上的 %LOCALAPPDATA%\Btcd,默认不再在 AppData 下
+	// 创建 BTCD 文件夹。仍可通过 --datadir / --homedir 显式指定任意位置。
+	defaultHomeDir     = filepath.Join(".", "ini")
 	defaultConfigFile  = filepath.Join(defaultHomeDir, defaultConfigFilename)
 	defaultDataDir     = filepath.Join(defaultHomeDir, defaultDataDirname)
 	knownDbTypes       = database.SupportedDrivers()
@@ -226,10 +246,23 @@ type serviceOptions struct {
 // cleanAndExpandPath expands environment variables and leading ~ in the
 // passed path, cleans the result, and returns it.
 func cleanAndExpandPath(path string) string {
-	// Expand initial ~ to OS specific home directory.
+	// Expand initial ~ to OS specific home directory.  The home directory is
+	// resolved via os.UserHomeDir rather than derived from defaultHomeDir: the
+	// latter is now a CWD-relative "./ini" folder, whose parent is "." and
+	// would rewrite "~/data" into "CWD/data" instead of the user's home.
+	// ~ 前缀展开到用户主目录。这里用 os.UserHomeDir 而不是从
+	// defaultHomeDir 推导:后者现在是 CWD 相对的 "./ini",其父目录是 ".",
+	// 会把 "~/data" 错误改写成 "CWD/data"。
 	if strings.HasPrefix(path, "~") {
-		homeDir := filepath.Dir(defaultHomeDir)
-		path = strings.Replace(path, "~", homeDir, 1)
+		if homeDir, err := os.UserHomeDir(); err == nil {
+			path = strings.Replace(path, "~", homeDir, 1)
+		} else {
+			// Fall back to the old behavior (parent of the default home dir)
+			// only when the OS cannot report a home directory.
+			// 仅在操作系统无法返回主目录时回退到旧行为(默认目录的父目录)。
+			homeDir := filepath.Dir(defaultHomeDir)
+			path = strings.Replace(path, "~", homeDir, 1)
+		}
 	}
 
 	// NOTE: The os.ExpandEnv doesn't work with Windows-style %VARIABLE%,
@@ -1215,7 +1248,7 @@ func loadConfig() (*config, []string, error) {
 	return &cfg, remainingArgs, nil
 }
 
-// createDefaultConfig copies the file sample-btcd.conf to the given destination path,
+// createDefaultConfig copies the file sample-ini.conf to the given destination path,
 // and populates it with some randomly generated RPC username and password.
 func createDefaultConfigFile(destinationPath string) error {
 	// Create the destination directory if it does not exists
