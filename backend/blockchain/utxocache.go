@@ -2,6 +2,7 @@
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
+// Asher_Mod_Start_20260910_142235
 // Asher_Mod_Start_20260910_131359
 // Asher_Mod_Start_20260910_123842
 package blockchain
@@ -230,6 +231,18 @@ type utxoCache struct {
 	cachedEntries    mapSlice
 	totalEntryMemory uint64 // Total memory usage in bytes.
 
+	// dirtyOps tracks the outpoints whose cached entry deviates from the
+	// database (fresh new outputs, spent or nil entries waiting for a delete).
+	// It is maintained in lockstep with cachedEntries under the chain lock so
+	// an incremental flush (writeCache with cleanCache=false) only iterates the
+	// actually-changed outpoints instead of scanning the whole cache.  It is
+	// cleared together with the cache on a full flush and on purge.
+	// dirtyOps 记录缓存条目与数据库不一致的 outpoint(新增输出、待删除的
+	// spent/nil 条目)。它与 cachedEntries 在链锁内同步维护,使增量 flush
+	// (writeCache cleanCache=false)只遍历真正变化的 outpoint,而非扫描整个
+	// 缓存。全量 flush 与 purge 时随缓存一起清空。
+	dirtyOps map[wire.OutPoint]struct{}
+
 	// Below fields are used to indicate when the last flush happened.
 	lastFlushHash chainhash.Hash
 	lastFlushTime time.Time
@@ -255,6 +268,7 @@ func newUtxoCache(db database.DB, maxTotalMemoryUsage uint64) *utxoCache {
 			maxEntries:          []int{numMaxElements},
 			maxTotalMemoryUsage: maxTotalMemoryUsage,
 		},
+		dirtyOps: make(map[wire.OutPoint]struct{}),
 	}
 }
 
@@ -374,6 +388,7 @@ func (s *utxoCache) addTxOut(outpoint wire.OutPoint, txOut *wire.TxOut, isCoinBa
 
 	s.cachedEntries.put(outpoint, entry, s.totalEntryMemory)
 	s.totalEntryMemory += entry.memoryUsage()
+	s.dirtyOps[outpoint] = struct{}{}
 
 	return nil
 }
@@ -440,14 +455,17 @@ func (s *utxoCache) addTxIn(txIn *wire.TxIn, stxos *[]SpentTxOut) error {
 	// flushed to the database. Because of this, we can just delete it from the map of
 	// cached entries.
 	if entry.isFresh() {
-		// If the entry is fresh, we will always have it in the cache.
+		// If the entry is fresh, we will always have it in the cache.  The
+		// database never held a row for it, so nothing is dirty anymore.
 		s.cachedEntries.delete(txIn.PreviousOutPoint)
 		s.totalEntryMemory -= entry.memoryUsage()
+		delete(s.dirtyOps, txIn.PreviousOutPoint)
 	} else {
 		// Can leave the entry to be garbage collected as the only purpose
-		// of this entry now is so that the entry on disk can be deleted.
+		// of this entry now is so that the entry on disk can be deleted.  It
+		// is now dirty: the next incremental flush must delete its row.
 		entry = nil
-		s.totalEntryMemory -= entry.memoryUsage()
+		s.dirtyOps[txIn.PreviousOutPoint] = struct{}{}
 	}
 
 	return nil
@@ -507,72 +525,100 @@ func (s *utxoCache) connectTransactions(block *btcutil.Block, stxos *[]SpentTxOu
 	return nil
 }
 
-// writeCache writes all the entries that are cached in memory to the database
-// atomically.  When cleanCache is true the whole in-memory cache is cleared
-// after the write (historical behavior); when false the cache is retained —
-// dirty entries are persisted and their modified/fresh flags cleared, nil/spent
-// entries (whose deletes are now synced) are dropped from the cache, and clean
-// entries are left untouched.  Retaining the cache keeps subsequent UTXO reads
-// in memory instead of falling through to the database after every flush, and
-// keeps each flush incremental (only entries dirtied since the last flush are
-// written).
-// writeCache 把内存缓存中的条目原子写盘。cleanCache 为 true 时写盘后清空
-// 整个内存缓存(历史行为);为 false 时保留缓存——脏条目写盘并清除
-// modified/fresh 标记,nil/spent 条目(其删除已落盘)从缓存移除,干净条目
-// 不动。保留缓存使后续 UTXO 读取持续命中内存而非每次 flush 后落到数据库,
-// 且每次 flush 只写上次以来的脏条目(增量)。
+// writeCache writes the entries that differ from the database to the database
+// atomically.  When cleanCache is true the whole in-memory cache is written and
+// then cleared (historical behavior); when false only the tracked dirty
+// outpoints are written — their modified/fresh flags are cleared, nil/spent
+// entries (whose deletes are now synced) are dropped from the cache, and the
+// remaining entries stay resident.  Retaining the cache keeps subsequent UTXO
+// reads in memory instead of falling through to the database after every flush,
+// and the dirty-set iteration keeps each flush proportional to the number of
+// changes instead of the cache size.
+// writeCache 把与数据库不一致的条目原子写盘。cleanCache 为 true 时写整个
+// 内存缓存并清空(历史行为);为 false 时只写被跟踪的脏 outpoint——清除其
+// modified/fresh 标记,nil/spent 条目(删除已落盘)从缓存移除,其余条目驻留。
+// 保留缓存使后续 UTXO 读取持续命中内存;脏集合迭代使每次 flush 的开销与
+// 改动量成正比而非缓存大小。
 func (s *utxoCache) writeCache(dbTx database.Tx, bestState *BestState, cleanCache bool) error {
 	// Update commits and flushes the cache to the database.
 	// NOTE: The database has its own cache which gets atomically written
 	// to leveldb.
 	utxoBucket := dbTx.Metadata().Bucket(utxoSetBucketName)
-	for i := range s.cachedEntries.maps {
-		for outpoint, entry := range s.cachedEntries.maps[i] {
+
+	if cleanCache {
+		// Full flush: walk every cached entry, sync it to the database and
+		// clear the whole cache afterwards.
+		// 全量 flush:遍历每个缓存条目写盘,随后清空整个缓存。
+		for i := range s.cachedEntries.maps {
+			for outpoint, entry := range s.cachedEntries.maps[i] {
+				switch {
+				// If the entry is nil or spent, remove it from the database.
+				case entry == nil || entry.IsSpent():
+					err := dbDeleteUtxoEntry(utxoBucket, outpoint)
+					if err != nil {
+						return err
+					}
+
+				// No need to update the entry if it was not modified.
+				case !entry.isModified():
+
+				default:
+					// Entry is fresh and needs to be put into the database.
+					err := dbPutUtxoEntry(utxoBucket, outpoint, entry)
+					if err != nil {
+						return err
+					}
+				}
+
+				delete(s.cachedEntries.maps[i], outpoint)
+			}
+		}
+		s.cachedEntries.deleteMaps()
+		s.totalEntryMemory = 0
+		s.dirtyOps = make(map[wire.OutPoint]struct{})
+	} else {
+		// Incremental flush: only the outpoints registered in dirtyOps deviate
+		// from the database.  Entries that disappeared from the cache or are no
+		// longer modified are skipped defensively.
+		// 增量 flush:只有 dirtyOps 中登记的 outpoint 与数据库不一致。
+		// 防御性跳过已从缓存消失、或已不再 modified 的条目。
+		for outpoint := range s.dirtyOps {
+			entry, ok := s.cachedEntries.get(outpoint)
+			if !ok {
+				// The entry was removed from the cache (e.g. spent while
+				// fresh, or purged); nothing to persist for it.
+				// 条目已从缓存移除(如 fresh 被花费,或被 purge);无需写盘。
+				continue
+			}
+
 			switch {
-			// If the entry is nil or spent, remove the entry from the database
-			// and the cache.
+			// If the entry is nil or spent, remove the entry from the
+			// database and the cache.  The delete is now persisted.
+			// 条目为 nil/spent:删除数据库行并从缓存移除,删除已落盘。
 			case entry == nil || entry.IsSpent():
 				err := dbDeleteUtxoEntry(utxoBucket, outpoint)
 				if err != nil {
 					return err
 				}
-				// The delete is now persisted; in incremental mode drop the
-				// local entry and unaccount its memory (the whole cache is
-				// cleared below in clean mode).
-				// 删除已落盘;增量模式下移除本地条目并扣减其内存
-				// (全量模式下方统一清空)。
-				if !cleanCache {
-					delete(s.cachedEntries.maps[i], outpoint)
-					s.totalEntryMemory -= entry.memoryUsage()
-				}
+				s.cachedEntries.delete(outpoint)
+				s.totalEntryMemory -= entry.memoryUsage()
 
-			// No need to update the cache if the entry was not modified.
+			// No need to update the entry if it was not modified.
 			case !entry.isModified():
 
 			default:
-				// Entry is fresh and needs to be put into the database.
+				// Entry is dirty and needs to be put into the database; keep
+				// it resident and clear its flags so it is not rewritten on
+				// the next flush.
+				// 条目脏且需写盘;保留驻留并清除标记,下次 flush 不重写。
 				err := dbPutUtxoEntry(utxoBucket, outpoint, entry)
 				if err != nil {
 					return err
 				}
-				// Incremental mode keeps the entry resident: clear its
-				// modified/fresh flags so it stays consistent with the
-				// database and is not rewritten on the next flush.
-				// 增量模式保留条目:清除 modified/fresh 标记,使其与
-				// 数据库一致且下次 flush 不重复写。
-				if !cleanCache {
-					entry.clearModified()
-				}
-			}
-
-			if cleanCache {
-				delete(s.cachedEntries.maps[i], outpoint)
+				entry.clearModified()
 			}
 		}
-	}
-	if cleanCache {
-		s.cachedEntries.deleteMaps()
-		s.totalEntryMemory = 0
+		s.dirtyOps = make(map[wire.OutPoint]struct{})
 	}
 
 	// When done, store the best state hash in the database to indicate the state
@@ -711,6 +757,7 @@ func (b *BlockChain) PurgeUtxosAboveHeight(height int32) (int, error) {
 			if entry.BlockHeight() > height {
 				delete(m, outpoint)
 				s.totalEntryMemory -= entry.memoryUsage()
+				delete(s.dirtyOps, outpoint)
 				seen[outpoint] = struct{}{}
 				purged++
 			}
@@ -932,5 +979,6 @@ func (b *BlockChain) flushNeededAfterPrune(deletedBlockHashes []chainhash.Hash) 
 
 	return highestDeletedHeight >= lastFlushHeight, nil
 }
+// Asher_Mod_End_20260910_142235
 // Asher_Mod_End_20260910_131359
 // Asher_Mod_End_20260910_123842

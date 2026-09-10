@@ -1,6 +1,7 @@
 // Copyright (c) 2023 The btcsuite developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
+// Asher_Mod_Start_20260910_142235
 // Asher_Mod_Start_20260910_131359
 package blockchain
 
@@ -630,6 +631,16 @@ func TestUtxoCacheFlush(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The dirty-set must be emptied by the incremental flush: every registered
+	// outpoint was either persisted (resident, flags cleared) or dropped with
+	// its delete synced.
+	// 增量 flush 后脏集合必须为空:每个登记的 outpoint 要么已写盘(驻留、
+	// 标记已清),要么随删除同步落盘被移除。
+	if len(cache.dirtyOps) != 0 {
+		t.Fatalf("Expected 0 dirty outpoints after incremental flush, has %d",
+			len(cache.dirtyOps))
+	}
+
 	// Regression for the double-spend hazard: spend one of the incrementally
 	// flushed resident entries, then flush again.  The spent entry's database
 	// row must be deleted (disk count drops by one) — it must not survive as
@@ -669,6 +680,102 @@ func TestUtxoCacheFlush(t *testing.T) {
 	if cache.cachedEntries.length() != 0 {
 		t.Fatalf("Expected 0 entries after full-cache periodic flush, "+
 			"has %d instead", cache.cachedEntries.length())
+	}
+}
+
+// TestUtxoCacheDirtySet verifies the dirty-set tracking that feeds incremental
+// flushes: fresh outputs are registered, spending a fresh output removes it
+// from the set (no row exists to delete), spending a resident (previously
+// flushed) output registers it so its row is deleted, and a full-cache flush
+// clears the set together with the cache.
+// TestUtxoCacheDirtySet 验证支撑增量 flush 的脏集合追踪:新增输出被登记、
+// 花费 fresh 输出从集合移除(DB 无行可删)、花费驻留(已落盘)输出登记以待
+// 删除其行、满量 flush 随缓存一起清空集合。
+func TestUtxoCacheDirtySet(t *testing.T) {
+	chain, params, tearDown := utxoCacheTestChain("TestUtxoCacheDirtySet")
+	defer tearDown()
+	cache := chain.utxoCache
+	tip := btcutil.NewBlock(params.GenesisBlock)
+	tip.SetHeight(0)
+
+	// Adding outputs registers them as dirty.
+	// 新增输出登记进脏集合。
+	opA := outpointFromInt(0)
+	opB := outpointFromInt(1)
+	cache.addTxOut(opA, &wire.TxOut{Value: 10000, PkScript: getValidP2PKHScript()}, true, 0)
+	cache.addTxOut(opB, &wire.TxOut{Value: 10000, PkScript: getValidP2PKHScript()}, false, 0)
+	if len(cache.dirtyOps) != 2 {
+		t.Fatalf("Expected 2 dirty outpoints after addTxOut, has %d", len(cache.dirtyOps))
+	}
+
+	// Incremental flush persists both, keeps them resident, and clears the set.
+	// 增量 flush 写盘两者、保留驻留并清空集合。
+	chain.utxoCache.maxTotalMemoryUsage = 10 * 1024 * 1024
+	cache.lastFlushTime = time.Now().Add(-time.Minute * 6)
+	err := chain.db.Update(func(dbTx database.Tx) error {
+		return cache.flush(dbTx, FlushPeriodic, chain.stateSnapshot)
+	})
+	if err != nil {
+		t.Fatalf("unexpected error while flushing cache: %v", err)
+	}
+	if len(cache.dirtyOps) != 0 {
+		t.Fatalf("Expected 0 dirty outpoints after incremental flush, has %d",
+			len(cache.dirtyOps))
+	}
+	if cache.cachedEntries.length() != 2 {
+		t.Fatalf("Expected 2 resident entries after incremental flush, has %d",
+			cache.cachedEntries.length())
+	}
+
+	// Spending a resident output registers it so the next flush deletes the row.
+	// 花费驻留输出登记它,下次 flush 删除其数据库行。
+	cache.addTxIn(&wire.TxIn{PreviousOutPoint: opA}, nil)
+	if _, ok := cache.dirtyOps[opA]; !ok {
+		t.Fatal("Expected spent resident output to be registered in dirtyOps")
+	}
+	cache.lastFlushTime = time.Now().Add(-time.Minute * 6)
+	err = chain.db.Update(func(dbTx database.Tx) error {
+		return cache.flush(dbTx, FlushPeriodic, chain.stateSnapshot)
+	})
+	if err != nil {
+		t.Fatalf("unexpected error while flushing cache: %v", err)
+	}
+	if len(cache.dirtyOps) != 0 {
+		t.Fatalf("Expected 0 dirty outpoints after spent-row flush, has %d",
+			len(cache.dirtyOps))
+	}
+	if err := assertNbEntriesOnDisk(chain, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Spending a fresh (not yet flushed) output removes it from the set: it
+	// never had a row, so there is nothing to delete.
+	// 花费 fresh(未落盘)输出将其移出集合:它从无数据库行,无需删除。
+	opC := outpointFromInt(2)
+	cache.addTxOut(opC, &wire.TxOut{Value: 10000, PkScript: getValidP2PKHScript()}, false, 0)
+	if _, ok := cache.dirtyOps[opC]; !ok {
+		t.Fatal("Expected fresh output to be registered in dirtyOps")
+	}
+	cache.addTxIn(&wire.TxIn{PreviousOutPoint: opC}, nil)
+	if _, ok := cache.dirtyOps[opC]; ok {
+		t.Fatal("Expected fresh-spent output to be removed from dirtyOps")
+	}
+
+	// A full-cache flush clears the set together with the cache.
+	// 满量 flush 随缓存一起清空集合。
+	err = chain.db.Update(func(dbTx database.Tx) error {
+		return cache.flush(dbTx, FlushRequired, chain.stateSnapshot)
+	})
+	if err != nil {
+		t.Fatalf("unexpected error while flushing cache: %v", err)
+	}
+	if cache.cachedEntries.length() != 0 {
+		t.Fatalf("Expected 0 resident entries after full flush, has %d",
+			cache.cachedEntries.length())
+	}
+	if len(cache.dirtyOps) != 0 {
+		t.Fatalf("Expected 0 dirty outpoints after full flush, has %d",
+			len(cache.dirtyOps))
 	}
 }
 
@@ -1172,4 +1279,5 @@ func TestPurgeUtxosAboveHeightCacheOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+// Asher_Mod_End_20260910_142235
 // Asher_Mod_End_20260910_131359
