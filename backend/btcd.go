@@ -55,9 +55,17 @@ func btcdMain(serverChan chan<- *server) error {
 	}
 	cfg = tcfg
 	defer func() {
+		// Drain the async log queue first so no buffered line is lost, then
+		// close the rotator (A7).  stopLogWriter waits for the background
+		// flusher to write everything still queued.
+		// 先排空异步日志队列,确保不丢缓冲行,再关轮转器(A7)。
+		// stopLogWriter 会等待后台 flusher 写完所有排队行。
+		logWriterInst.stopLogWriter()
+		logRotatorMu.Lock()
 		if logRotator != nil {
 			logRotator.Close()
 		}
+		logRotatorMu.Unlock()
 	}()
 
 	// Get a channel that will be closed when a shutdown signal has been

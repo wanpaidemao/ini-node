@@ -135,18 +135,24 @@ const (
 	// processing, so without this cap the header tip races ahead of the
 	// blocks indefinitely (observed: ~42k-68k lead).  A lead beyond
 	// maxBlockRequestWindow (8000) serves no purpose -- the block request
-	// frontier never goes further than bestChain+8000 -- while a large lead
-	// pushes the receive-side prev check (HeaderHashByHeight(start-1)) out
-	// of the in-memory header window and into the DB cold-read path, whose
-	// reference frame is where stale height rows (P8/P9) live.  The cap is
-	// enforced at the single getheaders dispatch point (launchHeaderRange,
-	// which both fresh assignments and re-issues go through), so the header
-	// download keeps the lead just below this value: whenever the lead is
-	// below the cap a new range is dispatched immediately to push it back
-	// up, and once it reaches the cap dispatching pauses -- the header tip
-	// is kept ahead of the blocks by design, but never races arbitrarily
-	// far, and the receive-side prev check always stays in-memory.
-	headerLeadLimit = 42000
+	// frontier never goes further than bestChain+8000.  The cap is enforced
+	// at the single getheaders dispatch point (launchHeaderRange, which both
+	// fresh assignments and re-issues go through), so the header download
+	// keeps the lead just below this value: whenever the lead is below the
+	// cap a new range is dispatched immediately to push it back up, and once
+	// it reaches the cap dispatching pauses -- the header tip is kept ahead
+	// of the blocks by design, but never races arbitrarily far.
+	//
+	// The cap is deliberately kept far below the in-memory header window
+	// (headerwindow=50000): the receive-side prev check
+	// (HeaderHashByHeight(start-1)) then always resolves in memory and never
+	// falls into the DB cold-read path (the P8/P9 hazard).  With the lead at
+	// most headerLeadLimit above the best chain, the highest prev-check height
+	// (bestChain + maxBlockRequestWindow) stays thousands of blocks inside
+	// the window boundary, so the O2 request-window cache is only a
+	// defensive backstop rather than the thing standing between the sync and
+	// cold reads.
+	headerLeadLimit = 10000
 
 	// blockUnavailableTimeout is how long the block download may remain stuck
 	// at a single height before the header chain is suspected of being
@@ -597,6 +603,20 @@ type SyncStatus struct {
 	// MsgQueueDepth is the current number of queued messages in the sync
 	// manager's inbound channel.
 	MsgQueueDepth int `json:"msg_queue_depth"`
+	// HeaderWindowHits and HeaderColdReads feed the O8 metrics layer: how
+	// often HeaderHashByHeight resolved from the in-memory header window
+	// versus the DB cold-read path.  A rising cold-read count means header
+	// lookups are falling out of the window and hitting disk (the P8/P9
+	// hazard reference frame).  The counters cover every HeaderHashByHeight
+	// caller (prev check, getheaders locators, block-request completion loop,
+	// front-hash probe, orphan sweep), not only the receive-side prev check.
+	// HeaderWindowHits/HeaderColdReads 供 O8 指标层使用:HeaderHashByHeight
+	// 从内存 header 窗口命中与走 DB 冷读的次数。冷读计数上升意味着
+	// header 查询正在逐出窗口并落盘(P8/P9 隐患参照系)。计数覆盖
+	// HeaderHashByHeight 的所有调用方(prev 校验、getheaders locator、
+	// 块请求完成循环、前沿探测、孤儿扫描),不只接收端 prev 校验。
+	HeaderWindowHits uint64 `json:"header_window_hits"`
+	HeaderColdReads  uint64 `json:"header_cold_reads"`
 }
 
 // limitAdd is a helper function for maps that require a maximum limit by
@@ -4690,6 +4710,13 @@ func (sm *SyncManager) syncStatusSnapshot() *SyncStatus {
 	}
 	status.UtxoFlushLastMs, status.UtxoFlushCount = sm.chain.UtxoFlushStats()
 	status.MsgQueueDepth = len(sm.msgChan)
+
+	// O8: receive-side prev-check hit / cold-read counters from the chain.
+	// A growing cold-read count means header lookups are falling out of the
+	// in-memory window and hitting disk (the P8/P9 hazard reference frame).
+	// O8: 接收端 prev 校验的窗口命中/冷读计数,来自链层。冷读计数上升
+	// 意味着 header 查询正在逐出内存窗口、落盘(P8/P9 隐患参照系)。
+	status.HeaderWindowHits, status.HeaderColdReads = sm.chain.HeaderHashMetrics()
 
 	return status
 }

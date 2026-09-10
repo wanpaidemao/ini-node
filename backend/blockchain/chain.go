@@ -258,6 +258,27 @@ type BlockChain struct {
 	// 覆盖后台周期落盘与关闭时落盘。原子写入,任意 goroutine 无锁可读。
 	utxoFlushLastMs atomic.Int64
 	utxoFlushCount  atomic.Int64
+
+	// headerWindowHits and headerColdReads feed the O8 metrics layer: how
+	// often HeaderHashByHeight resolved from the in-memory header window
+	// versus the DB cold-read path (coldNodeAtHeight).  A cold read means the
+	// height was evicted from the window and the hash had to be fetched from
+	// disk -- the P8/P9 hazard reference frame.  The counters cover EVERY
+	// HeaderHashByHeight caller (the receive-side prev check, getheaders
+	// locators, the block-request completion loop, the front-hash probe and
+	// orphan sweep), not only the prev check; a rising cold-read total still
+	// means header lookups are falling out of the window and hitting disk.
+	// Written with atomic adds from the block handler; readable lock-free
+	// from any goroutine.
+	// headerWindowHits/headerColdReads 供 O8 指标层使用:HeaderHashByHeight
+	// 从内存 header 窗口命中与走 DB 冷读(coldNodeAtHeight)的次数。冷读
+	// 意味着该高度已被逐出窗口、hash 需从磁盘取——即 P8/P9 隐患的参照系。
+	// 计数覆盖 HeaderHashByHeight 的**所有**调用方(接收端 prev 校验、
+	// getheaders locator、块请求完成循环、前沿探测与孤儿扫描),不只 prev
+	// 校验;冷读总数上升仍然意味着 header 查询在逐出窗口、落盘。
+	// block handler 原子自增,任意 goroutine 无锁可读。
+	headerWindowHits atomic.Uint64
+	headerColdReads  atomic.Uint64
 }
 
 // HaveBlock returns whether or not the chain instance has the block data
@@ -1899,15 +1920,29 @@ func (b *BlockChain) HeaderHashByHeight(blockHeight int32) (
 
 	// Serve from the in-memory header window when the height is retained,
 	// otherwise fall back to the main-chain height index for heights that
-	// have been evicted.
+	// have been evicted.  Both paths count into the O8 metrics (covering all
+	// callers: prev check, locators, completion loop; see HeaderHashMetrics).
+	// 两条路径都计入 O8 指标(覆盖所有调用方:prev 校验、locator、完成
+	// 循环;见 HeaderHashMetrics)。
 	if node := b.bestHeader.NodeByHeight(blockHeight); node != nil {
+		b.headerWindowHits.Add(1)
 		return &node.hash, nil
 	}
 	if node := b.coldNodeAtHeight(blockHeight); node != nil {
+		b.headerColdReads.Add(1)
 		return &node.hash, nil
 	}
 
 	return nil, fmt.Errorf("blockheight %v not found", blockHeight)
+}
+
+// HeaderHashMetrics returns the O8 counters: how many HeaderHashByHeight
+// lookups resolved from the in-memory header window (hits) versus the DB
+// cold-read path (coldReads).  Safe for concurrent access.
+// HeaderHashMetrics 返回 O8 计数:HeaderHashByHeight 从内存窗口命中(hits)
+// 与走 DB 冷读(coldReads)的次数。并发安全。
+func (b *BlockChain) HeaderHashMetrics() (hits uint64, coldReads uint64) {
+	return b.headerWindowHits.Load(), b.headerColdReads.Load()
 }
 
 // HeaderHeightByHash returns the height of the header given its hash.

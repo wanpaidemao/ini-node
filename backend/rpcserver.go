@@ -2693,6 +2693,10 @@ func handleGetBlockSyncStatus(s *rpcServer, cmd interface{}, closeChan <-chan st
 		UtxoFlushCount:  st.UtxoFlushCount,
 		MsgQueueDepth:   st.MsgQueueDepth,
 		LogBytes:        LogFileSize(),
+		// O8: receive-side prev-check window hit / cold-read counters.
+		// O8: 接收端 prev 校验窗口命中/冷读计数。
+		HeaderWindowHits: st.HeaderWindowHits,
+		HeaderColdReads:  st.HeaderColdReads,
 	}
 	for _, w := range st.HeaderRecentRanges {
 		result.HeaderRecentRanges = append(result.HeaderRecentRanges, btcjson.HeaderRecentRangeResult{

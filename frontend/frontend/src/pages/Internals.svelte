@@ -894,6 +894,12 @@ onDestroy(() => clearInterval(timer));
           <span class="lg dim">锁 {dat ? dat.chainLockWaitMs : 0} ms</span>
           <span class="lg dim">flush {dat ? dat.utxoFlushLastMs : 0} ms ×{dat ? dat.utxoFlushCount : 0}</span>
           <span class="lg dim">队列 {dat ? dat.msgQueueDepth : 0} · 日志 {dat ? fmtBytes(dat.logBytes) : "0 B"}</span>
+          <!-- O8: window hit vs DB cold-read counters for the receive-side prev
+               check.  A rising cold-read count means header lookups fall out of
+               the in-memory window and hit disk (the P8/P9 hazard). -->
+          <!-- O8: 接收端 prev 校验的窗口命中/冷读计数。冷读计数上升意味着
+               header 查询逐出内存窗口、落盘(P8/P9 隐患)。 -->
+          <span class="lg dim">header 窗口 {dat ? fmt(dat.headerWindowHits) : 0} · 冷读 {dat ? fmt(dat.headerColdReads) : 0}</span>
         </div>
       </div>
     </div>

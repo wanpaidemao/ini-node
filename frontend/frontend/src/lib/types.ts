@@ -138,6 +138,13 @@ export interface NodeInternals {
   utxoFlushCount: number;
   msgQueueDepth: number;
   logBytes: number;
+  // O8 metrics: how often the receive-side prev check resolved from the
+  // in-memory header window vs the DB cold-read path.  A rising cold-read
+  // count means header lookups fall out of the window and hit disk.
+  // O8 指标:接收端 prev 校验从内存 header 窗口命中与走 DB 冷读的次数。
+  // 冷读计数上升意味着 header 查询逐出窗口、落盘。
+  headerWindowHits: number;
+  headerColdReads: number;
   debugLevel: string;
   // Per-peer connection stats from getpeerinfo, sampled at a low cadence
   // (5 min / manual refresh) so the quality cards do not churn every 2s poll.

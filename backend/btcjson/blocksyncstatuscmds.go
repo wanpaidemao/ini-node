@@ -67,6 +67,18 @@ type GetBlockSyncStatusResult struct {
 	UtxoFlushCount   int64   `json:"utxo_flush_count"`
 	MsgQueueDepth    int     `json:"msg_queue_depth"`
 	LogBytes         int64   `json:"log_bytes"`
+
+	// O8 metrics: how often HeaderHashByHeight resolved from the in-memory
+	// header window vs the DB cold-read path.  The counters cover every
+	// HeaderHashByHeight caller (prev check, locators, completion loop), not
+	// only the receive-side prev check.  A rising cold-read count means
+	// header lookups fall out of the window and hit disk.
+	// O8 指标:HeaderHashByHeight 从内存 header 窗口命中与走 DB 冷读的
+	// 次数。计数覆盖所有 HeaderHashByHeight 调用方(prev 校验、locator、
+	// 完成循环),不只接收端 prev 校验。冷读计数上升意味着 header 查询
+	// 逐出窗口、落盘。
+	HeaderWindowHits uint64 `json:"header_window_hits"`
+	HeaderColdReads  uint64 `json:"header_cold_reads"`
 }
 
 func init() {

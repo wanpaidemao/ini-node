@@ -371,6 +371,8 @@ export const Services = {
         utxo_flush_count: number;
         msg_queue_depth: number;
         log_bytes: number;
+        header_window_hits: number;
+        header_cold_reads: number;
       }>("getblocksyncstatus"),
       // Low-cadence per-peer connection stats for the quality / traffic cards.
       // Sampled here (every poll) but the UI refreshes them at its own pace
@@ -580,6 +582,8 @@ export const Services = {
       utxoFlushCount: sync.utxo_flush_count ?? 0,
       msgQueueDepth: sync.msg_queue_depth ?? 0,
       logBytes: sync.log_bytes ?? 0,
+      headerWindowHits: sync.header_window_hits ?? 0,
+      headerColdReads: sync.header_cold_reads ?? 0,
       debugLevel: await Services.getDebugLevel().catch(() => "info"),
     };
   },
