@@ -131,15 +131,41 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
 		// 视图**已覆盖**父块高度且该高度是另一个块(伪造/分叉父块)时拒绝;
 		// 视图尚未覆盖(滞后或窗口驱逐)时放行,由孤儿/分叉检测
 		// (HeaderChainDiverged、孤儿洪流、DB 高度索引对比)兜底真正的伪造 tip。
+		//
+		// Note (B fix): a lagging view is NOT a reason to admit the block.
+		// Observed: a miner-submitted block whose prev height exceeded the
+		// stale view height (62 blocks behind) sailed straight through this
+		// guard and displaced the real main-chain tip (0af1401e@44337489),
+		// forking the node permanently.  When the view does not cover the
+		// parent's height we therefore REJECT with a re-sync hint instead of
+		// accepting; the sync manager catches this, triggers a header catch-up
+		// and the miner retries once the view has caught up.  A genuinely
+		// forged parent is then rejected by the covered-view check below (the
+		// view holds the network block, not the local sibling).
+		// 注意(B 修复):视图滞后不是放行的理由。实测:矿工提交块的 prev 高度
+		// 超过滞后视图高度(落后 62 块)时,守卫被整体跳过,本地块直接顶替了
+		// 真实主链 tip(0af1401e@44337489),使节点永久分叉。因此视图未覆盖
+		// 父块高度时改为**拒绝**并附带重新同步提示;同步管理器捕获后触发
+		// header 追赶,矿工在视图追上后重试。真正伪造的父块随后被"视图已
+		// 覆盖"的检查拒绝(视图中是网络块,而非本地兄弟块)。
 		headerTip := b.bestHeader.Tip()
-		if headerTip != nil && prevNode.height <= headerTip.height {
-			if headerNode := b.bestHeader.NodeByHeight(prevNode.height); headerNode != nil &&
-				!headerNode.hash.IsEqual(&prevNode.hash) {
-				str := fmt.Sprintf("miner-submitted block %v builds on parent %v "+
-					"which is not on the network-confirmed header chain -- "+
-					"waiting for re-sync", block.Hash(), prevHash)
-				return false, ruleError(ErrMinedBlockNotOnMainChain, str)
+		if headerTip == nil || prevNode.height > headerTip.height {
+			headerViewHeight := int32(-1)
+			if headerTip != nil {
+				headerViewHeight = headerTip.height
 			}
+			str := fmt.Sprintf("miner-submitted block %v builds on parent %v "+
+				"whose height %d is above the confirmed header view (%d) -- "+
+				"re-sync required before acceptance",
+				block.Hash(), prevHash, prevNode.height, headerViewHeight)
+			return false, ruleError(ErrMinedBlockNotOnMainChain, str)
+		}
+		if headerNode := b.bestHeader.NodeByHeight(prevNode.height); headerNode != nil &&
+			!headerNode.hash.IsEqual(&prevNode.hash) {
+			str := fmt.Sprintf("miner-submitted block %v builds on parent %v "+
+				"which is not on the network-confirmed header chain -- "+
+				"waiting for re-sync", block.Hash(), prevHash)
+			return false, ruleError(ErrMinedBlockNotOnMainChain, str)
 		}
 
 		if headerNode := b.bestHeader.NodeByHeight(blockHeight); headerNode != nil &&
