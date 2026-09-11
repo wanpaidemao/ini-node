@@ -948,6 +948,14 @@ func (bi *blockIndex) snapshotDirtyLocked() []*nodeRowSnapshot {
 			status:      node.status,
 			hashIndex:   true,
 			heightIndex: bi.bestHeaderView != nil && bi.bestHeaderView.Contains(node),
+			// Asher_Mod_Start_20260911_174500
+			// Records whether the node is on the connected chain: a header-only
+			// (fabricated/concurrent) node must never displace a height row that
+			// a real connected block already owns (height-index pollution).
+			// 记录节点是否在已连接链上:header-only(fabricated/竞争)节点不得
+			// 顶掉已连接块持有的高度行(高度索引污染)。
+			heightIndexChain: bi.bestChainView != nil && bi.bestChainView.Contains(node),
+			// Asher_Mod_End_20260911_174500
 		})
 	}
 	return rows
@@ -975,9 +983,17 @@ func (bi *blockIndex) flushDirtyLocked(dbTx database.Tx) error {
 		// main-chain height, and rows below the window are no longer dirty
 		// because an earlier flush already persisted them.
 		if bi.bestHeaderView != nil && bi.bestHeaderView.Contains(node) {
-			if err := dbPutHeightIndex(dbTx, node.height, &node.hash); err != nil {
+			// Asher_Mod_Start_20260911_174500
+			// Guarded write: only a connected main-chain node may displace an
+			// existing row; header-only (fabricated/concurrent) nodes write
+			// only when the height is unclaimed (height-index pollution fix).
+			// 护栏写入:只有已连接主链节点可顶替已有行;header-only
+			// (fabricated/竞争)节点仅在高度未被占用时写入(高度索引污染修复)。
+			onChain := bi.bestChainView != nil && bi.bestChainView.Contains(node)
+			if err := dbPutHeightIndexGuarded(dbTx, node.height, &node.hash, onChain); err != nil {
 				return err
 			}
+			// Asher_Mod_End_20260911_174500
 		}
 	}
 

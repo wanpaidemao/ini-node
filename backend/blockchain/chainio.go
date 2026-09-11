@@ -998,6 +998,31 @@ func dbPutHeightIndex(dbTx database.Tx, height int32, hash *chainhash.Hash) erro
 	return heightIndex.Put(serializedHeight[:], hash[:])
 }
 
+// Asher_Mod_Start_20260911_174500
+// dbPutHeightIndexGuarded writes the height-to-hash mapping unless the height
+// is already owned by a real main-chain row and the caller is a header-only
+// (fabricated/concurrent) node, which must never displace a connected block's
+// row.  A polluted height index makes UTXO reconstruction hit a bodyless
+// block ("block ... does not exist"); the replay self-heal walks the block
+// index hash chain instead, but preventing the pollution in the first place
+// keeps every read path honest.  Guarded only affects the overwrite case:
+// unclaimed heights are written freely so cold header resolution by height
+// keeps working above the connected tip.
+// dbPutHeightIndexGuarded 写入高度→哈希映射,除非该高度已被真实主链行占用
+// 而调用方只是 header-only(fabricated/竞争)节点——不得顶掉已连接块持有
+// 的行。被污染的高度索引会让 UTXO 重建撞上无块体的块;重放自愈改走块索引
+// 哈希链,但从源头防污染能让所有读路径都诚实。护栏只影响"覆盖已有行"的
+// 情形:未占用的高度照常写入,使已连接 tip 之上的冷 header 按高度解析正常。
+func dbPutHeightIndexGuarded(dbTx database.Tx, height int32, hash *chainhash.Hash, onChain bool) error {
+	if !onChain {
+		if _, err := dbFetchHashByHeight(dbTx, height); err == nil {
+			return nil
+		}
+	}
+	return dbPutHeightIndex(dbTx, height, hash)
+}
+// Asher_Mod_End_20260911_174500
+
 // dbRemoveHeightIndex uses an existing database transaction to delete the
 // height to hash mapping for the provided height from the height index bucket.
 // It is the inverse of dbPutHeightIndex and is used when a fabricated or

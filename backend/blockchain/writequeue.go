@@ -74,6 +74,15 @@ type nodeRowSnapshot struct {
 
 	hashIndex   bool // dbPutHashIndex(hash, height)
 	heightIndex bool // dbPutHeightIndex(height, hash) when on the best header view
+
+	// Asher_Mod_Start_20260911_174500
+	// heightIndexChain reports whether the node is on the connected chain, the
+	// only case allowed to displace an existing height-index row (pollution
+	// guard, see dbPutHeightIndexGuarded).
+	// heightIndexChain 记录节点是否在已连接链上——只有该情形允许顶替已有的
+	// 高度索引行(污染护栏,见 dbPutHeightIndexGuarded)。
+	heightIndexChain bool
+	// Asher_Mod_End_20260911_174500
 }
 
 // writeItem is one unit of asynchronous disk work (A3): the block body plus
@@ -528,9 +537,15 @@ func writeNodeRowSnapshot(dbTx database.Tx, row *nodeRowSnapshot) error {
 		}
 	}
 	if row.heightIndex {
-		if err := dbPutHeightIndex(dbTx, row.height, &row.hash); err != nil {
+		// Asher_Mod_Start_20260911_174500
+		// Guarded write: a header-only (fabricated/concurrent) node must never
+		// displace an existing main-chain height row (pollution fix).
+		// 护栏写入:header-only(fabricated/竞争)节点不得顶替已有的主链高度行
+		// (污染修复)。
+		if err := dbPutHeightIndexGuarded(dbTx, row.height, &row.hash, row.heightIndexChain); err != nil {
 			return err
 		}
+		// Asher_Mod_End_20260911_174500
 	}
 	return nil
 }

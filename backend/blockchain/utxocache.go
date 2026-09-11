@@ -1100,37 +1100,89 @@ func (b *BlockChain) InitConsistentState(tip *blockNode, interrupt <-chan struct
 		"take a long time...", statusHash.String(), lastFlushNode.height,
 		tip.hash.String(), tip.height)
 
+	if lastFlushNode.height > tip.height {
+		// Asher_Mod_Start_20260911_174500
+		// The on-disk UTXO state reflects blocks the chain state does not know
+		// about (e.g. the legacy A3 marker-ahead failure).  Forward-rebuilding
+		// the missing main-chain metadata is the dedicated recovery for this
+		// shape; fail loudly instead of panicking or replaying backwards.
+		// 盘上 UTXO 状态超前于链状态(如早期 A3 的 marker 领先故障)。前向补
+		// 齐缺失的主链元数据是该形态的专用恢复;这里明确报错,而非崩溃或
+		// 反向重放。
+		return fmt.Errorf("utxo consistency point %v (%d) is above the chain "+
+			"tip (%d): the on-disk UTXO set includes blocks missing from the "+
+			"chain state -- a forward-rebuild of the main-chain metadata is "+
+			"required", statusHash, lastFlushNode.height, tip.height)
+		// Asher_Mod_End_20260911_174500
+	}
+
 	// The last consistent state and everything after it is necessarily on the
 	// best chain (blocks are never disconnected during a reorganization, and
 	// the cache is flushed before a reorganization begins).  Since the in-memory
 	// parent chain may not reach back to the consistent node when windowing has
-	// evicted it, recover by walking heights forward from the consistent height
-	// instead of by following in-memory parent pointers.  The main-chain height
-	// index must therefore agree on the consistent node's height, which also
-	// re-validates that statusHash is on the best chain.
-	var consistentHeight int32
-	err = s.db.View(func(dbTx database.Tx) error {
-		hash, err := dbFetchHashByHeight(dbTx, lastFlushNode.height)
-		if err != nil {
-			return err
+	// evicted it, recover by walking the BLOCK INDEX hash chain (PrevBlock)
+	// from the chain tip downward to the consistent block, then replaying
+	// forward.  The block-index hash chain cannot be polluted by fabricated
+	// headers the way the main-chain height index can, so a polluted height row
+	// (e.g. an orphan's hash claiming a connected height, breaking
+	// fetchBlockByHeight with "block ... does not exist") no longer aborts the
+	// reconstruction -- this is the unclean-shutdown self-heal path.
+	// 一致点及其之后的块必然在主链上。内存父链可能因窗口驱逐而够不到一致
+	// 点,因此改为沿块索引哈希链(PrevBlock)从链尖向下走到一致点,再正向
+	// 重放。块索引哈希链不会被 fabricated header 像主链高度索引那样污染,
+	// 因此"孤儿 hash 霸占已连接高度导致 fetchBlockByHeight 报 block does
+	// not exist"不再中止重建——这就是非正常关闭的自愈路径。
+	consistentHeight := lastFlushNode.height
+	count := int(tip.height - consistentHeight)
+	hashes := make([]chainhash.Hash, 0, count)
+	err = b.db.View(func(dbTx database.Tx) error {
+		cur := tip.hash
+		for i := int32(0); i <= tip.height-consistentHeight; i++ {
+			header, err := dbFetchHeaderByHash(dbTx, &cur)
+			if err != nil {
+				return err
+			}
+			if cur == *statusHash {
+				// Reached the consistency boundary (exclusive): hashes holds
+				// exactly the blocks one height above it, in descending order.
+				// 触达一致点边界(不含):hashes 中恰为边界上方的块,当前为降序。
+				return nil
+			}
+			hashes = append(hashes, cur)
+			cur = header.PrevBlock
 		}
-		if !hash.IsEqual(statusHash) {
-			return AssertError(fmt.Sprintf("last utxo consistency status contains "+
-				"hash that fails to match best chain at height %d: %v", lastFlushNode.height, statusHash))
-		}
-		consistentHeight = lastFlushNode.height
-		return nil
+		return AssertError(fmt.Sprintf("utxo reconstruction walk did not reach the "+
+			"consistent block %v (%d) starting from tip %v (%d)", statusHash,
+			consistentHeight, tip.hash, tip.height))
 	})
 	if err != nil {
 		return err
 	}
+	if len(hashes) != count {
+		return AssertError(fmt.Sprintf("utxo reconstruction walked %d hashes but "+
+			"expected %d heights between %d and %d", len(hashes), count,
+			consistentHeight, tip.height))
+	}
+	// Reverse the walk into forward (ascending) height order.
+	// 反转为正向(高度升序)。
+	for i, j := 0, len(hashes)-1; i < j; i, j = i+1, j-1 {
+		hashes[i], hashes[j] = hashes[j], hashes[i]
+	}
 
 	// Replay the blocks from the last consistent state up to the best state.
-	// Blocks above the in-memory window are read directly from the database by
-	// height, so recovery does not require any parent links that windowing may
-	// have evicted.
-	for height := consistentHeight + 1; height <= tip.height; height++ {
-		block, err := b.fetchBlockByHeight(height)
+	// The canonical hashes come from the block-index hash chain and each body
+	// is fetched by hash, so neither the (pollutable) height index nor any
+	// in-memory parent link is consulted.
+	// 重放一致点到 best state 之间的块。规范哈希来自块索引哈希链,块体按
+	// 哈希获取,不依赖(可被污染的)高度索引或任何内存父链。
+	for i, hash := range hashes {
+		height := consistentHeight + 1 + int32(i)
+		var block *btcutil.Block
+		err = b.db.View(func(dbTx database.Tx) error {
+			var e error
+			block, e = dbFetchBlockByHeightHash(dbTx, &hash, height)
+			return e
+		})
 		if err != nil {
 			return err
 		}
@@ -1142,7 +1194,7 @@ func (b *BlockChain) InitConsistentState(tip *blockNode, interrupt <-chan struct
 		// Flush the utxo cache if needed.  This will in turn update the
 		// consistent state to this block.
 		err = b.db.Update(func(dbTx database.Tx) error {
-			return s.flush(dbTx, FlushIfNeeded, &BestState{Height: height, Hash: *block.Hash()})
+			return s.flush(dbTx, FlushIfNeeded, &BestState{Height: height, Hash: hash})
 		})
 		if err != nil {
 			return err
