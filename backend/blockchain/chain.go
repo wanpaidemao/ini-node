@@ -976,12 +976,36 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 		b.sendNotification(NTBlockConnected, block)
 	}()
 
+	// Asher_Mod_Start_20260911_162551
 	// Since we may have changed the UTXO cache, we make sure it didn't exceed its
 	// maximum size.  If we're pruned and have flushed already, this will be a no-op.
+	// Under A3 the chain-state metadata is written asynchronously, so before
+	// persisting UTXO entries/marker the metadata queue is drained to the current
+	// tip (A3 crash-safety fix): this keeps the on-disk UTXO consistency marker
+	// at or below the metadata watermark at every durable moment, so an unclean
+	// shutdown can always be recovered by the forward-replay path.
+	// A3 下链状态元数据异步写,在落盘 UTXO 条目/标记之前先排空元数据队列到
+	// 当前 tip(A3 崩溃安全修复):使任意持久化时刻盘上 UTXO 一致性标记不高于
+	// 元数据水印,非正常关闭后总能由前向重放路径恢复。
+	if b.writeQueue != nil {
+		// Memory-pressure flush only: between batches the cache is retained
+		// (A4) and flushed per background period or shutdown, avoiding the
+		// per-block database transaction entirely.
+		// 仅内存压力触发落盘:批次间缓存驻留(A4),按后台周期或关闭时落盘,
+		// 完全避免了逐块的数据库事务。
+		if b.utxoCache.totalMemoryUsage() >= b.utxoCache.maxTotalMemoryUsage {
+			b.writeQueue.syncNow()
+			return b.db.Update(func(dbTx database.Tx) error {
+				return b.utxoCache.flush(dbTx, FlushRequired, state)
+			})
+		}
+		return nil
+	}
 	return b.db.Update(func(dbTx database.Tx) error {
 		return b.utxoCache.flush(dbTx, FlushIfNeeded, state)
 	})
 }
+// Asher_Mod_End_20260911_162551
 
 // disconnectBlock handles disconnecting the passed node/block from the end of
 // the main (best) chain.
@@ -1011,6 +1035,24 @@ func (b *BlockChain) disconnectBlock(node *blockNode, block *btcutil.Block, view
 	if err != nil {
 		return err
 	}
+
+	// Asher_Mod_Start_20260911_162551
+	// Under A3: before performing the db.Update that will write the new
+	// best-chain state (which is now after disconnecting, so its height
+	// is lower than before) and flush UTXO to the new height, we drain all
+	// pending items above the new tip height from the async write queue; any
+	// pending metadata for blocks that just got disconnected would be
+	// resurrected if we didn't drop them here, and the UTXO flush that follows
+	// would mark a consistency point at a height where the metadata doesn't
+	// exist (causing startup failure "no block at height ... exists").
+	// A3 下:在写入断开后的新高 best-chain state、并 flush UTXO 到新高之前,
+	// 从异步写队列排空所有高于新高的未处理条目;刚被断开区块的挂起元数据
+	// 如果不在这里丢弃,会被 writer 复活,随后的 UTXO flush 会在一个不存在
+	// 元数据的高度标记一致性点,导致启动时报 "no block at height ... exists"。
+	if b.writeQueue != nil {
+		b.writeQueue.syncNowBelow(prevNode.height)
+	}
+	// Asher_Mod_End_20260911_162551
 
 	// Generate a new best state snapshot that will be used to update the
 	// database and later memory if all database updates are successful.
@@ -3243,6 +3285,21 @@ func New(config *Config) (*BlockChain, error) {
 	return &b, nil
 }
 // Asher_Mod_End_20260910_112851
+
+// Asher_Mod_Start_20260911_162551
+// StopWriteQueue drains and stops the A3 async write queue.  It is called
+// during shutdown, after the final UTXO flush, so no trailing metadata item
+// is lost and the writer goroutine exits before shutdown completes.  No-op
+// when the queue is disabled (prune mode keeps the synchronous write path).
+// StopWriteQueue 排空并停止 A3 异步写队列。在关闭流程中、最终 UTXO flush
+// 之后调用,避免尾部元数据丢失并让 writer goroutine 在关闭完成前退出。
+// 队列未启用(prune 模式保持同步写路径)时为 no-op。
+func (b *BlockChain) StopWriteQueue() {
+	if b.writeQueue != nil {
+		b.writeQueue.stop()
+	}
+}
+// Asher_Mod_End_20260911_162551
 
 // CachedStateSize returns the total size of the cached state of the blockchain
 // in bytes.

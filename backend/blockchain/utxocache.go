@@ -801,6 +801,17 @@ func (b *BlockChain) FlushUtxoCache(mode FlushMode) error {
 	b.chainLock.Lock()
 	defer b.chainLock.Unlock()
 
+	// Asher_Mod_Start_20260911_162551
+	// Under A3 the chain-state metadata is written asynchronously: drain the
+	// queue to the current tip first so the UTXO entries/marker persisted below
+	// stay at or below the metadata watermark (A3 crash-safety invariant).
+	// A3 下链状态元数据异步写:先排空元数据队列到当前 tip,使下面落盘的
+	// UTXO 条目/标记不高于元数据水印(A3 崩溃安全不变量)。
+	if b.writeQueue != nil {
+		b.writeQueue.syncNow()
+	}
+	// Asher_Mod_End_20260911_162551
+
 	err := b.db.Update(func(dbTx database.Tx) error {
 		return b.utxoCache.flush(dbTx, mode, b.BestSnapshot())
 	})

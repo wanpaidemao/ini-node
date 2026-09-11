@@ -4404,6 +4404,18 @@ out:
 		log.Errorf("Error while flushing blockchain caches: %v", err)
 	}
 
+	// Asher_Mod_Start_20260911_162551
+	// Drain and stop the A3 async write queue so no trailing metadata item is
+	// lost and the writer goroutine exits before the SyncManager reports
+	// shutdown complete.  Without this the tail of the async metadata batch is
+	// discarded on every shutdown, leaving the on-disk metadata watermark
+	// behind the flushed UTXO state (A3 crash-safety fix).
+	// 排空并停止 A3 异步写队列,确保尾部元数据不丢失且 writer goroutine 在
+	// SyncManager 报告关闭完成前退出。不调用它则每次关闭都会丢弃异步元数据
+	// 批次的尾部,使盘上元数据水印落后于已 flush 的 UTXO 状态(A3 崩溃安全修复)。
+	sm.chain.StopWriteQueue()
+	// Asher_Mod_End_20260911_162551
+
 	sm.wg.Done()
 	log.Trace("Block handler done")
 }

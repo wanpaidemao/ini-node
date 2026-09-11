@@ -122,8 +122,27 @@ type writeItem struct {
 // O(块内交易数)、零数据库 I/O 的情况下快照元数据并入队 writeItem;
 // 专用 writer goroutine 执行实际事务,每 writeQueueBatchSize 个条目合并
 // 一次元数据,并推进持久化水印,使崩溃后可重放尾部。
+//
+// Asher_Mod_Start_20260911_162551
+// syncNow/syncNowBelow: the UTXO state is still persisted synchronously
+// (entries + consistency marker) by the flush sites (connectBlock tail /
+// background loop / shutdown), so without a guard the on-disk UTXO marker can
+// advance ABOVE the async metadata watermark (up to one batch behind).  After
+// an unclean shutdown the recovery assumes "consistent point <= chainstate";
+// a marker above the watermark breaks that assumption (dbFetchHashByHeight of
+// the marker height fails) and startup dies with "no block at height N
+// exists".  The barrier below makes every flush site first drain all enqueued
+// metadata to the current tip, so marker == watermark == chainstate at every
+// durable moment.
+// syncNow/syncNowBelow:UTXO 状态仍由 flush 各入口(connectBlock 尾部/后台循环/
+// 关闭)同步落盘(条目+一致性标记),不加护栏时盘上 UTXO 标记可能领先异步元
+// 数据水印(最多落后一个批次)。非正常关闭后恢复逻辑假设"一致点 <=
+// chainstate";标记高于水印会破坏该假设(按标记高度查高度索引失败),启动报
+// "no block at height N exists"。下面的屏障让每个 flush 入口先排空全部已入队
+// 元数据到当前 tip,使任意持久化时刻满足 marker == watermark == chainstate。
 type writeQueue struct {
-	items chan *writeItem
+	items  chan *writeItem
+	syncCh chan syncReq
 
 	// mu guards the stopped flag.
 	mu      sync.Mutex
@@ -143,11 +162,26 @@ type writeQueue struct {
 	indexManager IndexManager
 }
 
+// syncReq is a drain-barrier request (A3 fix).  The requester holds the chain
+// lock, so no new item can be enqueued while the writer drains: the writer
+// flushes its in-flight batch, drains the queue, optionally drops items above
+// maxHeight (reorg rebase -- the detached blocks' rows are removed
+// synchronously by the disconnect path), flushes the tail and acks.
+// syncReq 是排空屏障请求(A3 修复)。请求方持有链锁,排空期间不会再有新
+// 条目入队:writer 冲刷在途批次、排空队列、按需丢弃 maxHeight 以上的条目
+// (重组重基——被断开块的元数据行由 disconnect 路径同步删除)、冲刷尾部
+// 并回执。
+type syncReq struct {
+	maxHeight int32 // < 0 保留全部条目;否则丢弃高于该高度的条目
+	done      chan struct{}
+}
+
 // newWriteQueue starts the writer goroutine for a new async write queue.
 // newWriteQueue 启动新异步写队列的 writer goroutine。
 func newWriteQueue(db database.DB, indexManager IndexManager) *writeQueue {
 	q := &writeQueue{
 		items:        make(chan *writeItem, writeQueueCap),
+		syncCh:       make(chan syncReq),
 		stopCh:       make(chan struct{}),
 		db:           db,
 		indexManager: indexManager,
@@ -155,6 +189,44 @@ func newWriteQueue(db database.DB, indexManager IndexManager) *writeQueue {
 	q.wg.Add(1)
 	go q.writer()
 	return q
+}
+
+// syncNow blocks until every item enqueued so far is durably written and the
+// watermark advanced to the current tip.  It must be called with the chain
+// lock held (before persisting UTXO entries/marker) so the on-disk UTXO
+// consistency marker never exceeds the metadata watermark.
+// syncNow 阻塞直到当前已入队的全部条目持久化、水印推进到当前 tip。必须
+// 在持有链锁时调用(落盘 UTXO 条目/标记之前),保证盘上 UTXO 一致性标记
+// 不高于元数据水印。
+func (q *writeQueue) syncNow() {
+	q.syncNowBelow(-1)
+}
+
+// syncNowBelow is syncNow with a height filter: items above maxHeight are
+// dropped instead of flushed.  Used by the disconnect path so metadata rows
+// for blocks just detached from the best chain are not resurrected by the
+// async writer, and the UTXO flush that follows stays consistent with the
+// reconnected chain tip.  Both syncNow paths bail out without blocking when
+// the queue is stopping, so a shutdown that races an in-flight barrier never
+// hangs (the caller's UTXO flush then lags at worst one batch, which the
+// stop-drain below repairs).
+// syncNowBelow 是带高度过滤的 syncNow:maxHeight 以上的条目被丢弃而非落盘。
+// 供 disconnect 路径使用,使刚被断开区块的元数据行不会被异步 writer 复活,
+// 且紧随其后的 UTXO flush 与重组后的链 tip 保持一致。两个 syncNow 入口在
+// 队列停止时直接返回而不阻塞,因此关闭与在途屏障竞争时不会挂死(调用方的
+// UTXO flush 至多落后一个批次,由下面的 stop 排空补上)。
+func (q *writeQueue) syncNowBelow(maxHeight int32) {
+	req := syncReq{maxHeight: maxHeight, done: make(chan struct{})}
+	select {
+	case q.syncCh <- req:
+	case <-q.stopCh:
+		return
+	}
+	select {
+	case <-req.done:
+	case <-q.stopCh:
+		return
+	}
 }
 
 // enqueue adds one item to the async queue.  It blocks when the queue is
@@ -214,10 +286,15 @@ func (q *writeQueue) stop() {
 // writer is the dedicated goroutine that serializes the disk writes.  It
 // accumulates items into a batch and flushes the whole batch in one database
 // transaction every writeQueueBatchSize items (design doc 3.3.1).  On stop it
-// flushes its in-flight (partial) batch before exiting.
+// flushes its in-flight (partial) batch before exiting.  A syncReq barrier
+// flushes the in-flight batch plus everything currently queued (optionally
+// dropping items above maxHeight) before acknowledging, so the requester can
+// safely persist UTXO state at the same height afterward.
 // writer 是串行执行落盘的专用 goroutine。它把条目累积成批次,每
 // writeQueueBatchSize 个条目把整个批次在单个数据库事务内冲刷
-// (设计文档 3.3.1)。停止时先冲刷在途(部分)批次再退出。
+// (设计文档 3.3.1)。停止时先冲刷在途(部分)批次再退出。syncReq 屏障会
+// 冲刷在途批次加当前队列中的全部条目(可按 maxHeight 丢弃部分)后再回执,
+// 使请求方可安全地在同一高度随后落盘 UTXO 状态。
 func (q *writeQueue) writer() {
 	defer q.wg.Done()
 	batch := make([]*writeItem, 0, writeQueueBatchSize)
@@ -229,12 +306,47 @@ func (q *writeQueue) writer() {
 				q.flushBatch(batch)
 				batch = batch[:0]
 			}
+
+		case req := <-q.syncCh:
+			// Flush the in-flight batch first, filtering out any items above
+			// maxHeight (reorg rebase drops the just-detached blocks here).
+			// 先冲刷在途批次,过滤掉 maxHeight 以上的条目(重组重基在此丢弃
+			// 刚被断开的块)。
+			var keep []*writeItem
+			for _, it := range batch {
+				if req.maxHeight < 0 || it.height <= req.maxHeight {
+					keep = append(keep, it)
+				}
+			}
+			q.flushBatch(keep)
+			batch = batch[:0]
+
+			// Drain everything still queued.  The requester holds the chain
+			// lock, so nothing new is enqueued during this loop.
+			// 排空仍在队列中的全部条目。请求方持有链锁,此循环期间不会有新条目。
+			var tail []*writeItem
+		drainsync:
+			for {
+				select {
+				case item := <-q.items:
+					if req.maxHeight < 0 || item.height <= req.maxHeight {
+						tail = append(tail, item)
+					}
+				default:
+					break drainsync
+				}
+			}
+			q.flushBatch(tail)
+			close(req.done)
+
 		case <-q.stopCh:
 			q.flushBatch(batch)
 			return
 		}
 	}
 }
+
+// Asher_Mod_End_20260911_162551
 
 // flushBatch merges the whole batch's metadata rows into a single database
 // transaction (block-index rows, best-tip snapshot, best state, height index,
