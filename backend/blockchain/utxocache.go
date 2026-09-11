@@ -227,6 +227,19 @@ const (
 // 块花费;全量 flush 后保留它们可避免紧接着的数据库冷读。
 const utxoHotDepth int32 = 2000
 
+// utxoDelta records one changed outpoint to be persisted by the A3 batch
+// transaction (full 方案1).  A tombstone deletes the row; otherwise takeDelta
+// copies the entry value out of the live cache under the chain lock, so the
+// async writer never races concurrent cache mutations.
+// utxoDelta 记录一个待由 A3 批次事务落盘的变更 outpoint(完整方案1)。
+// tombstone 删除行;否则 takeDelta 在链锁内从活动缓存复制条目值,异步
+// writer 不会与并发缓存修改竞争。
+type utxoDelta struct {
+	op        wire.OutPoint
+	tombstone bool
+	entry     *UtxoEntry // 仅 !tombstone 且经 takeDelta 复制后非 nil
+}
+
 // utxoCache houses a cache of unspent transaction outputs to be used for
 // various purposes and gives concurrent access to the cache for callers.
 type utxoCache struct {
@@ -254,6 +267,28 @@ type utxoCache struct {
 	// (writeCache cleanCache=false)只遍历真正变化的 outpoint,而非扫描整个
 	// 缓存。全量 flush 与 purge 时随缓存一起清空。
 	dirtyOps map[wire.OutPoint]struct{}
+
+	// Asher_Mod_Start_20260911_173000
+	// trackDeltas enables per-block UTXO delta capture for the A3 batch
+	// (full 方案1).  When true, addTxIn/addTxOut register the touched outpoints
+	// in deltaPoints and takeDelta snapshots them into the current writeItem,
+	// so the batch transaction persists UTXO entries + consistency marker
+	// together with the metadata and watermark.  It is enabled when the async
+	// write queue is active (A3-on) and stays off for the synchronous/prune
+	// path.
+	// trackDeltas 启用逐块 UTXO 增量捕获(完整方案1/A3)。为 true 时
+	// addTxIn/addTxOut 把触及的 outpoint 记入 deltaPoints,takeDelta 把它们
+	// 快照进当前 writeItem,使批次事务把 UTXO 条目+一致性标记与元数据、
+	// 水印一起落盘。异步写队列启用(A3-on)时打开;同步/prune 路径保持关闭。
+	trackDeltas bool
+
+	// deltaPoints is the per-block list of outpoints whose cache state changed
+	// while applying the current block (under the chain lock).  It is consumed
+	// and cleared by takeDelta once per connected block under A3.
+	// deltaPoints 是当前块应用期间(链锁内)缓存状态发生变化的 outpoint
+	// 列表。A3 下每连接一块,由 takeDelta 消费并清空一次。
+	deltaPoints []utxoDelta
+	// Asher_Mod_End_20260911_173000
 
 	// hotFloor is the lowest block height whose UTXO entries are considered
 	// "hot" (A4-3 hot region).  A full cache flush keeps entries at or above
@@ -458,6 +493,15 @@ func (s *utxoCache) addTxOut(outpoint wire.OutPoint, txOut *wire.TxOut, isCoinBa
 	s.cachedEntries.put(outpoint, entry, s.totalEntryMemory)
 	s.totalEntryMemory += entry.memoryUsage()
 	s.dirtyOps[outpoint] = struct{}{}
+	// Asher_Mod_Start_20260911_173000
+	// Register the new/unspent output in the per-block delta list (full 方案1);
+	// takeDelta copies its value into the batch item at connect time.
+	// 把新增/恢复的输出登记进逐块增量列表(完整方案1);takeDelta 在连接时
+	// 把值复制进批次 item。
+	if s.trackDeltas {
+		s.deltaPoints = append(s.deltaPoints, utxoDelta{op: outpoint})
+	}
+	// Asher_Mod_End_20260911_173000
 
 	return nil
 }
@@ -519,6 +563,20 @@ func (s *utxoCache) addTxIn(txIn *wire.TxIn, stxos *[]SpentTxOut) error {
 
 	// Mark the entry as spent.
 	entry.Spend()
+
+	// Asher_Mod_Start_20260911_173000
+	// Under A3 (full 方案1) every spend is recorded as a tombstone delta: the
+	// row must be deleted by the batch.  This covers BOTH the fresh case (the
+	// entry was created by an earlier still-pending block of the same batch
+	// window and was captured as a put; the delete must follow in order) and
+	// the non-fresh case.
+	// A3 下(完整方案1)每次花费都记录为 tombstone 增量:该行必须由批次删除。
+	// fresh 与非 fresh 两种情形都覆盖(fresh 条目可能已被本批次窗口内更早
+	// 的挂起块捕获为 put,删除必须按顺序跟在 put 之后)。
+	if s.trackDeltas {
+		s.deltaPoints = append(s.deltaPoints, utxoDelta{op: txIn.PreviousOutPoint, tombstone: true})
+	}
+	// Asher_Mod_End_20260911_173000
 
 	// If an entry is fresh it indicates that this entry was spent before it could be
 	// flushed to the database. Because of this, we can just delete it from the map of
@@ -593,6 +651,67 @@ func (s *utxoCache) connectTransactions(block *btcutil.Block, stxos *[]SpentTxOu
 
 	return nil
 }
+
+// Asher_Mod_Start_20260911_173000
+// takeDelta snapshots the per-block changed outpoints (full 方案1) into a
+// delta list the A3 batch writer will persist.  It MUST be called under the
+// chain lock immediately after the block's connectTransactions: put entries
+// are copied by value from the live cache so later blocks may mutate them
+// freely, tombstoned (spent) entries drop their spent row from the cache (its
+// delete is recorded by the batch), and the working dirtyOps set is drained
+// so re-write tracking stays aligned with the batch cadence instead of
+// growing without bound.
+// takeDelta 把逐块变化的 outpoint 快照成增量列表(完整方案1),由 A3 批次
+// writer 落盘。必须在链锁内、本块 connectTransactions 之后立即调用:put
+// 条目按值从活动缓存复制,后续块可自由修改;被花费(tombstone)的条目从
+// 缓存移除其 spent 行(删除由批次记录);工作用 dirtyOps 集合随之清空,
+// 使重写跟踪与批次节奏对齐而不会无限增长。
+func (s *utxoCache) takeDelta() []utxoDelta {
+	if !s.trackDeltas {
+		return nil
+	}
+	if len(s.deltaPoints) == 0 {
+		s.dirtyOps = make(map[wire.OutPoint]struct{})
+		return nil
+	}
+	deltas := make([]utxoDelta, 0, len(s.deltaPoints))
+	for _, d := range s.deltaPoints {
+		if d.tombstone {
+			if entry, ok := s.cachedEntries.get(d.op); ok {
+				s.cachedEntries.delete(d.op)
+				if entry != nil {
+					s.totalEntryMemory -= entry.memoryUsage()
+				}
+			}
+			deltas = append(deltas, utxoDelta{op: d.op, tombstone: true})
+			continue
+		}
+		entry, ok := s.cachedEntries.get(d.op)
+		if ok && entry != nil {
+			c := *entry
+			deltas = append(deltas, utxoDelta{op: d.op, entry: &c})
+		} else {
+			// The fresh entry was consumed (e.g. spent within the same block);
+			// persist a delete so an earlier pending put cannot resurrect it.
+			// fresh 条目已被消费(如本块内即被花费);记录删除,避免更早的
+			// 挂起 put 把它复活。
+			deltas = append(deltas, utxoDelta{op: d.op, tombstone: true})
+		}
+	}
+	s.deltaPoints = nil
+	s.dirtyOps = make(map[wire.OutPoint]struct{})
+	return deltas
+}
+
+// resetDelta discards any per-block deltas accumulated without being consumed
+// (e.g. by the UTXO reconstruction replay during startup), so they can never
+// leak into the first connected block's batch item.
+// resetDelta 丢弃未被消费而累积的逐块增量(如启动时 UTXO 重建重放产生的),
+// 使它们不会泄漏进首个连接块的批次 item。
+func (s *utxoCache) resetDelta() {
+	s.deltaPoints = nil
+}
+// Asher_Mod_End_20260911_173000
 
 // writeCache writes the entries that differ from the database to the database
 // atomically.  When cleanCache is true the whole in-memory cache is written and
@@ -1035,6 +1154,13 @@ func (b *BlockChain) InitConsistentState(tip *blockNode, interrupt <-chan struct
 		}
 	}
 	log.Debug("UTXO state reconstruction done")
+
+	// Asher_Mod_Start_20260911_173000
+	// Discard any deltas accumulated by the replay above so they never leak
+	// into the first connected block's batch item (full 方案1).
+	// 丢弃上方重放累积的增量,避免泄漏进首个连接块的批次 item(完整方案1)。
+	s.resetDelta()
+	// Asher_Mod_End_20260911_173000
 
 	// Set the last flush hash as it's the default value of 0s.
 	s.lastFlushHash = tip.hash

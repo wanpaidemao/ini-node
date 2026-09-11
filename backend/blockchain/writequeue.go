@@ -110,6 +110,18 @@ type writeItem struct {
 	// 高度为负表示"尚无 best header node"(尚未刷新),跳过写入。
 	bestHeaderHash   chainhash.Hash
 	bestHeaderHeight int32
+
+	// Asher_Mod_Start_20260911_173000
+	// utxoDelta carries the UTXO entry changes produced by connecting this
+	// block (full 方案1): put entries are value copies taken from the cache
+	// under the chain lock, tombstoned outpoints delete their rows.  The batch
+	// transaction applies them in order so the persisted UTXO set always stops
+	// at the same height as the metadata watermark and the consistency marker.
+	// utxoDelta 携带连接本块产生的 UTXO 条目变化(完整方案1):put 条目为链锁
+	// 内从缓存复制的值,tombstone 的 outpoint 删除对应行。批次事务按顺序
+	// 应用它们,使落盘 UTXO 集始终与元数据水印、一致性标记停在相同高度。
+	utxoDelta []utxoDelta
+	// Asher_Mod_End_20260911_173000
 }
 
 // writeQueue serializes the chain-state disk writes that used to happen
@@ -365,11 +377,34 @@ func (q *writeQueue) flushBatch(items []*writeItem) {
 	}
 	lastHeight := items[len(items)-1].height
 	err := q.db.Update(func(dbTx database.Tx) error {
+		// Asher_Mod_Start_20260911_173000
+		// Full 方案1: the UTXO entries (per-item deltas) and the consistency
+		// marker are persisted in the SAME transaction as the metadata rows and
+		// the watermark, so at every durable moment on-disk marker == watermark
+		// == metadata tip.  An unclean shutdown therefore leaves a replay window
+		// of at most one batch -- and in practice zero, since the on-disk tip
+		// never exceeds the watermark -- instead of replaying the whole chain.
+		// 完整方案1:UTXO 条目(逐 item 增量)与一致性标记与元数据行、水印在
+		// 同一事务落盘,使任意持久化时刻盘上 marker == watermark == 元数据
+		// tip。非正常关闭后重放窗口至多一个批次——实际上为零,因为盘上
+		// tip 不会超过水印——而非重放整条链。
 		for _, item := range items {
 			if err := writeItemRows(dbTx, item, q.indexManager); err != nil {
 				return err
 			}
+			if err := writeItemDeltas(dbTx, item); err != nil {
+				return err
+			}
 		}
+		// Advance the UTXO consistency marker to the batch's final state only
+		// together with the metadata/watermark commit (see writeItemDeltas).
+		// 仅在元数据/水印提交的同时,把 UTXO 一致性标记推进到批次最终状态。
+		if lastBest := items[len(items)-1].bestState; lastBest != nil {
+			if err := dbPutUtxoStateConsistency(dbTx, &lastBest.Hash); err != nil {
+				return err
+			}
+		}
+		// Asher_Mod_End_20260911_173000
 		return dbPutWriteWatermark(dbTx, lastHeight)
 	})
 	if err != nil {
@@ -377,6 +412,33 @@ func (q *writeQueue) flushBatch(items []*writeItem) {
 			"height %d: %v", lastHeight, err)
 	}
 }
+
+// Asher_Mod_Start_20260911_173000
+// writeItemDeltas persists the UTXO entry changes captured by one connected
+// block (full 方案1) inside the batch transaction: puts for new/unspent
+// outs, deletes for tombstoned (spent) outpoints.  The entry values are
+// snapshots taken under the chain lock, so the writer never races concurrent
+// cache mutation.
+// writeItemDeltas 在批次事务内落盘一个已连接块的 UTXO 条目变化(完整方案1):
+// 新增/恢复的输出 put,被花费(tombstone)的 outpoint 删除。条目值为链锁内
+// 快照,writer 不会与并发缓存修改竞争。
+func writeItemDeltas(dbTx database.Tx, item *writeItem) error {
+	if len(item.utxoDelta) == 0 {
+		return nil
+	}
+	utxoBucket := dbTx.Metadata().Bucket(utxoSetBucketName)
+	for _, d := range item.utxoDelta {
+		if d.tombstone || d.entry == nil {
+			if err := dbDeleteUtxoEntry(utxoBucket, d.op); err != nil {
+				return err
+			}
+		} else if err := dbPutUtxoEntry(utxoBucket, d.op, d.entry); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+// Asher_Mod_End_20260911_173000
 
 // writeItemRows reproduces, inside one db transaction, the six metadata
 // writes that connectBlock used to perform synchronously (design doc 3.3.1),

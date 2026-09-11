@@ -910,6 +910,14 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 			bestState:   state,
 			blockHash:   *block.Hash(),
 			stxos:       stxos,
+			// Asher_Mod_Start_20260911_173000
+			// Snapshot this block's UTXO changes (full 方案1).  Called under the
+			// chain lock right after the block's connectTransactions, so the
+			// delta list holds exactly this block's touched outpoints.
+			// 快照本块的 UTXO 变化(完整方案1)。在链锁内、本块
+			// connectTransactions 之后调用,增量列表恰好是本块触及的 outpoint。
+			utxoDelta: b.utxoCache.takeDelta(),
+			// Asher_Mod_End_20260911_173000
 		}
 		// Snapshot the best header state that flushDirtyLocked would have
 		// persisted (dbPutBestHeaderState), so the async writer reproduces it
@@ -3206,6 +3214,13 @@ func New(config *Config) (*BlockChain, error) {
 	// prune 模式保持同步写路径。
 	if b.pruneTarget == 0 {
 		b.writeQueue = newWriteQueue(config.DB, config.IndexManager)
+		// Asher_Mod_Start_20260911_173000
+		// Enable per-block UTXO delta capture so the A3 batch persists entries
+		// + consistency marker with the metadata and watermark (full 方案1).
+		// 启用逐块 UTXO 增量捕获,使 A3 批次把条目+一致性标记与元数据、
+		// 水印一起落盘(完整方案1)。
+		b.utxoCache.trackDeltas = true
+		// Asher_Mod_End_20260911_173000
 	}
 
 	// Set the best header tip function so flushToDB persists the best header
