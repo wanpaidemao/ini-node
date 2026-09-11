@@ -40,6 +40,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -67,10 +69,6 @@ type upnpNAT struct {
 // Discover searches the local network for a UPnP router returning a NAT
 // for the network if so, nil if not.
 func Discover() (nat NAT, err error) {
-	ssdp, err := net.ResolveUDPAddr("udp4", "239.255.255.250:1900")
-	if err != nil {
-		return
-	}
 	conn, err := net.ListenPacket("udp4", ":0")
 	if err != nil {
 		return
@@ -78,6 +76,31 @@ func Discover() (nat NAT, err error) {
 	socket := conn.(*net.UDPConn)
 	defer socket.Close()
 
+	// Standard multicast SSDP discovery (239.255.255.250:1900).
+	ssdp := &net.UDPAddr{IP: net.IPv4(239, 255, 255, 250), Port: 1900}
+	nat, err = discoverProbe(socket, ssdp)
+	if err == nil {
+		return
+	}
+
+	// Some routers (e.g. OpenWrt with MiniUPnPd) disable multicast SSDP
+	// responses entirely but still answer a unicast M-SEARCH — fall back to
+	// probing the default gateway directly. / 部分路由器(MiniUPnPd 系)完全
+	// 不响应组播 SSDP 但会应答单播 M-SEARCH——回退到直连默认网关探测。
+	if gw := defaultGatewayIPv4(); gw != nil {
+		unicast := &net.UDPAddr{IP: gw, Port: 1900}
+		if nat, err = discoverProbe(socket, unicast); err == nil {
+			return
+		}
+	}
+
+	err = errors.New("UPnP port discovery failed")
+	return
+}
+
+// discoverProbe sends repeated M-SEARCH probes to target (multicast or
+// unicast) and parses the first matching IGD response into a NAT.
+func discoverProbe(socket *net.UDPConn, target *net.UDPAddr) (nat NAT, err error) {
 	err = socket.SetDeadline(time.Now().Add(3 * time.Second))
 	if err != nil {
 		return
@@ -86,14 +109,14 @@ func Discover() (nat NAT, err error) {
 	st := "ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n"
 	buf := bytes.NewBufferString(
 		"M-SEARCH * HTTP/1.1\r\n" +
-			"HOST: 239.255.255.250:1900\r\n" +
+			"HOST: " + target.String() + "\r\n" +
 			st +
 			"MAN: \"ssdp:discover\"\r\n" +
 			"MX: 2\r\n\r\n")
 	message := buf.Bytes()
 	answerBytes := make([]byte, 1024)
 	for i := 0; i < 3; i++ {
-		_, err = socket.WriteToUDP(message, ssdp)
+		_, err = socket.WriteToUDP(message, target)
 		if err != nil {
 			return
 		}
@@ -101,8 +124,6 @@ func Discover() (nat NAT, err error) {
 		n, _, err = socket.ReadFromUDP(answerBytes)
 		if err != nil {
 			continue
-			// socket.Close()
-			// return
 		}
 		answer := string(answerBytes[0:n])
 		if !strings.Contains(answer, "\r\n"+st) {
@@ -212,13 +233,136 @@ func getChildService(d *device, serviceType string) *service {
 	return nil
 }
 
-// getOurIP returns a best guess at what the local IP is.
-func getOurIP() (ip string, err error) {
-	hostname, err := os.Hostname()
-	if err != nil {
-		return
+// defaultGatewayIPv4 returns the IPv4 address of this host's default gateway,
+// or nil when it cannot be determined.  Used as the fallback unicast target
+// for UPnP/SSDP discovery when the router ignores multicast M-SEARCH probes
+// (e.g. OpenWrt MiniUPnPd).
+// defaultGatewayIPv4 返回本机默认网关的 IPv4 地址,无法确定时返回 nil。
+// 作为路由器忽略组播 M-SEARCH 时(如 OpenWrt MiniUPnPd)UPnP/SSDP 发现的
+// 单播回退探测目标。
+func defaultGatewayIPv4() net.IP {
+	switch runtime.GOOS {
+	case "windows":
+		// "route print -4 0.0.0.0" prints the default route as
+		// "0.0.0.0  0.0.0.0  192.168.68.1  192.168.68.2  25"; match by the
+		// numeric destination/mask so parsing is locale-independent.
+		// 默认路由行形如 "0.0.0.0  0.0.0.0  192.168.68.1  192.168.68.2  25",
+		// 按数字键值匹配,与系统语言无关。
+		out, err := exec.Command("route", "print", "-4", "0.0.0.0").Output()
+		if err != nil {
+			return nil
+		}
+		for _, line := range strings.Split(string(out), "\r\n") {
+			f := strings.Fields(line)
+			if len(f) >= 3 && f[0] == "0.0.0.0" && f[1] == "0.0.0.0" {
+				if ip := net.ParseIP(f[2]); ip != nil {
+					return ip
+				}
+			}
+		}
+	case "linux":
+		// /proc/net/route stores destination/gateway as little-endian hex.
+		// /proc/net/route 中目的/网关为小端十六进制。
+		b, rerr := os.ReadFile("/proc/net/route")
+		if rerr != nil {
+			return nil
+		}
+		for _, line := range strings.Split(string(b), "\n")[1:] {
+			f := strings.Fields(line)
+			if len(f) >= 3 && f[1] == "00000000" {
+				gw, perr := strconv.ParseUint(f[2], 16, 32)
+				if perr != nil {
+					continue
+				}
+				return net.IPv4(byte(gw), byte(gw>>8), byte(gw>>16),
+					byte(gw>>24))
+			}
+		}
+	default: // darwin and other BSDs
+		// "route -n get default" prints "gateway: 192.168.68.1".
+		// 输出形如 "gateway: 192.168.68.1"。
+		out, err := exec.Command("route", "-n", "get", "default").Output()
+		if err != nil {
+			return nil
+		}
+		for _, line := range strings.Split(string(out), "\n") {
+			f := strings.Fields(line)
+			if len(f) == 2 && f[0] == "gateway:" {
+				if ip := net.ParseIP(f[1]); ip != nil {
+					return ip
+				}
+			}
+		}
 	}
-	return net.LookupCNAME(hostname)
+	return nil
+}
+
+// getOurIP returns a best guess at the IPv4 address of this host.  The
+// historical implementation derived it from net.LookupCNAME(hostname), which
+// fails whenever the unqualified host name cannot be resolved by the system
+// resolver (common on Windows); enumerating the interfaces instead never
+// depends on DNS.  Prefer the address on the default gateway's subnet, since
+// that is the one the router will see as NewInternalClient.
+// getOurIP 返回本机 IPv4 地址的最佳猜测。旧实现用 net.LookupCNAME(hostname)
+// 推导,当主机名无法被系统解析器解析时(Windows 上很常见)会直接失败;这里
+// 改为枚举网卡,完全不依赖 DNS。优先返回与默认网关同网段的地址——那才是
+// 路由器会当作 NewInternalClient 看到的地址。
+func getOurIP() (ip string, err error) {
+	gw := defaultGatewayIPv4()
+	ifs, err := net.Interfaces()
+	if err != nil {
+		return "", err
+	}
+	// First pass: an IPv4 on an up, non-loopback interface that shares the
+	// default gateway's subnet.
+	// 第一遍:处于默认网关同网段、且网卡为 up 的非回环 IPv4。
+	for _, ifi := range ifs {
+		if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, aerr := ifi.Addrs()
+		if aerr != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipNet, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip4 := ipNet.IP.To4()
+			if ip4 == nil || ip4.IsLoopback() || ip4.IsUnspecified() ||
+				ip4.IsLinkLocalUnicast() {
+				continue
+			}
+			if gw != nil && ipNet.Contains(gw) {
+				return ip4.String(), nil
+			}
+		}
+	}
+	// Fallback: any usable IPv4.
+	// 兜底:任意可用 IPv4。
+	for _, ifi := range ifs {
+		if ifi.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, aerr := ifi.Addrs()
+		if aerr != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipNet, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip4 := ipNet.IP.To4()
+			if ip4 == nil || ip4.IsLoopback() || ip4.IsUnspecified() ||
+				ip4.IsLinkLocalUnicast() {
+				continue
+			}
+			return ip4.String(), nil
+		}
+	}
+	return "", errors.New("no suitable IPv4 address found")
 }
 
 // getServiceURL parses the xml description at the given root url to find the
