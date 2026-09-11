@@ -8,7 +8,9 @@
 package blockchain
 
 import (
+	"bytes"
 	"fmt"
+	"math/big"
 	"sync"
 	"time"
 
@@ -1103,16 +1105,35 @@ func (b *BlockChain) InitConsistentState(tip *blockNode, interrupt <-chan struct
 	if lastFlushNode.height > tip.height {
 		// Asher_Mod_Start_20260911_174500
 		// The on-disk UTXO state reflects blocks the chain state does not know
-		// about (e.g. the legacy A3 marker-ahead failure).  Forward-rebuilding
-		// the missing main-chain metadata is the dedicated recovery for this
-		// shape; fail loudly instead of panicking or replaying backwards.
-		// 盘上 UTXO 状态超前于链状态(如早期 A3 的 marker 领先故障)。前向补
-		// 齐缺失的主链元数据是该形态的专用恢复;这里明确报错,而非崩溃或
-		// 反向重放。
-		return fmt.Errorf("utxo consistency point %v (%d) is above the chain "+
-			"tip (%d): the on-disk UTXO set includes blocks missing from the "+
-			"chain state -- a forward-rebuild of the main-chain metadata is "+
-			"required", statusHash, lastFlushNode.height, tip.height)
+		// about (e.g. a normal shutdown losing the A3 tail batch, or the
+		// legacy marker-ahead failure).  Forward-rebuilding the missing
+		// main-chain metadata is the dedicated recovery for this shape.
+		// Self-heal here instead of failing the node startup: the UTXO cache
+		// already flushed past the chain state, so the blocks in
+		// (chainHeight, utxoHeight] are re-indexed in one transaction and the
+		// node starts normally.  Only when the rebuild itself fails do we
+		// surface an error (the forwardrebuild dev tool remains the manual
+		// fallback).
+		// 盘上 UTXO 状态超前于链状态(如正常关闭丢失 A3 尾部批次,或早期
+		// A3 的 marker 领先故障)。前向补齐缺失的主链元数据是该形态的专用
+		// 恢复。这里自动自愈而非拒绝启动:UTXO 缓存已领先链状态,单事务
+		// 重新索引 (chainHeight, utxoHeight] 之间的块后节点正常启动;仅当
+		// 重建本身失败时才报错(forwardrebuild 开发工具仍为手动兜底)。
+		if err := b.forwardRebuildMainChainMetadata(); err != nil {
+			return fmt.Errorf("utxo consistency point %v (%d) is above the "+
+				"chain tip (%d) and the automatic forward-rebuild failed: %v",
+				statusHash, lastFlushNode.height, tip.height, err)
+		}
+		log.Warnf("Forward-rebuilt main-chain metadata to UTXO consistency "+
+			"point %v (%d) -- node startup continues", statusHash,
+			lastFlushNode.height)
+
+		// The cache now agrees with the disk: the consistency point is the
+		// last flush boundary.
+		// 缓存与盘上一致:一致点即最后冲刷边界。
+		s.lastFlushHash = *statusHash
+		s.lastFlushTime = time.Now()
+		return nil
 		// Asher_Mod_End_20260911_174500
 	}
 
@@ -1219,6 +1240,163 @@ func (b *BlockChain) InitConsistentState(tip *blockNode, interrupt <-chan struct
 	s.lastFlushTime = time.Now()
 
 	return nil
+}
+
+// forwardRebuildMainChainMetadata forward-rebuilds the main-chain metadata
+// rows when the on-disk UTXO consistency point is above the chain tip (the
+// shape left by a normal shutdown losing the A3 tail batch, or the legacy
+// marker-ahead failure).  The UTXO cache flushed past the chain state, so
+// the blocks in (chainHeight, utxoHeight] must be re-indexed: block-index
+// rows, hash→height and height→hash mappings, the chainstate, the best-tip
+// snapshot and the A3 write watermark are all brought up to the consistency
+// point in one transaction.  This is the in-process equivalent of the
+// forwardrebuild dev tool, so an interrupted or unclean shutdown never
+// leaves the node unable to start.
+// forwardRebuildMainChainMetadata 前向重建主链元数据:当盘上 UTXO 一致点
+// 高于链尖时(正常关闭丢失 A3 尾部批次,或遗留 marker 领先故障)。UTXO 缓存
+// 已领先链状态,需重新索引 (chainHeight, utxoHeight] 之间的块:块索引行、
+// hash→height 与 height→hash 映射、chainstate、best-tip 快照与 A3 写水印
+// 在同一事务内补齐到一致点。等价于 forwardrebuild 开发工具的进程内版本,
+// 中断/非正常关闭不会让节点无法启动。
+func (b *BlockChain) forwardRebuildMainChainMetadata() error {
+	// Read the current chainstate (the lower boundary).
+	// 读取当前 chainstate(下边界)。
+	var chainHash chainhash.Hash
+	var chainHeight int32
+	var chainTotalTxns uint64
+	var chainWorkSum *big.Int
+	err := b.db.View(func(dbTx database.Tx) error {
+		raw := dbTx.Metadata().Get(chainStateKeyName)
+		if raw == nil {
+			return fmt.Errorf("chainstate key missing")
+		}
+		cs, err := deserializeBestChainState(raw)
+		if err != nil {
+			return fmt.Errorf("deserialize chainstate: %v", err)
+		}
+		chainHash = cs.hash
+		chainHeight = int32(cs.height)
+		chainTotalTxns = cs.totalTxns
+		chainWorkSum = cs.workSum
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	// Read the UTXO consistency hash (the upper boundary).
+	// 读取 UTXO 一致点 hash(上边界)。
+	var utxoHash chainhash.Hash
+	err = b.db.View(func(dbTx database.Tx) error {
+		consRaw := dbFetchUtxoStateConsistency(dbTx)
+		if consRaw == nil {
+			return fmt.Errorf("utxo consistency key missing")
+		}
+		copy(utxoHash[:], consRaw)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	return b.db.Update(func(dbTx database.Tx) error {
+		// Walk the block bodies backwards from the consistency hash to the
+		// chainstate hash (mirrors the forwardrebuild tool's collectSegment).
+		// 沿块体 prevHash 从一致点回退到 chainstate hash(对应工具 collectSegment)。
+		var reversed []*wire.MsgBlock
+		cur := utxoHash
+		for {
+			raw, err := dbTx.FetchBlock(&cur)
+			if err != nil {
+				return fmt.Errorf("block %v: %v", cur, err)
+			}
+			msg := new(wire.MsgBlock)
+			if err := msg.Deserialize(bytes.NewReader(raw)); err != nil {
+				return fmt.Errorf("deserialize block %v: %v", cur, err)
+			}
+			reversed = append(reversed, msg)
+			if msg.Header.PrevBlock.IsEqual(&chainHash) {
+				break
+			}
+			if msg.Header.PrevBlock == (chainhash.Hash{}) {
+				return fmt.Errorf("walk reached genesis without finding chain hash %v",
+					chainHash)
+			}
+			cur = msg.Header.PrevBlock
+		}
+
+		meta := dbTx.Metadata()
+		hashIdx := meta.Bucket(hashIndexBucketName)
+		heightIdx := meta.Bucket(heightIndexBucketName)
+		blockIdx := meta.Bucket(blockIndexBucketName)
+		if hashIdx == nil || heightIdx == nil || blockIdx == nil {
+			return fmt.Errorf("index buckets missing")
+		}
+
+		// Forward (ascending height) re-index of the missing segment.
+		// 正向(高度升序)重索引缺失段。
+		totalTxns := chainTotalTxns
+		work := new(big.Int).Set(chainWorkSum)
+		height := chainHeight
+		for i := len(reversed) - 1; i >= 0; i-- {
+			blk := reversed[i]
+			height++
+			blkHash := blk.BlockHash()
+			serHeader := new(bytes.Buffer)
+			if err := blk.Header.Serialize(serHeader); err != nil {
+				return err
+			}
+			// ① Block-index row: BE height + hash -> header + status.
+			// ① 块索引行:BE height + hash -> header + status。
+			row := append(serHeader.Bytes(), byte(statusDataStored|statusValid))
+			if err := blockIdx.Put(blockIndexKey(&blkHash, uint32(height)), row); err != nil {
+				return err
+			}
+			// ② hash -> height mapping.
+			// ② hash -> height 映射。
+			var serH [4]byte
+			byteOrder.PutUint32(serH[:], uint32(height))
+			if err := hashIdx.Put(blkHash[:], serH[:]); err != nil {
+				return err
+			}
+			// ③ height -> hash mapping.
+			// ③ height -> hash 映射。
+			if err := heightIdx.Put(serH[:], blkHash[:]); err != nil {
+				return err
+			}
+			// ④ Cumulative totals.
+			// ④ 累计状态。
+			totalTxns += uint64(len(blk.Transactions))
+			work.Add(work, CalcWork(blk.Header.Bits))
+		}
+
+		// ⑤ New chainstate at the consistency point.
+		// ⑤ 一致点处的新 chainstate。
+		newCS := bestChainState{
+			hash:      utxoHash,
+			height:    uint32(height),
+			totalTxns: totalTxns,
+			workSum:   work,
+		}
+		if err := meta.Put(chainStateKeyName, serializeBestChainState(newCS)); err != nil {
+			return err
+		}
+
+		// ⑥ Best-tip snapshot (hash + LE height + 32B right-aligned work).
+		// ⑥ best-tip 快照(hash + LE height + 32B 右对齐 work)。
+		snap := make([]byte, 32+4+32)
+		copy(snap[:32], utxoHash[:])
+		byteOrder.PutUint32(snap[32:36], uint32(height))
+		wb := work.Bytes()
+		copy(snap[36+32-len(wb):], wb)
+		if err := blockIdx.Put(bestTipSnapshotKey, snap); err != nil {
+			return err
+		}
+
+		// ⑦ A3 write watermark.
+		// ⑦ A3 写水印。
+		return dbPutWriteWatermark(dbTx, height)
+	})
 }
 
 // flushNeededAfterPrune returns true if the utxo cache needs to be flushed after a prune

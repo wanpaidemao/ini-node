@@ -2858,6 +2858,20 @@ func (s *server) Stop() error {
 	// 链事件。
 	s.chain.StopNotifications()
 
+	// Stop the A3 async write queue BEFORE any database handle is closed:
+	// stop() drains the remaining items and flushes the final partial batch
+	// through the still-open database, and the writer goroutine exits before
+	// stop returns.  Without this the writer can attempt a metadata batch on
+	// an already-closed database (observed on a normal shutdown: the final
+	// A3 batch failed with "leveldb: closed", leaving the UTXO consistency
+	// point above the chain tip and the node unable to start on restart).
+	// 在任何数据库句柄关闭之前停止 A3 异步写队列:stop() 会排空剩余条目
+	// 并经仍打开的数据库冲刷最终部分批次,writer goroutine 在 stop 返回前
+	// 退出。缺少这一步时 writer 可能在已关闭的数据库上合并元数据批次
+	// (实测正常关闭时:A3 尾部批次报 "leveldb: closed",UTXO 一致点超前
+	// 链尖,重启后节点无法启动)。
+	s.chain.StopWriteQueue()
+
 	// Close the sugar index LevelDB if it was opened.
 	if s.sugarIndex != nil {
 		if err := s.sugarIndex.Close(); err != nil {
