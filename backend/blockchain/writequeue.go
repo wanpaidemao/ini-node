@@ -125,15 +125,13 @@ type writeItem struct {
 type writeQueue struct {
 	items chan *writeItem
 
-	// mu guards the batch accounting and the stopped flag.
+	// mu guards the stopped flag.
 	mu      sync.Mutex
 	stopped bool
 
 	stopCh   chan struct{}
 	stopOnce sync.Once
-
-	// batch counts items enqueued since the last metadata merge.
-	batch int
+	wg       sync.WaitGroup
 
 	db database.DB
 
@@ -154,6 +152,7 @@ func newWriteQueue(db database.DB, indexManager IndexManager) *writeQueue {
 		db:           db,
 		indexManager: indexManager,
 	}
+	q.wg.Add(1)
 	go q.writer()
 	return q
 }
@@ -168,7 +167,6 @@ func (q *writeQueue) enqueue(item *writeItem) bool {
 		q.mu.Unlock()
 		return false
 	}
-	q.batch++
 	q.mu.Unlock()
 
 	select {
@@ -191,72 +189,80 @@ func (q *writeQueue) stop() {
 		q.mu.Unlock()
 		close(q.stopCh)
 
-		// Drain whatever is still queued so nothing is lost, flushing the
-		// final partial batch before returning.
-		// 排空仍在队列中的条目,返回前冲刷最后的部分批次,避免丢失。
+		// Drain whatever the writer has not consumed yet and flush it as the
+		// final partial batch so nothing is lost.  The writer flushes its own
+		// in-flight batch before exiting (see writer), and wg.Wait below
+		// ensures both the writer's batch and this tail are durably written
+		// before stop returns.
+		// 排空 writer 尚未消费的条目,作为最后的部分批次冲刷,避免丢失。
+		// writer 退出前会冲刷自己在途的批次(见 writer),下面的 wg.Wait
+		// 确保 writer 的批次与本尾部都在 stop 返回前持久化。
+		var tail []*writeItem
 		for {
 			select {
 			case item := <-q.items:
-				q.writeOne(item)
+				tail = append(tail, item)
 			default:
+				q.flushBatch(tail)
+				q.wg.Wait()
 				return
 			}
 		}
 	})
 }
 
-// writer is the dedicated goroutine that serializes the disk writes.
-// writer 是串行执行落盘的专用 goroutine。
+// writer is the dedicated goroutine that serializes the disk writes.  It
+// accumulates items into a batch and flushes the whole batch in one database
+// transaction every writeQueueBatchSize items (design doc 3.3.1).  On stop it
+// flushes its in-flight (partial) batch before exiting.
+// writer 是串行执行落盘的专用 goroutine。它把条目累积成批次,每
+// writeQueueBatchSize 个条目把整个批次在单个数据库事务内冲刷
+// (设计文档 3.3.1)。停止时先冲刷在途(部分)批次再退出。
 func (q *writeQueue) writer() {
+	defer q.wg.Done()
+	batch := make([]*writeItem, 0, writeQueueBatchSize)
 	for {
 		select {
 		case item := <-q.items:
-			q.writeOne(item)
+			batch = append(batch, item)
+			if len(batch) >= writeQueueBatchSize {
+				q.flushBatch(batch)
+				batch = batch[:0]
+			}
 		case <-q.stopCh:
+			q.flushBatch(batch)
 			return
 		}
 	}
 }
 
-// writeOne accumulates one item and, every writeQueueBatchSize items, merges
-// the metadata batch into a single database transaction carrying the
-// snapshot's block-index rows, best-tip snapshot, best state, height index,
-// spend journal and index manager replay, then advances the watermark in the
-// same transaction.  The block body itself is stored synchronously by
-// maybeAcceptBlock before the metadata is enqueued (v1 scope: A3 asyncs the
-// metadata write path only, the heavy block-body store stays in the
-// synchronous flow to keep the change small and crash semantics unchanged).
-// writeOne 累积一个条目,每 writeQueueBatchSize 个条目把元数据批次合并进
-// 单个数据库事务,承载快照的块索引行、best-tip 快照、best state、高度
-// 索引、spend journal 与 index manager 重放,并在同一事务内推进水印。
-// 块体本身由 maybeAcceptBlock 在元数据入队前同步存储(v1 范围:A3 只
-// 异步元数据写路径,重 I/O 的块体存储留在同步流程,保持改动小且崩溃
-// 语义不变)。
-func (q *writeQueue) writeOne(item *writeItem) {
-	q.mu.Lock()
-	q.batch--
-	merge := q.batch <= 0
-	if merge {
-		q.batch = writeQueueBatchSize
-	}
-	q.mu.Unlock()
-
-	if !merge {
+// flushBatch merges the whole batch's metadata rows into a single database
+// transaction (block-index rows, best-tip snapshot, best state, height index,
+// spend journal and index manager replay) and advances the watermark to the
+// batch's highest height in the same transaction.  The block bodies
+// themselves are stored synchronously by maybeAcceptBlock before the
+// metadata is enqueued (v1 scope: A3 asyncs the metadata write path only).
+// flushBatch 把整个批次的元数据行合并进单个数据库事务(块索引行、
+// best-tip 快照、best state、高度索引、spend journal 与 index manager
+// 重放),并在同一事务内把水印推进到批次的最高高度。块体本身由
+// maybeAcceptBlock 在元数据入队前同步存储(v1 范围:A3 只异步元数据
+// 写路径)。
+func (q *writeQueue) flushBatch(items []*writeItem) {
+	if len(items) == 0 {
 		return
 	}
-
-	// Merge this batch's metadata rows into a single transaction and advance
-	// the watermark atomically with them.
-	// 把该批次的元数据行合并进单个事务,并与水印原子推进。
+	lastHeight := items[len(items)-1].height
 	err := q.db.Update(func(dbTx database.Tx) error {
-		if err := writeItemRows(dbTx, item, q.indexManager); err != nil {
-			return err
+		for _, item := range items {
+			if err := writeItemRows(dbTx, item, q.indexManager); err != nil {
+				return err
+			}
 		}
-		return dbPutWriteWatermark(dbTx, item.height)
+		return dbPutWriteWatermark(dbTx, lastHeight)
 	})
 	if err != nil {
-		log.Errorf("A3 writeQueue: failed to merge metadata at height %d: %v",
-			item.height, err)
+		log.Errorf("A3 writeQueue: failed to merge metadata batch ending at "+
+			"height %d: %v", lastHeight, err)
 	}
 }
 
