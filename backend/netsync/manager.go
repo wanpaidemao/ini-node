@@ -4289,6 +4289,42 @@ out:
 						if rerr, ok := err.(blockchain.RuleError); ok &&
 							rerr.ErrorCode ==
 								blockchain.ErrMinedBlockNotOnMainChain {
+							// B fix: a rejection because the block's parent
+							// height is above the confirmed header view is a
+							// LAGGING VIEW, not a fork -- kick a header
+							// catch-up so the miner can retry once the view
+							// covers the parent.  fetchHeaders is a no-op
+							// when no peer is taller than the local header
+							// tip, and the divergence checks below stay
+							// false for a mere lag (the header chain is not
+							// ahead of the best chain), so no rollback is
+							// triggered for the legitimate lag case.
+							// B 修复:因块的父高度高于已确认 header 视图而
+							// 被拒,属于**视图滞后**而非分叉——触发 header
+							// 追赶,矿工在视图覆盖父块后重试。fetchHeaders
+							// 在没有高于本地 header tip 的 peer 时是 no-op;
+							// 且纯粹滞后时下方分叉检查保持 false(header 链
+							// 未领先 best chain),不会误触发回滚。
+							_, bestHeaderHeight := sm.chain.BestHeader()
+							blockHeight := int32(-1)
+							if mb := msg.block.MsgBlock(); mb != nil &&
+								blockchain.ShouldHaveSerializedBlockHeight(
+									&mb.Header) {
+								if txs := msg.block.Transactions(); len(txs) > 0 {
+									if h, herr := blockchain.
+										ExtractCoinbaseHeight(txs[0]); herr == nil {
+										blockHeight = int32(h)
+									}
+								}
+							}
+							if blockHeight > bestHeaderHeight {
+								log.Infof("Miner-submitted block %v "+
+									"(height %d) above header view %d -- "+
+									"triggering header catch-up",
+									msg.block.Hash(), blockHeight,
+									bestHeaderHeight)
+								sm.fetchHeaders()
+							}
 							if sm.chain.HeaderChainDiverged() {
 								forkHeight :=
 									sm.chain.BestChainHeaderForkHeight()
