@@ -959,15 +959,11 @@ func (sm *SyncManager) fetchHeaders() {
 		ranges:     make(map[int32]*headerRange),
 		peerRange:  make(map[*peerpkg.Peer]*headerRange),
 		// sliceLen is the per-peer getheaders batch size (headers per
-		// request).  It is deliberately smaller than the protocol maximum
-		// (wire.MaxBlockHeadersPerMsg = 2000): shorter ranges re-dispatch
-		// more frequently, so a stalled range is re-issued sooner and the
-		// header frontier keeps the block download fed.  Tuned to 1000.
-		// sliceLen 是每 peer 一次 getheaders 请求的 header 批次大小。
-		// 刻意小于协议上限(wire.MaxBlockHeadersPerMsg = 2000):更短的
-		// range 派发更频繁,stalled 的 range 重派更早,header 前沿能持续
-		// 供上 block 下载。当前调为 1000。
-		sliceLen: 1000,
+		// request), set to the protocol maximum so each round-trip pulls the
+		// largest possible batch.
+		// sliceLen 是每 peer 一次 getheaders 请求的 header 批次大小,
+		// 使用协议上限,使每次往返拉取最大批次。
+		sliceLen: wire.MaxBlockHeadersPerMsg,
 	}
 
 	log.Infof("Downloading headers for blocks %d to %d in parallel "+
