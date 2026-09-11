@@ -1,0 +1,383 @@
+// Copyright (c) 2026 The btcsuite developers
+// Use of this source code is governed by an ISC
+// license that can be found in the LICENSE file.
+
+// Asher_Mod_Start_20260911_123000
+package blockchain
+
+import (
+	"math/big"
+	"sync"
+
+	"github.com/btcsuite/btcd/btcutil/v2"
+	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/btcsuite/btcd/database"
+)
+
+// writeQueueCap is the capacity of the async write queue (A3).  A bounded
+// queue gives natural back-pressure: when the writer goroutine falls behind,
+// the connect path blocks at the enqueue instead of unboundedly buffering
+// memory.
+// writeQueueCap 是异步写队列容量(A3)。有界队列提供天然背压:当 writer
+// goroutine 落后时,连接路径在入队处阻塞,而非无界缓冲内存。
+const writeQueueCap = 64
+
+// writeQueueBatchSize is how many writeItems' metadata are merged into a
+// single database transaction before the write watermark advances (A3).
+// The write transaction count is therefore divided by writeQueueBatchSize
+// (G4 target).  Distinct from blockFlushBatchSize (header-sync flush cadence,
+// 1000) and the UTXO flush cadence.
+// writeQueueBatchSize 是每多少个 writeItem 的元数据合并进单个数据库事务、
+// 随后推进写水印的批量大小(A3)。写事务数因此除以 writeQueueBatchSize
+// (G4 目标)。与 blockFlushBatchSize(header 同步 flush 节奏,1000)和 UTXO
+// flush 节奏不同。
+const writeQueueBatchSize = 32
+
+// writeWatermarkBucketName is the db bucket that stores the highest height
+// whose chain-state metadata (block index rows, best state, height index,
+// spend journal) has been durably written by the async writer.  On startup,
+// heights above the watermark are replayed from the block bodies already on
+// disk (A3).
+// writeWatermarkBucketName 是存储"链状态元数据(块索引行、best state、
+// 高度索引、spend journal)已由异步 writer 持久化写入的最高高度"的
+// db bucket。启动时,高于水印的高度从已落盘的块体重放(A3)。
+var writeWatermarkBucketName = []byte("writewatermark")
+
+// nodeRowSnapshot is the snapshot of one dirty blockNode's persisted rows:
+// the block-index row (dbStoreBlockNode) plus the optional hash-index and
+// height-index rows written by flushDirtyLocked.  It is captured inside the
+// chain lock at the original db.Update site so the async writer reproduces
+// exactly what the synchronous path used to write, even after the node has
+// been evicted from the in-memory window.  The header fields are stored as
+// the node's own immutable fields (not a wire.BlockHeader) so the writer can
+// reconstruct a blockNode whose Header() serialization is byte-identical to
+// the original.
+// nodeRowSnapshot 是一个脏 blockNode 的持久化行快照:块索引行
+// (dbStoreBlockNode)加上 flushDirtyLocked 写入的可选 hash 索引与高度索引
+// 行。它在链锁内、原 db.Update 位置捕获,使异步 writer 精确重现同步路径
+// 原本的写入内容,即使 node 之后已被从内存窗口驱逐。header 字段按 node
+// 自身的不可变字段存储(而非 wire.BlockHeader),使 writer 重建的 blockNode
+// 其 Header() 序列化与原节点逐字节一致。
+type nodeRowSnapshot struct {
+	hash   chainhash.Hash
+	height int32
+
+	// Immutable header fields (blockNode.Header() rebuilds from these).
+	version    int32
+	bits       uint32
+	nonce      uint32
+	timestamp  int64
+	merkleRoot chainhash.Hash
+	parentHash chainhash.Hash
+
+	status blockStatus
+
+	hashIndex   bool // dbPutHashIndex(hash, height)
+	heightIndex bool // dbPutHeightIndex(height, hash) when on the best header view
+}
+
+// writeItem is one unit of asynchronous disk work (A3): the block body plus
+// a full snapshot of the chain-state metadata produced by connecting it.
+// All metadata is captured by value (not by pointer) because the writer runs
+// asynchronously and the source structures (blockNode, BestState) may be
+// mutated or evicted by later blocks before the writer consumes the item.
+// writeItem 是一个异步落盘工作单元(A3):块体加上连接它产生的链状态
+// 元数据的完整快照。所有元数据按值捕获(非指针),因为 writer 异步执行,
+// 源结构(blockNode、BestState)可能在 writer 消费该条目前被后续块修改
+// 或驱逐。
+type writeItem struct {
+	height int32
+	block  *btcutil.Block
+
+	// Metadata snapshot, mirroring the six writes inside connectBlock's
+	// single db.Update (see design doc 3.3.1).
+	// 元数据快照,对应 connectBlock 单个 db.Update 内的六项写入
+	// (见设计文档 3.3.1)。
+	nodeRows    []*nodeRowSnapshot
+	bestTipHash chainhash.Hash
+	tipHeight   int32
+	tipWork     *big.Int
+	bestState   *BestState
+	blockHash   chainhash.Hash
+	stxos       []SpentTxOut
+
+	// bestHeaderHash/bestHeaderHeight snapshot the best-header state that
+	// flushDirtyLocked persists via dbPutBestHeaderState, so the async
+	// writer reproduces it too.  Negative height means "no best header node"
+	// (not yet flushed) and skips the write.
+	// bestHeaderHash/bestHeaderHeight 快照 flushDirtyLocked 通过
+	// dbPutBestHeaderState 持久化的 best-header 状态,异步 writer 同样重现。
+	// 高度为负表示"尚无 best header node"(尚未刷新),跳过写入。
+	bestHeaderHash   chainhash.Hash
+	bestHeaderHeight int32
+}
+
+// writeQueue serializes the chain-state disk writes that used to happen
+// synchronously inside the chain lock (A3).  The connect path snapshots the
+// metadata and enqueues a writeItem in O(block tx count) with no database
+// I/O; a dedicated writer goroutine performs the actual transactions,
+// merging metadata every writeQueueBatchSize items, and advances the
+// persisted watermark so a crash can replay the tail.
+// writeQueue 把过去在链锁内同步执行的链状态落盘串行化(A3)。连接路径在
+// O(块内交易数)、零数据库 I/O 的情况下快照元数据并入队 writeItem;
+// 专用 writer goroutine 执行实际事务,每 writeQueueBatchSize 个条目合并
+// 一次元数据,并推进持久化水印,使崩溃后可重放尾部。
+type writeQueue struct {
+	items chan *writeItem
+
+	// mu guards the batch accounting and the stopped flag.
+	mu      sync.Mutex
+	stopped bool
+
+	stopCh   chan struct{}
+	stopOnce sync.Once
+
+	// batch counts items enqueued since the last metadata merge.
+	batch int
+
+	db database.DB
+
+	// indexManager replays optional-index ConnectBlock rows inside the
+	// metadata merge so txindex/addrindex/sugarindex stay in lockstep with
+	// the chain state (design doc 3.3.1, item ⑦).
+	// indexManager 在元数据合并事务内重放可选索引的 ConnectBlock 行,
+	// 使 txindex/addrindex/sugarindex 与链状态保持同步(设计文档 3.3.1 ⑦)。
+	indexManager IndexManager
+}
+
+// newWriteQueue starts the writer goroutine for a new async write queue.
+// newWriteQueue 启动新异步写队列的 writer goroutine。
+func newWriteQueue(db database.DB, indexManager IndexManager) *writeQueue {
+	q := &writeQueue{
+		items:        make(chan *writeItem, writeQueueCap),
+		stopCh:       make(chan struct{}),
+		db:           db,
+		indexManager: indexManager,
+	}
+	go q.writer()
+	return q
+}
+
+// enqueue adds one item to the async queue.  It blocks when the queue is
+// full (back-pressure) and reports false after the queue has been stopped.
+// enqueue 向异步队列添加一个条目。队列满时阻塞(背压),队列已停止后返回
+// false。
+func (q *writeQueue) enqueue(item *writeItem) bool {
+	q.mu.Lock()
+	if q.stopped {
+		q.mu.Unlock()
+		return false
+	}
+	q.batch++
+	q.mu.Unlock()
+
+	select {
+	case q.items <- item:
+		return true
+	case <-q.stopCh:
+		return false
+	}
+}
+
+// stop drains the queue, flushes the remaining (partial) batch and stops the
+// writer goroutine.  It is called during shutdown after the chain lock is
+// released.  Idempotent via sync.Once.
+// stop 排空队列,冲刷剩余(部分)批次并停止 writer goroutine。在关闭流程
+// 中、链锁释放后调用。通过 sync.Once 幂等。
+func (q *writeQueue) stop() {
+	q.stopOnce.Do(func() {
+		q.mu.Lock()
+		q.stopped = true
+		q.mu.Unlock()
+		close(q.stopCh)
+
+		// Drain whatever is still queued so nothing is lost, flushing the
+		// final partial batch before returning.
+		// 排空仍在队列中的条目,返回前冲刷最后的部分批次,避免丢失。
+		for {
+			select {
+			case item := <-q.items:
+				q.writeOne(item)
+			default:
+				return
+			}
+		}
+	})
+}
+
+// writer is the dedicated goroutine that serializes the disk writes.
+// writer 是串行执行落盘的专用 goroutine。
+func (q *writeQueue) writer() {
+	for {
+		select {
+		case item := <-q.items:
+			q.writeOne(item)
+		case <-q.stopCh:
+			return
+		}
+	}
+}
+
+// writeOne accumulates one item and, every writeQueueBatchSize items, merges
+// the metadata batch into a single database transaction carrying the
+// snapshot's block-index rows, best-tip snapshot, best state, height index,
+// spend journal and index manager replay, then advances the watermark in the
+// same transaction.  The block body itself is stored synchronously by
+// maybeAcceptBlock before the metadata is enqueued (v1 scope: A3 asyncs the
+// metadata write path only, the heavy block-body store stays in the
+// synchronous flow to keep the change small and crash semantics unchanged).
+// writeOne 累积一个条目,每 writeQueueBatchSize 个条目把元数据批次合并进
+// 单个数据库事务,承载快照的块索引行、best-tip 快照、best state、高度
+// 索引、spend journal 与 index manager 重放,并在同一事务内推进水印。
+// 块体本身由 maybeAcceptBlock 在元数据入队前同步存储(v1 范围:A3 只
+// 异步元数据写路径,重 I/O 的块体存储留在同步流程,保持改动小且崩溃
+// 语义不变)。
+func (q *writeQueue) writeOne(item *writeItem) {
+	q.mu.Lock()
+	q.batch--
+	merge := q.batch <= 0
+	if merge {
+		q.batch = writeQueueBatchSize
+	}
+	q.mu.Unlock()
+
+	if !merge {
+		return
+	}
+
+	// Merge this batch's metadata rows into a single transaction and advance
+	// the watermark atomically with them.
+	// 把该批次的元数据行合并进单个事务,并与水印原子推进。
+	err := q.db.Update(func(dbTx database.Tx) error {
+		if err := writeItemRows(dbTx, item, q.indexManager); err != nil {
+			return err
+		}
+		return dbPutWriteWatermark(dbTx, item.height)
+	})
+	if err != nil {
+		log.Errorf("A3 writeQueue: failed to merge metadata at height %d: %v",
+			item.height, err)
+	}
+}
+
+// writeItemRows reproduces, inside one db transaction, the six metadata
+// writes that connectBlock used to perform synchronously (design doc 3.3.1),
+// plus the index-manager replay.
+// writeItemRows 在单个数据库事务内重现 connectBlock 过去同步执行的六项
+// 元数据写入(设计文档 3.3.1),加上 index manager 重放。
+func writeItemRows(dbTx database.Tx, item *writeItem, indexManager IndexManager) error {
+	// ① Block index rows + hash/height index rows from the node snapshots.
+	for _, row := range item.nodeRows {
+		if err := writeNodeRowSnapshot(dbTx, row); err != nil {
+			return err
+		}
+	}
+
+	// ①b Best-header state (flushDirtyLocked also persists this in the same
+	// transaction via dbPutBestHeaderState).
+	// ①b Best-header 状态(flushDirtyLocked 也在同一事务内通过
+	// dbPutBestHeaderState 持久化它)。
+	if item.bestHeaderHeight >= 0 {
+		if err := dbPutBestHeaderState(dbTx, &item.bestHeaderHash,
+			item.bestHeaderHeight); err != nil {
+			return err
+		}
+	}
+
+	// ② Best-tip snapshot.
+	if err := dbPutBestTipSnapshot(dbTx, &item.bestTipHash,
+		item.tipHeight, item.tipWork); err != nil {
+		return err
+	}
+
+	// ④ Best state.
+	if err := dbPutBestState(dbTx, item.bestState, item.tipWork); err != nil {
+		return err
+	}
+
+	// ⑤ Height -> hash block index row.
+	if err := dbPutBlockIndex(dbTx, &item.blockHash, item.height); err != nil {
+		return err
+	}
+
+	// ⑥ Spend journal.
+	if err := dbPutSpendJournalEntry(dbTx, &item.blockHash, item.stxos); err != nil {
+		return err
+	}
+
+	// ⑦ Index manager replay: optional indexes (txindex/addrindex/
+	// sugarindex) connect rows inside the same metadata transaction so they
+	// stay in lockstep with the chain state (design doc 3.3.1, item ⑦).
+	// The block body is referenced for the indexers' per-block updates.
+	// ⑦ Index manager 重放:可选索引(txindex/addrindex/sugarindex)在同一个
+	// 元数据事务内连接行,使其与链状态保持同步(设计文档 3.3.1 ⑦)。
+	// 引用块体供索引器做每块更新。
+	if indexManager != nil && item.block != nil {
+		if err := indexManager.ConnectBlock(dbTx, item.block, item.stxos); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// writeNodeRowSnapshot writes one captured node row: the block-index entry
+// plus the optional hash-index and height-index rows.  The blockNode is
+// reconstructed from the snapshot's immutable header fields so its Header()
+// serialization is byte-identical to the original node.
+// writeNodeRowSnapshot 写入一个捕获的节点行:块索引条目加上可选的
+// hash 索引与高度索引行。blockNode 由快照的不可变 header 字段重建,使其
+// Header() 序列化与原节点逐字节一致。
+func writeNodeRowSnapshot(dbTx database.Tx, row *nodeRowSnapshot) error {
+	node := &blockNode{
+		hash:       row.hash,
+		height:     row.height,
+		version:    row.version,
+		bits:       row.bits,
+		nonce:      row.nonce,
+		timestamp:  row.timestamp,
+		merkleRoot: row.merkleRoot,
+		parentHash: row.parentHash,
+		status:     row.status,
+	}
+	if err := dbStoreBlockNode(dbTx, node); err != nil {
+		return err
+	}
+	if row.hashIndex {
+		if err := dbPutHashIndex(dbTx, &row.hash, row.height); err != nil {
+			return err
+		}
+	}
+	if row.heightIndex {
+		if err := dbPutHeightIndex(dbTx, row.height, &row.hash); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// dbPutWriteWatermark persists the highest durably-written metadata height.
+// dbPutWriteWatermark 持久化已落盘元数据的最高高度。
+func dbPutWriteWatermark(dbTx database.Tx, height int32) error {
+	bucket, err := dbTx.Metadata().CreateBucketIfNotExists(writeWatermarkBucketName)
+	if err != nil {
+		return err
+	}
+	serialized := make([]byte, 4)
+	byteOrder.PutUint32(serialized, uint32(height))
+	return bucket.Put([]byte("height"), serialized)
+}
+
+// loadWriteWatermark returns the persisted write watermark, or -1 when none
+// has been stored yet.
+// loadWriteWatermark 返回已持久化的写水印;未存储时返回 -1。
+func loadWriteWatermark(dbTx database.Tx) (int32, error) {
+	bucket := dbTx.Metadata().Bucket(writeWatermarkBucketName)
+	if bucket == nil {
+		return -1, nil
+	}
+	v := bucket.Get([]byte("height"))
+	if v == nil {
+		return -1, nil
+	}
+	return int32(byteOrder.Uint32(v)), nil
+}

@@ -201,6 +201,19 @@ type BlockChain struct {
 	// It is protected by the chain lock.
 	utxoCache *utxoCache
 
+	// writeQueue serializes the chain-state metadata disk writes that used
+	// to happen synchronously inside the chain lock (A3).  The connect path
+	// snapshots the metadata and enqueues a writeItem (no database I/O under
+	// the chain lock); a dedicated writer goroutine merges batches of items
+	// into single transactions and advances the write watermark.  Nil when
+	// the async queue is disabled (e.g. prune mode keeps the synchronous
+	// path).
+	// writeQueue 把过去在链锁内同步执行的链状态元数据落盘串行化(A3)。
+	// 连接路径快照元数据并入队 writeItem(链锁内零数据库 I/O);专用 writer
+	// goroutine 把一批条目合并进单个事务并推进写水印。异步队列禁用时
+	// (如 prune 模式保持同步路径)为 nil。
+	writeQueue *writeQueue
+
 	// These fields are related to handling of orphan blocks.  They are
 	// protected by a combination of the chain lock and the orphan lock.
 	orphanLock   sync.RWMutex
@@ -782,6 +795,7 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 	// pointer-scalable evictWindow scan is still throttled to every
 	// blockFlushBatchSize commits (see blockIndex.finishFlushLocked).
 	b.index.Lock()
+	if b.writeQueue == nil {
 	err := b.db.Update(func(dbTx database.Tx) error {
 		// Write any dirty block nodes (including this block) into the
 		// transaction being committed for the chain state.
@@ -878,6 +892,47 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 	// is durable.
 	b.index.finishFlushLocked(false)
 	b.index.Unlock()
+	} else {
+		// A3 async path: snapshot the metadata under the index lock and
+		// enqueue it -- no database I/O happens under the chain lock.  The
+		// writer goroutine merges the batch into one transaction later and
+		// advances the write watermark (design doc 3.3.1).
+		// A3 异步路径:在 index 锁下快照元数据并入队——链锁内零数据库 I/O。
+		// writer goroutine 稍后把批次合并进单个事务并推进写水印
+		// (设计文档 3.3.1)。
+		item := &writeItem{
+			height:      node.height,
+			block:       block,
+			nodeRows:    b.index.snapshotDirtyLocked(),
+			bestTipHash: node.hash,
+			tipHeight:   node.height,
+			tipWork:     node.workSum,
+			bestState:   state,
+			blockHash:   *block.Hash(),
+			stxos:       stxos,
+		}
+		// Snapshot the best header state that flushDirtyLocked would have
+		// persisted (dbPutBestHeaderState), so the async writer reproduces it
+		// in the same transaction.
+		// 快照 flushDirtyLocked 原本会持久化的 best header 状态
+		// (dbPutBestHeaderState),让异步 writer 在同一事务中重现它。
+		if b.index.bestHeaderNode != nil {
+			if tip := b.index.bestHeaderNode(); tip != nil {
+				item.bestHeaderHash = tip.hash
+				item.bestHeaderHeight = tip.height
+			} else {
+				item.bestHeaderHeight = -1
+			}
+		} else {
+			item.bestHeaderHeight = -1
+		}
+		b.index.finishFlushLocked(false)
+		b.index.Unlock()
+
+		if !b.writeQueue.enqueue(item) {
+			return errors.New("A3 write queue stopped during block connect")
+		}
+	}
 
 	// Swap the best-chain view tip and advance the UTXO hot region floor
 	// under the query lock (A2 v1): queries reading the view/snapshot take
@@ -3099,6 +3154,17 @@ func New(config *Config) (*BlockChain, error) {
 	// chain events without waiting for subscribers.
 	// 启动异步通知总线,让块处理无需等待订阅者即可发布链事件。
 	go b.notifyLoop()
+
+	// Start the A3 async write queue unless pruning is enabled: the prune
+	// path mutates the database inside the connect transaction (PruneBlocks),
+	// which cannot be decoupled from the snapshotting without reworking the
+	// prune flow, so prune mode keeps the synchronous write path.
+	// 启动 A3 异步写队列,除非启用了 prune:prune 路径在连接事务内直接改
+	// 数据库(PruneBlocks),不重构 prune 流程就无法从快照化中解耦,因此
+	// prune 模式保持同步写路径。
+	if b.pruneTarget == 0 {
+		b.writeQueue = newWriteQueue(config.DB, config.IndexManager)
+	}
 
 	// Set the best header tip function so flushToDB persists the best header
 	// state alongside the block index writes.

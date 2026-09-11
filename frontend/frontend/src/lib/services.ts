@@ -1187,7 +1187,16 @@ export const Services = {
       upnp: bool("upnp"),
       sugarIndex: bool("sugarindex"),
       // frontend-only keys stored in frontend.ini / 前端专属键,存 frontend.ini
-      runNodeOnStart: raw.runnodeonstart !== "0" && raw.runnodeonstart !== "false",
+      // runnodeonstart is opt-in: the node is auto-started ONLY when the ini
+      // explicitly sets runnodeonstart=1 (or true).  Absent/unset (undefined)
+      // means the node is NOT auto-started -- the user starts it from the
+      // Control Center.  This avoids launching the node on every app start
+      // without the user asking for it.
+      // runnodeonstart 为显式开启:仅当 ini 明确设置 runnodeonstart=1(或
+      // true)时应用启动才自动拉起节点。未设置(undefined)表示不自动启动
+      // ——用户从控制中心手动启动。避免应用每次启动都未经用户同意拉起
+      // 节点。
+      runNodeOnStart: raw.runnodeonstart === "1" || raw.runnodeonstart === "true",
       // iniPath for reference (control center ini picker) / ini 路径(参考)
       iniPath: raw.iniPath ?? "",
     };

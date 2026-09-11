@@ -920,6 +920,43 @@ func (bi *blockIndex) flushToDB(forceEvict bool) error {
 // points at.
 //
 // This method must be called with bi.Lock held.
+// snapshotDirtyLocked captures the dirty block nodes as nodeRowSnapshot
+// values so the A3 async write queue can reproduce the exact rows that
+// flushDirtyLocked would have written, even after the nodes are evicted from
+// the in-memory window before the async writer runs.  Must be called with
+// bi.Lock held.  It does not clear the dirty set -- the caller clears it via
+// finishFlushLocked once the snapshot has been captured.
+// snapshotDirtyLocked 把脏 block 节点捕获为 nodeRowSnapshot 值,使 A3 异步
+// 写队列能重现 flushDirtyLocked 原本要写的行,即使节点在异步 writer
+// 运行前已被从内存窗口驱逐。必须在持有 bi.Lock 时调用。它不清空
+// dirty 集合——调用方在快照捕获后通过 finishFlushLocked 清空。
+func (bi *blockIndex) snapshotDirtyLocked() []*nodeRowSnapshot {
+	if len(bi.dirty) == 0 {
+		return nil
+	}
+	rows := make([]*nodeRowSnapshot, 0, len(bi.dirty))
+	for node := range bi.dirty {
+		rows = append(rows, &nodeRowSnapshot{
+			hash:        node.hash,
+			height:      node.height,
+			version:     node.version,
+			bits:        node.bits,
+			nonce:       node.nonce,
+			timestamp:   node.timestamp,
+			merkleRoot:  node.merkleRoot,
+			parentHash:  node.parentHash,
+			status:      node.status,
+			hashIndex:   true,
+			heightIndex: bi.bestHeaderView != nil && bi.bestHeaderView.Contains(node),
+		})
+	}
+	return rows
+}
+
+// flushDirtyLocked writes all of the currently dirty block nodes to the
+// provided database transaction, along with the best header state.
+// flushDirtyLocked 把所有当前脏的 block 节点以及 best header 状态写入
+// 提供的数据库事务。
 func (bi *blockIndex) flushDirtyLocked(dbTx database.Tx) error {
 	if len(bi.dirty) == 0 {
 		return nil
