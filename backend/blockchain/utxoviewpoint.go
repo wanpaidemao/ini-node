@@ -654,6 +654,27 @@ func (view *UtxoViewpoint) fetchInputUtxos(cache *utxoCache, block *btcutil.Bloc
 	return view.fetchUtxosFromCache(cache, view.findInputsToFetch(block))
 }
 
+// PrefetchUtxos warms the UTXO cache with the distinct inputs referenced by
+// the given block (A4-3 prefetch queue).  It is a read-only best-effort
+// prefetch meant to be called right before the block is connected (the block
+// bodies are already on disk by then), so the connect path's fetchInputUtxos
+// hits the in-memory cache instead of performing a chain-lock database read.
+// Prefetching an entry that later turns out to be on a rolled-back branch is
+// harmless: the normal connect path re-fetches and overwrites as usual.
+//
+// This function is safe for concurrent access.
+// PrefetchUtxos 用给定块引用的去重输入预热 UTXO 缓存(A4-3 预取队列)。
+// 它是只读的尽力而为预取,设计在块连接前调用(此时块体已落盘),使连接
+// 路径的 fetchInputUtxos 命中内存缓存,而非执行链锁内的数据库读。预取了
+// 后来被回滚分支上的条目也无害:正常连接路径会照常重新读取并覆盖。
+//
+// 本函数可并发安全调用。
+func (b *BlockChain) PrefetchUtxos(block *btcutil.Block) {
+	b.chainLock.RLock()
+	defer b.chainLock.RUnlock()
+	b.utxoCache.prefetchInputs(block)
+}
+
 // NewUtxoViewpoint returns a new empty unspent transaction output view.
 func NewUtxoViewpoint() *UtxoViewpoint {
 	return &UtxoViewpoint{

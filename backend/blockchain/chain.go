@@ -128,6 +128,27 @@ type BlockChain struct {
 	// fields in this struct below this point.
 	chainLock trackedRWMutex
 
+	// queryLock decouples read-only chain queries (BestHeader,
+	// HeaderHashByHeight, HeaderHeightByHash, HeightRange, ...) from the
+	// connection/rollback write path (A2 v1).  Queries take queryLock.RLock
+	// and read the best-header view snapshots; the connect/rollback path
+	// briefly takes queryLock.Lock only while swapping the best-header view
+	// tip / snapshot inside chainLock, so a query never queues behind a long
+	// chain-lock database write -- it only waits for the instant view swap.
+	//
+	// Lock ordering is strictly chainLock -> queryLock on the write path;
+	// queries take queryLock only and never chainLock, so there is no
+	// lock-order inversion.
+	// queryLock 把只读链查询(BestHeader、HeaderHashByHeight、
+	// HeaderHeightByHash、HeightRange 等)与连接/回滚写路径解耦(A2 v1)。
+	// 查询持 queryLock.RLock 读取 best-header 视图快照;连接/回滚路径只在
+	// chainLock 内瞬时取 queryLock.Lock 交换视图 tip/快照,因此查询不会
+	// 排队等待长的链锁数据库写,只等待瞬间的视图交换。
+	//
+	// 锁序严格为写路径 chainLock -> queryLock;查询只取 queryLock 从不取
+	// chainLock,不存在锁序倒置。
+	queryLock sync.RWMutex
+
 	// pruneTarget is the size in bytes the database targets for when the node
 	// is pruned.
 	pruneTarget uint64
@@ -858,8 +879,29 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 	b.index.finishFlushLocked(false)
 	b.index.Unlock()
 
+	// Swap the best-chain view tip and advance the UTXO hot region floor
+	// under the query lock (A2 v1): queries reading the view/snapshot take
+	// queryLock.RLock, so the swap must be atomic under queryLock.Lock.  The
+	// lock is held only for this instant pointer swap -- never for the
+	// database write above -- so queries do not queue behind chain-lock
+	// writes.  Lock order is chainLock -> queryLock.
+	// 在查询锁下交换 best-chain 视图 tip 并推进 UTXO 热区下界(A2 v1):
+	// 查询读取视图/快照时持 queryLock.RLock,因此交换必须在 queryLock.Lock
+	// 下原子完成。该锁只覆盖这一瞬时的指针交换——绝不包括上面的数据库
+	// 写——所以查询不会排队等待链锁写。锁序为 chainLock -> queryLock。
+	b.queryLock.Lock()
+
 	// This node is now the end of the best chain.
 	b.bestChain.SetTip(node)
+
+	// Advance the UTXO hot region floor (A4-3): entries at or above this
+	// height stay resident across a full cache flush, so the next blocks'
+	// lookups hit memory instead of the database right after a flush.
+	// 推进 UTXO 热区下界(A4-3):高度 ≥ 该下界的条目在全量 flush 时保留
+	// 驻留,后续块的查询在 flush 后直接命中内存而非数据库。
+	b.utxoCache.hotFloor = node.height - utxoHotDepth
+
+	b.queryLock.Unlock()
 
 	// Update the state for the best block.  Notice how this replaces the
 	// entire struct instead of updating the existing one.  This effectively
@@ -1002,7 +1044,15 @@ func (b *BlockChain) disconnectBlock(node *blockNode, block *btcutil.Block, view
 	view.commit()
 
 	// This node's parent is now the end of the best chain.
+	// Swap the best-chain view tip under the query lock (A2 v1): queries
+	// reading the view take queryLock.RLock, so the swap must be atomic under
+	// queryLock.Lock.  Lock order is chainLock -> queryLock.
+	// 在查询锁下交换 best-chain 视图 tip(A2 v1):查询读取视图时持
+	// queryLock.RLock,交换因此必须在 queryLock.Lock 下原子完成。
+	// 锁序为 chainLock -> queryLock。
+	b.queryLock.Lock()
 	b.bestChain.SetTip(node.parent)
+	b.queryLock.Unlock()
 
 	// Update the state for the best block.  Notice how this replaces the
 	// entire struct instead of updating the existing one.  This effectively
@@ -1567,9 +1617,17 @@ func (b *BlockChain) BestSnapshot() *BestState {
 }
 
 // BestHeader returns the hash and the height of the best header.
+//
+// It only needs the query lock: it reads the best-header chain view, which
+// the connect/rollback path swaps atomically under queryLock.Lock (A2 v1).
+// It never takes chainLock, so it does not queue behind chain-lock database
+// writes.
+// 它只需要查询锁:读取 best-header 链视图,连接/回滚路径在 queryLock.Lock
+// 下原子交换该视图(A2 v1)。它从不取 chainLock,因此不会排队等待链锁
+// 数据库写。
 func (b *BlockChain) BestHeader() (chainhash.Hash, int32) {
-	b.chainLock.RLock()
-	defer b.chainLock.RUnlock()
+	b.queryLock.RLock()
+	defer b.queryLock.RUnlock()
 
 	best := b.bestHeader.Tip()
 	return best.hash, best.height
@@ -1918,6 +1976,14 @@ func (b *BlockChain) LatestBlockLocatorByHeader() (BlockLocator, error) {
 func (b *BlockChain) HeaderHashByHeight(blockHeight int32) (
 	*chainhash.Hash, error) {
 
+	// Query lock: reads the best-header view (and possibly the DB cold path).
+	// The view is swapped atomically under queryLock by the connect/rollback
+	// path, so the query never queues behind chain-lock database writes (A2 v1).
+	// 查询锁:读取 best-header 视图(可能走 DB 冷读)。连接/回滚路径在
+	// queryLock 下原子交换该视图,查询因此不会排队等待链锁数据库写(A2 v1)。
+	b.queryLock.RLock()
+	defer b.queryLock.RUnlock()
+
 	// Serve from the in-memory header window when the height is retained,
 	// otherwise fall back to the main-chain height index for heights that
 	// have been evicted.  Both paths count into the O8 metrics (covering all
@@ -1947,6 +2013,13 @@ func (b *BlockChain) HeaderHashMetrics() (hits uint64, coldReads uint64) {
 
 // HeaderHeightByHash returns the height of the header given its hash.
 func (b *BlockChain) HeaderHeightByHash(blockHash chainhash.Hash) (int32, error) {
+	// Query lock: reads the block index and the best-header view, both
+	// swapped/updated atomically under queryLock by the write path (A2 v1).
+	// 查询锁:读取块索引与 best-header 视图,写路径在 queryLock 下原子更新
+	// 它们(A2 v1)。
+	b.queryLock.RLock()
+	defer b.queryLock.RUnlock()
+
 	if node := b.index.LookupNode(&blockHash); node != nil &&
 		b.bestHeader.Contains(node) {
 
@@ -1971,6 +2044,14 @@ func (b *BlockChain) HeaderHeightByHash(blockHash chainhash.Hash) (int32, error)
 //
 // This function is safe for concurrent access.
 func (b *BlockChain) HeightRange(startHeight, endHeight int32) ([]chainhash.Hash, error) {
+	// Query lock: reads the best-chain view, swapped atomically under
+	// queryLock by the connect/rollback path (A2 v1).  Queries never take
+	// chainLock, so they do not queue behind chain-lock database writes.
+	// 查询锁:读取 best-chain 视图,连接/回滚路径在 queryLock 下原子交换
+	// (A2 v1)。查询从不取 chainLock,因此不会排队等待链锁数据库写。
+	b.queryLock.RLock()
+	defer b.queryLock.RUnlock()
+
 	// Ensure requested heights are sane.
 	if startHeight < 0 {
 		return nil, fmt.Errorf("start height of fetch range must not "+
@@ -2602,7 +2683,15 @@ func (b *BlockChain) InvalidateHeaderChain(rollbackHeight int32) error {
 		}
 	}
 
+	// Swap the best-chain view tip under the query lock (A2 v1): queries
+	// reading the view take queryLock.RLock, so the swap must be atomic under
+	// queryLock.Lock.  Lock order is chainLock -> queryLock.
+	// 在查询锁下交换 best-chain 视图 tip(A2 v1):查询读取视图时持
+	// queryLock.RLock,交换因此必须在 queryLock.Lock 下原子完成。
+	// 锁序为 chainLock -> queryLock。
+	b.queryLock.Lock()
 	b.bestChain.SetTip(rollbackNode)
+	b.queryLock.Unlock()
 
 	// Rebuild the best-block state snapshot for the rolled-back tip.  The
 	// old snapshot still describes the fabricated tip; without this,

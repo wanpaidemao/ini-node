@@ -421,8 +421,15 @@ func (b *BlockChain) maybeAcceptBlockHeader(header *wire.BlockHeader,
 	if parentHash.IsEqual(&b.bestHeader.Tip().hash) {
 		log.Debugf("accepted header %v as the new header tip", node.hash)
 
-		// This header is now the end of the best headers.
+		// Swap the best-header view tip under the query lock (A2 v1):
+		// queries reading the view take queryLock.RLock, so the swap must be
+		// atomic under queryLock.Lock.  Lock order is chainLock -> queryLock.
+		// 在查询锁下交换 best-header 视图 tip(A2 v1):查询读取视图时持
+		// queryLock.RLock,交换因此必须在 queryLock.Lock 下原子完成。
+		// 锁序为 chainLock -> queryLock。
+		b.queryLock.Lock()
 		b.bestHeader.SetTip(node)
+		b.queryLock.Unlock()
 		isMainChain = true
 	} else if node.workSum.Cmp(b.bestHeader.Tip().workSum) <= 0 {
 		// We're extending (or creating) a side chain, but the cumulative
@@ -451,7 +458,13 @@ func (b *BlockChain) maybeAcceptBlockHeader(header *wire.BlockHeader,
 			node.hash, node.height,
 			prevTip.hash, prevTip.height)
 
+		// Swap the best-header view tip under the query lock (A2 v1); see the
+		// extending-tip branch above.  Lock order is chainLock -> queryLock.
+		// 在查询锁下交换 best-header 视图 tip(A2 v1);见上方扩展 tip 分支。
+		// 锁序为 chainLock -> queryLock。
+		b.queryLock.Lock()
 		b.bestHeader.SetTip(node)
+		b.queryLock.Unlock()
 		isMainChain = true
 	}
 

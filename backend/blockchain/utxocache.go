@@ -217,6 +217,18 @@ const (
 )
 
 // utxoCache is a cached utxo view in the chainstate of a BlockChain.
+// utxoHotDepth is how many blocks of UTXO entries stay resident across a
+// full cache flush (A4-3 hot region).  Entries whose block height is above
+// bestTip.Height-utxoHotDepth are the "hot" outputs most likely to be spent
+// by the next blocks; keeping them cached avoids falling through to the
+// database right after a full flush.
+// utxoHotDepth 是全量 flush 时仍驻留内存的 UTXO 条目块数(A4-3 热区)。
+// 高度高于 bestTip.Height-utxoHotDepth 的条目即"热"输出,最可能被后续
+// 块花费;全量 flush 后保留它们可避免紧接着的数据库冷读。
+const utxoHotDepth int32 = 2000
+
+// utxoCache houses a cache of unspent transaction outputs to be used for
+// various purposes and gives concurrent access to the cache for callers.
 type utxoCache struct {
 	db database.DB
 
@@ -242,6 +254,16 @@ type utxoCache struct {
 	// (writeCache cleanCache=false)只遍历真正变化的 outpoint,而非扫描整个
 	// 缓存。全量 flush 与 purge 时随缓存一起清空。
 	dirtyOps map[wire.OutPoint]struct{}
+
+	// hotFloor is the lowest block height whose UTXO entries are considered
+	// "hot" (A4-3 hot region).  A full cache flush keeps entries at or above
+	// hotFloor resident so the next blocks' lookups hit memory instead of the
+	// database right after the flush.  It is advanced by the caller (the
+	// connect path) to bestTip.Height-utxoHotDepth under the chain lock.
+	// hotFloor 是"热"UTXO 条目的最低块高(A4-3 热区)。全量 flush 保留高度
+	// ≥ hotFloor 的条目,使后续块的查询在 flush 后直接命中内存而非数据库。
+	// 由调用方(连接路径)在链锁内推进为 bestTip.Height-utxoHotDepth。
+	hotFloor int32
 
 	// Below fields are used to indicate when the last flush happened.
 	lastFlushHash chainhash.Hash
@@ -354,6 +376,53 @@ func (s *utxoCache) fetchEntries(outpoints []wire.OutPoint) ([]*UtxoEntry, error
 	}
 
 	return entries, nil
+}
+
+// prefetchInputs warms the UTXO cache with the distinct inputs referenced by
+// the given block (A4-3 prefetch queue).  The block bodies are already on
+// disk by the time the block is about to be connected, so resolving their
+// inputs through fetchEntries brings the entries into the cache before the
+// connect path's fetchInputUtxos runs -- turning what would be a chain-lock
+// database read into an in-memory hit.  It is best-effort and read-only with
+// respect to the chain state: errors are ignored (the connect path fetches
+// on demand anyway) and entries are not registered as dirty.
+//
+// This function MUST be called with the chain state lock held (read or write).
+// prefetchInputs 用即将连接块的去重输入预热 UTXO 缓存(A4-3 预取队列)。
+// 块体在块连接前已落盘,通过 fetchEntries 解析其输入可在连接路径的
+// fetchInputUtxos 之前把条目带入缓存——把链锁内的数据库读变成内存命中。
+// 尽力而为、对链状态只读:错误被忽略(连接路径本就会按需读取),条目
+// 不登记为脏。
+//
+// 调用方必须持有链状态锁(读或写)。
+func (s *utxoCache) prefetchInputs(block *btcutil.Block) {
+	// Collect the distinct input outpoints referenced by the block.  The
+	// coinbase input is skipped since its previous outpoint is the zero
+	// outpoint, which never exists in the UTXO set.
+	// 收集块引用的去重输入 outpoint。跳过 coinbase 输入,其 prevout 是
+	// 零值 outpoint,UTXO 集中必然不存在。
+	needed := make([]wire.OutPoint, 0, 64)
+	seen := make(map[wire.OutPoint]struct{})
+	for _, tx := range block.Transactions() {
+		if IsCoinBase(tx) {
+			continue
+		}
+		for _, txIn := range tx.MsgTx().TxIn {
+			op := txIn.PreviousOutPoint
+			if _, ok := seen[op]; ok {
+				continue
+			}
+			seen[op] = struct{}{}
+			needed = append(needed, op)
+		}
+	}
+	if len(needed) == 0 {
+		return
+	}
+	// Best-effort warm-up: a DB error here just means the connect path will
+	// perform the normal on-demand fetch later.
+	// 尽力预热:这里的 DB 错误只会让连接路径之后执行正常的按需读取。
+	_, _ = s.fetchEntries(needed)
 }
 
 // addTxOut adds the specified output to the cache if it is not provably
@@ -547,8 +616,17 @@ func (s *utxoCache) writeCache(dbTx database.Tx, bestState *BestState, cleanCach
 
 	if cleanCache {
 		// Full flush: walk every cached entry, sync it to the database and
-		// clear the whole cache afterwards.
-		// 全量 flush:遍历每个缓存条目写盘,随后清空整个缓存。
+		// clear the cache afterwards.  Entries at or above the hot region
+		// floor (A4-3) are written but kept resident: they are the outputs
+		// most likely to be spent by the next blocks, so keeping them cached
+		// avoids a database cold-read right after the flush.  The hot entries
+		// survive in a fresh map slice so the maps below hotFloor are still
+		// reclaimed and totalEntryMemory stays accurate.
+		// 全量 flush:遍历每个缓存条目写盘,随后清空缓存。高度 ≥ 热区下界
+		// (A4-3)的条目写盘后保留驻留:它们是后续块最可能花费的输出,保留
+		// 可避免 flush 后立即的数据库冷读。热条目放入新的 map 分片,冷区
+		// map 仍被回收,totalEntryMemory 保持准确。
+		var hotEntries []wire.OutPoint
 		for i := range s.cachedEntries.maps {
 			for outpoint, entry := range s.cachedEntries.maps[i] {
 				switch {
@@ -568,14 +646,32 @@ func (s *utxoCache) writeCache(dbTx database.Tx, bestState *BestState, cleanCach
 					if err != nil {
 						return err
 					}
+					entry.clearModified()
 				}
 
+				if entry != nil && !entry.IsSpent() &&
+					entry.BlockHeight() >= s.hotFloor {
+					hotEntries = append(hotEntries, outpoint)
+					continue
+				}
 				delete(s.cachedEntries.maps[i], outpoint)
 			}
 		}
 		s.cachedEntries.deleteMaps()
 		s.totalEntryMemory = 0
 		s.dirtyOps = make(map[wire.OutPoint]struct{})
+
+		// Re-insert the hot region entries into a fresh map slice so their
+		// memory is accounted for and later lookups hit the cache.  Note the
+		// entries keep their (now-clean) modified flags: they were just
+		// written to the database, so a later incremental flush skips them.
+		// 把热区条目重新放入新的 map 分片,计入内存并供后续查询命中。
+		// 条目已写盘且标志已清除,后续增量 flush 会跳过它们。
+		for _, op := range hotEntries {
+			entry, _ := s.cachedEntries.get(op)
+			s.cachedEntries.put(op, entry, s.totalEntryMemory)
+			s.totalEntryMemory += entry.memoryUsage()
+		}
 	} else {
 		// Incremental flush: only the outpoints registered in dirtyOps deviate
 		// from the database.  Entries that disappeared from the cache or are no

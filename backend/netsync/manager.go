@@ -143,16 +143,30 @@ const (
 	// it reaches the cap dispatching pauses -- the header tip is kept ahead
 	// of the blocks by design, but never races arbitrarily far.
 	//
-	// The cap is deliberately kept far below the in-memory header window
+	// The cap is kept safely below the in-memory header window
 	// (headerwindow=50000): the receive-side prev check
 	// (HeaderHashByHeight(start-1)) then always resolves in memory and never
-	// falls into the DB cold-read path (the P8/P9 hazard).  With the lead at
-	// most headerLeadLimit above the best chain, the highest prev-check height
-	// (bestChain + maxBlockRequestWindow) stays thousands of blocks inside
-	// the window boundary, so the O2 request-window cache is only a
-	// defensive backstop rather than the thing standing between the sync and
-	// cold reads.
-	headerLeadLimit = 10000
+	// falls into the DB cold-read path (the P8/P9 hazard).  The window
+	// boundary is bestChain+lead-50000 and the highest prev-check height is
+	// bestChain+maxBlockRequestWindow, so cold reads only appear once
+	// lead > 58000.  42000 leaves a 16000-block margin over the cold-read
+	// boundary while still staying above blockSyncStartLead (8000), so the
+	// parallel block download starts normally; the O2 request-window cache
+	// (capacity lead+snapInterval) remains a defensive backstop rather than
+	// the thing standing between the sync and cold reads.
+	headerLeadLimit = 42000
+
+	// headerLeadResume is the hysteresis dead-band for header dispatch
+	// resumption: after the lead hits headerLeadLimit and dispatch pauses,
+	// it stays paused until the blocks catch up so the lead drops to (or
+	// below) headerLeadResume.  This prevents flapping -- a lead that only
+	// dips a few blocks below the cap would otherwise immediately trigger a
+	// new getheaders, race back up, pause again, and repeat.
+	// headerLeadResume 是 header 派发恢复的迟滞死区:lead 顶到
+	// headerLeadLimit 暂停派发后,保持暂停直到 block 追上使 lead 降到(或
+	// 低于)headerLeadResume。这防止抖动——lead 只是略低于 cap 的话会
+	// 立刻触发新的 getheaders、再冲回 cap、再暂停、反复循环。
+	headerLeadResume = 28000
 
 	// blockUnavailableTimeout is how long the block download may remain stuck
 	// at a single height before the header chain is suspected of being
@@ -944,7 +958,16 @@ func (sm *SyncManager) fetchHeaders() {
 		nextAssign: height + 1,
 		ranges:     make(map[int32]*headerRange),
 		peerRange:  make(map[*peerpkg.Peer]*headerRange),
-		sliceLen:   wire.MaxBlockHeadersPerMsg,
+		// sliceLen is the per-peer getheaders batch size (headers per
+		// request).  It is deliberately smaller than the protocol maximum
+		// (wire.MaxBlockHeadersPerMsg = 2000): shorter ranges re-dispatch
+		// more frequently, so a stalled range is re-issued sooner and the
+		// header frontier keeps the block download fed.  Tuned to 1000.
+		// sliceLen 是每 peer 一次 getheaders 请求的 header 批次大小。
+		// 刻意小于协议上限(wire.MaxBlockHeadersPerMsg = 2000):更短的
+		// range 派发更频繁,stalled 的 range 重派更早,header 前沿能持续
+		// 供上 block 下载。当前调为 1000。
+		sliceLen: 1000,
 	}
 
 	log.Infof("Downloading headers for blocks %d to %d in parallel "+
@@ -1004,12 +1027,30 @@ func (sm *SyncManager) launchHeaderRange(peer *peerpkg.Peer, start int32) bool {
 	// P8/P9 hazard.  Keeping the lead just below headerLeadLimit keeps the
 	// header tip ahead of the blocks by design without racing arbitrarily
 	// far (observed ~42k-68k lead before the cap).
+	//
+	// Resumption uses hysteresis: once the lead hits headerLeadLimit the
+	// dispatch pauses, and it only resumes after the blocks have caught up
+	// to headerLeadResume.  Without the dead band the lead would flap
+	// around the cap -- a single processed block drops the lead below the
+	// limit and immediately triggers a new getheaders, which races the lead
+	// back up, pauses, and repeats, causing dispatch churn and the
+	// block-download stall the user observed at window boundaries.
+	// 恢复采用迟滞:lead 顶到 headerLeadLimit 后暂停派发,只有 block 追上
+	// 使 lead 降到 headerLeadResume 才恢复。没有死区的话 lead 会在 cap
+	// 附近抖动——每处理一块 lead 降到上限以下就立刻触发新的 getheaders,
+	// 又冲回上限、再暂停、循环,造成派发抖动与用户在窗口边界看到的
+	// block 下载停顿。
 	_, bestHeaderHeight := sm.chain.BestHeader()
-	if bestHeaderHeight-sm.chain.BestSnapshot().Height > headerLeadLimit {
+	lead := bestHeaderHeight - sm.chain.BestSnapshot().Height
+	if hs.leadPaused {
+		if lead > headerLeadResume {
+			return false
+		}
+		hs.leadPaused = false
+	} else if lead > headerLeadLimit {
 		hs.leadPaused = true
 		return false
 	}
-	hs.leadPaused = false
 
 	rng := &headerRange{
 		start:      start,
@@ -2067,6 +2108,18 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 			}
 		}
 	}
+
+	// Warm the UTXO cache with this block's inputs (A4-3 prefetch) before
+	// processing.  The block body is already on disk at this point, so
+	// resolving its inputs now makes the connect path's fetchInputUtxos hit
+	// the in-memory cache instead of performing a chain-lock database read.
+	// The prefetch is read-only and best-effort; entries on a later
+	// rolled-back branch are simply overwritten by the normal connect path.
+	// 处理前用本块的输入预热 UTXO 缓存(A4-3 预取)。此时块体已落盘,提前
+	// 解析输入可使连接路径的 fetchInputUtxos 命中内存缓存,而非执行链锁内
+	// 的数据库读。预取只读且尽力而为;位于后续回滚分支上的条目会被正常
+	// 连接路径覆盖,无副作用。
+	sm.chain.PrefetchUtxos(bmsg.block)
 
 	// Process the block to include validation, best chain selection, orphan
 	// handling, etc.
