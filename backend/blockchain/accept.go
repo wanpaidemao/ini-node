@@ -273,6 +273,35 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
 		return false, writeErr
 	}
 
+	// C1: 网络广播的块直接到达 maybeAcceptBlock(不经 header 下载路径),
+	// bestHeader 视图不会自动推进,导致视图滞后连接链——BFMinerSubmit 守卫
+	// 会拒绝父块高度超过滞后视图的矿工块(实测:同步正常、网络正常,但挖矿
+	// 连续被拒,header 视图卡在旧高度,本地 headers 高度反超全部 peer 通告
+	// 高度后 fetchHigherPeers 恒空、永不发起 header 下载,形成死锁)。
+	// 块连接成功后,若其 work 高于当前视图 tip,同步推进视图,保持视图与
+	// 连接链一致,矿工块不再被误拒。
+	// C1: a network-broadcast block reaches maybeAcceptBlock directly (not
+	// via the header download path), so the bestHeader view never advances and
+	// lags the connected chain -- the BFMinerSubmit guard then rejects miner
+	// blocks whose parent height is above the stale view (observed: sync and
+	// network fine, but mining rejected repeatedly with the view stuck; once
+	// local headers outgrew every peer's advertised height, fetchHigherPeers
+	// stays empty and no header download is ever started, deadlocking).  After
+	// the block is connected, advance the view when its work exceeds the
+	// current tip so the view tracks the connected chain and miner blocks are
+	// not wrongly rejected.
+	if isMainChain {
+		hdrTip := b.bestHeader.Tip()
+		if newNode.workSum.Cmp(hdrTip.workSum) > 0 {
+			// Lock order is chainLock -> queryLock (A2 v1); see the header
+			// path in maybeAcceptBlockHeader.
+			// 锁序为 chainLock -> queryLock(A2 v1);见 maybeAcceptBlockHeader。
+			b.queryLock.Lock()
+			b.bestHeader.SetTip(newNode)
+			b.queryLock.Unlock()
+		}
+	}
+
 	// Notify the caller that the new block was accepted into the block
 	// chain.  The caller would typically want to react by relaying the
 	// inventory to other peers.

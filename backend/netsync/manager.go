@@ -91,6 +91,16 @@ const (
 	// is still in flight.
 	headerRangeStallTimeout = 6 * time.Second
 
+	// headerProbeInterval rate-limits the catch-up probe issued when no
+	// peer advertises a height above the local header tip (B fix, see
+	// lastHeaderProbeAt).  The probe re-arms fetchHeaders after the
+	// connection-time LastBlock snapshot has had a chance to be updated by
+	// any headers/inv traffic in between.
+	// headerProbeInterval 限制无 peer 通告高度高于本地 header tip 时发出的
+	// 追赶探测频率(B 修复,见 lastHeaderProbeAt)。探测在连接时快照被期间
+	// 的 headers/inv 流量更新后重新武装 fetchHeaders。
+	headerProbeInterval = 30 * time.Second
+
 	// blockSliceStallTimeout is the amount of time an in-flight block slice
 	// is allowed to remain without any of its blocks being requested by the
 	// peer before it is re-issued to a different peer.  It is longer than
@@ -677,6 +687,18 @@ type SyncManager struct {
 	peerStates       map[*peerpkg.Peer]*peerSyncState
 	lastProgressTime time.Time
 
+	// lastHeaderProbeAt rate-limits the header catch-up probe issued by
+	// fetchHeaders when no peer advertises a height above the local header
+	// tip (B fix: connection-time LastBlock snapshots can freeze below the
+	// local height, leaving fetchHigherPeers empty and the header download
+	// deadlocked even though the network is healthy).  Only touched from
+	// the blockHandler goroutine.
+	// lastHeaderProbeAt 限制 fetchHeaders 在无 peer 通告高度高于本地 header
+	// tip 时发出的 header 追赶探测频率(B 修复:连接时的 LastBlock 快照可能
+	// 冻结在低于本地高度处,使 fetchHigherPeers 恒空、header 下载即使网络
+	// 正常也死锁)。仅 blockHandler goroutine 访问。
+	lastHeaderProbeAt time.Time
+
 	// headerSync is non-nil while the initial header download is being
 	// performed across several peers in parallel.  It is only touched from
 	// the blockHandler goroutine.
@@ -903,6 +925,34 @@ func (sm *SyncManager) fetchHeaders() {
 	_, height := sm.chain.BestHeader()
 	higherPeers := sm.fetchHigherPeers(height)
 	if len(higherPeers) == 0 {
+		// B fix: connection-time LastBlock snapshots can freeze below the
+		// local header height once the node is current (no blocks/headers are
+		// requested anymore), leaving fetchHigherPeers empty and the header
+		// download deadlocked even though the network is healthy.  Probe the
+		// existing peers instead of giving up: the getheaders request itself
+		// is answered by the peers, handleHeadersMsg updates their LastBlock
+		// from the delivered batch, and the next fetchHeaders then finds a
+		// candidate above the local tip.  Rate-limited so a permanently
+		// peer-less node does not hammer its peers.
+		// B 修复:节点 current 后(不再请求块/headers)连接时的 LastBlock 快照
+		// 可能冻结在低于本地 header 高度处,使 fetchHigherPeers 恒空、header
+		// 下载即使网络正常也死锁。改为向现有 peer 发探测而不是放弃:peer
+		// 会回复 getheaders,handleHeadersMsg 从送达批次更新其 LastBlock,
+		// 下一次 fetchHeaders 就能在本地 tip 之上找到候选。限流防止无 peer
+		// 节点持续轰炸对端。
+		if time.Since(sm.lastHeaderProbeAt) >= headerProbeInterval {
+			sm.lastHeaderProbeAt = time.Now()
+			bestHash, _ := sm.chain.BestHeader()
+			locator := blockchain.BlockLocator([]*chainhash.Hash{&bestHash})
+			for peer := range sm.peerStates {
+				if sm.isSyncCandidate(peer) {
+					peer.PushGetHeadersMsg(locator, &zeroHash)
+				}
+			}
+			log.Warnf("No sync peer candidates above header height %d -- "+
+				"probing %d candidate peers for a catch-up", height,
+				len(higherPeers))
+		}
 		log.Warnf("No sync peer candidates available")
 		return
 	}
@@ -2823,6 +2873,19 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	}
 
 	bestHash, bestHeight := sm.chain.BestHeader()
+	// B fix: the peer just delivered a headers batch that reaches (at least)
+	// this height, so its advertised height must reflect it.  Without this the
+	// connection-time LastBlock snapshot freezes below the local header height
+	// once the node is current (no blocks/headers are requested anymore), and
+	// fetchHigherPeers then finds no peer above the local height forever --
+	// the header download deadlocks even though the network is healthy.
+	// B 修复:该 peer 刚送达一批至少到这个高度的 headers,其通告高度必须
+	// 随之更新。否则节点 current 后(不再请求块/headers)连接时的 LastBlock
+	// 快照冻结在低于本地 header 高度处,fetchHigherPeers 永远找不到比本地
+	// 更高的 peer——即使网络正常 header 下载也会死锁。
+	if bestHeight > peer.LastBlock() {
+		peer.UpdateLastBlockHeight(bestHeight)
+	}
 	if sm.ibdMode {
 		if sm.syncPeer == nil {
 			// Return if we've disconnected from the syncPeer.
@@ -3524,6 +3587,24 @@ func (sm *SyncManager) abortHeaderSync() {
 // is invalidated, all in-flight header/block state is discarded, and the sync
 // restarts from the confirmed height.
 func (sm *SyncManager) rollbackFabricatedHeaderChain() {
+	// D fix: when no peer advertises a height above the local header tip,
+	// a stalled block download is NOT a forged/forked chain -- it is the
+	// stale connection-time LastBlock snapshot (B fix) leaving no candidate
+	// to serve the front block.  Rolling back in that state only deepens
+	// the cut pointlessly and chews the header index; skip it and let the
+	// header catch-up probe (fetchHeaders) re-arm the download.
+	// D 修复:没有 peer 通告高度高于本地 header tip 时,block 下载停滞不是
+	// 伪造/分叉链——而是连接时 LastBlock 快照冻结(B 修复)导致没有候选能
+	// 提供 front 块。此时回滚只会无意义地加深切口、啃咬 header 索引;跳过,
+	// 让 header 追赶探测(fetchHeaders)重新武装下载。
+	_, bestHeaderHeight := sm.chain.BestHeader()
+	if len(sm.fetchHigherPeers(bestHeaderHeight)) == 0 {
+		log.Warnf("Skipping fabricated-header rollback: no peer advertises "+
+			"a height above local header height %d -- the stall is a stale "+
+			"LastBlock snapshot, not a forged chain", bestHeaderHeight)
+		return
+	}
+
 	// 1. Determine the rollback height.  The best chain tip itself can be the
 	// bogus block (a locally-mined block persisted as best-chain tip that no
 	// peer's main chain contains): rolling back to best.Height would keep that
