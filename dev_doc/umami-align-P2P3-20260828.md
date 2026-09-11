@@ -64,9 +64,14 @@
 1. 收到 prev 不存在的块：
    a. 先 dbPutBlock 落盘（块数据 + header 索引，标记 statusDataStored|statusHeaderStored）
    b. 再 addOrphanBlock 进内存池（条目保留，用于 processOrphans 依赖索引）
-2. 孤儿池容量上限改为磁盘字节/高度窗口控制（新常量 maxOrphanBlocksBytes 或按高度差），
-   驱逐时：从磁盘删除最老的孤儿块数据 + 清除其 header 索引数据标志（保留 header 索引本身，
-   或整体移除索引——需与现有 removeOrphanBlock 语义对齐）
+2. 清理策略 = 事件驱动主动清理（无定时巡检）：
+   a. 容量上限：孤儿+候选磁盘占用超 maxOrphanBlockBytes（1 GiB，可调）→
+      按 work 最小/最旧优先删（删块数据 + 清 header 索引数据标志，保留索引头或整体移除）
+   b. 落后阈值：候选/孤儿链 tip 落后主链 > maxOrphanBlockHeight（2000，重组窗口上限）
+      → 该链已无逆转可能 → 删数据清索引
+   c. 触发点仅两个（事件驱动，无后台定时器）：
+      · 块连接失败（竞争失败，按 P2-2 持久化标记 + 删磁盘数据，记录即完事）
+      · 驱逐（removeOrphanBlock 现有路径扩展：应用容量上限 a 与落后阈值 b）
 3. processOrphans 父块连接成功后：走正常 maybeAcceptBlock（数据已在磁盘，直接读盘验证），
    连接失败（如共识失败）→ 按 P2-2 标记失败，并清理其磁盘数据
 ```
@@ -74,30 +79,32 @@
 关键点：
 - **落盘≠上链**：孤儿块只写数据 + header 索引，不写高度索引、不进入 bestChain 视图；
 - **去重**：`addOrphanBlock` 现有去重（hash 已存在则忽略）在落盘后仍适用——落盘前先查 header 索引是否已有数据，避免重复写盘；
-- **清理**：孤儿块被连接/失败/驱逐时删除磁盘数据，防磁盘无限增长。
+- **清理 = 事件驱动主动清理**（根治"先存后选" + 容量/落后双上限，无定时巡检）：触发点仅两个——① 块连接失败（竞争失败，按 P2-2 持久化标记 + 删数据，记录即完事）；② 驱逐（`removeOrphanBlock` 现有路径应用容量上限 `maxOrphanBlockBytes` 与落后阈值 `maxOrphanBlockHeight`）。孤儿/候选块被连接（转正保留）不清盘、无后台巡检 goroutine。
 
 ### 1.6 详细实现步骤
 
 | # | 文件 | 动作 |
 |---|---|---|
-| 1 | `backend/blockchain/chain.go` | 新增常量 `maxOrphanBlockBytes = 1 << 30`（1 GiB，可调）；`BlockChain` 结构新增字段 `orphanDiskBytes int64` |
+| 1 | `backend/blockchain/chain.go` | 新增常量 `maxOrphanBlockBytes = 1 << 30`（1 GiB，可调）与 `maxOrphanBlockHeight = 2000`（落后阈值，重组窗口上限）；`BlockChain` 结构新增字段 `orphanDiskBytes int64` |
 | 2 | `backend/blockchain/process.go` | `ProcessBlock` 的孤儿分支（283-287）：在 `addOrphanBlock` 前调用新增 `b.dbPutOrphanBlock(block)`；失败（写盘错误）时回退为纯内存孤儿（记录日志，不阻断） |
 | 3 | `backend/blockchain/chainio.go` | 新增 `dbPutOrphanBlock`：复用 `dbPutBlock` 的块数据写入 + 新增 header 索引条目（标记 `statusDataStored\|statusHeaderStored`，**不**设置 `statusValid`）；新增 `dbRemoveOrphanBlockData(hash)`：删块数据 + 清 header 索引数据标志 |
 | 4 | `backend/blockchain/chain.go` | `removeOrphanBlock` 扩展：驱逐时调用 `dbRemoveOrphanBlockData`，累计/扣除 `orphanDiskBytes` |
 | 5 | `backend/blockchain/process.go` | `processOrphans` 连接失败分支：调用 `dbRemoveOrphanBlockData`（按 P2-2 标记失败的块不再保留数据） |
 | 6 | `backend/blockchain/process.go` | `maybeAcceptBlock` 前置：若 header 索引已含数据标志且块未上链，跳过重复写盘（复用现有读取路径） |
-| 7 | 测试 | `backend/blockchain/process_test.go`：① 孤儿块落盘 → 模拟重启（新 BlockChain 实例）→ 父块到达 → 自动连接；② 孤儿池驱逐 → 磁盘数据删除；③ 重复孤儿不重复写盘 |
+| 7 | `backend/blockchain/process.go` | 事件驱动主动清理（无定时巡检）：仅两个触发点——① `processOrphans` 块连接失败分支调用 `b.pruneOrphanDisk`（按 P2-2 标记 + 删数据）；② `removeOrphanBlock` 驱逐路径扩展调用 `b.pruneOrphanDisk`（应用 `maxOrphanBlockBytes` 容量上限与 `maxOrphanBlockHeight` 落后阈值，work 最小/最旧优先删数据清索引）。无后台定时器、无 ProcessBlock 入口检查 |
+| 8 | 测试 | `backend/blockchain/process_test.go`：① 孤儿块落盘 → 模拟重启（新 BlockChain 实例）→ 父块到达 → 自动连接；② 孤儿池驱逐 → 磁盘数据删除；③ 重复孤儿不重复写盘；④ 超容量/超落后阈值 → 磁盘数据清理（事件触发，无巡检） |
 
 ### 1.7 风险与验证
 
 - **风险（中）**：
-  - 磁盘占用：受 `maxOrphanBlockBytes` 上限约束，且驱逐/失败即清理；
+  - 磁盘占用：受 `maxOrphanBlockBytes` 上限 + `maxOrphanBlockHeight` 落后阈值双约束，且驱逐/失败/落后即清理；
   - 与现有孤儿池逻辑耦合：`removeOrphanBlock` 现有调用点（驱逐、父块处理完）需逐一核对，避免漏删磁盘数据；
   - 状态一致性：孤儿块 header 索引不设 `statusValid`，若意外被 `KnownValid` 逻辑误判需排查。
 - **验证**：
   1. `go test ./blockchain/...` 通过；
   2. 构造缺父块场景 → 断言日志出现孤儿落盘；重启节点 → 父块到位后自动上链（无需重新下载）；
-  3. 压测孤儿洪流（>16384 条目）→ 磁盘占用不超过上限，驱逐正常。
+  3. 压测孤儿洪流（>16384 条目）→ 磁盘占用不超过上限，驱逐正常；
+  4. 构造落后主链超阈值的候选/孤儿链 → 事件触发清理（无巡检），磁盘数据删除、索引数据标志清除。
 
 ---
 
@@ -112,7 +119,7 @@
 ### 2.2 ini-node 现状
 
 - `blockindex.go:41-42`：已有 `statusValidateFailed` 标志位，`KnownInvalid()`（79-80）可判定；`chain.go:1260/1364/1392` 多处 `SetStatusFlags(node, statusValidateFailed)`（重组/失效路径在用）；
-- **但**：失败标记是否随 block index 序列化落盘**未审计确认**（chainio.go 中未见明确的 status 序列化代码路径）——若仅内存，则**重启后重新踩坑**（重复校验失败块），与 umami 的持久化语义不符；
+- **status 落盘：已审计确认（2026-09-11）**——块索引行 value = header 序列化 + 1 字节 status（`chainio.go:2296 WriteByte(byte(node.status))`，读取 2230），`SetStatusFlags` 标记 dirty（blockindex.go:816-821）→ `flushDirtyLocked`/`flushToDB` 持久化。P2-2 的核心机制（失败标记 + 落盘 + 重启秒拒 + 后代标记）已随修复 B / 放宽语义 / 回滚自愈轮次**全部落地**，本节剩余缺口仅文档化确认，无需新代码。
 - 模板级失败（`CheckConnectBlockTemplate` 返回）与共识级失败混用同一错误通道，需区分。
 
 ### 2.3 可行性分析

@@ -2327,6 +2327,29 @@ func dbStoreBlock(dbTx database.Tx, block *btcutil.Block) error {
 	return dbTx.StoreBlock(block)
 }
 
+// dbPutOrphanBlock persists an orphan block's payload so a restart does not
+// lose data received while its parent was unknown (P2-1 "先存后选").  Only the
+// block body is written -- the height-less orphan cannot own a main-chain
+// height-index row, and it is not marked valid.  When the parent arrives the
+// normal maybeAcceptBlock path reads the body from disk and connects it;
+// duplicate downloads are skipped by dbStoreBlock's HasBlock check.
+// dbPutOrphanBlock 落盘孤儿块体,使父块未知期间收到的数据重启不丢(P2-1
+// "先存后选")。只写块体——没有确定高度的孤儿无法拥有主链高度索引行,也不
+// 标记有效。父块到位后正常 maybeAcceptBlock 路径从磁盘读体并连接;重复下载
+// 由 dbStoreBlock 的 HasBlock 检查跳过。
+func dbPutOrphanBlock(dbTx database.Tx, block *btcutil.Block) error {
+	return dbStoreBlock(dbTx, block)
+}
+
+// dbRemoveOrphanBlockData deletes an orphan block's payload from the database.
+// The underlying block-file region is left orphaned for pruning to reclaim
+// later; the block is simply no longer addressable by hash.
+// dbRemoveOrphanBlockData 从数据库删除孤儿块体。底层块文件区域留给剪枝后续
+// 回收;该块只是不再按 hash 可寻址。
+func dbRemoveOrphanBlockData(dbTx database.Tx, block *btcutil.Block) error {
+	return dbTx.DeleteBlock(block.Hash())
+}
+
 // blockIndexKey generates the binary key for an entry in the block index
 // bucket. The key is composed of the block height encoded as a big-endian
 // 32-bit unsigned int followed by the 32 byte block hash.

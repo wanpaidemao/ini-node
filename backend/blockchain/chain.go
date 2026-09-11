@@ -35,6 +35,15 @@ const (
 	// the tip, so the pool is sized to absorb a full in-flight request batch
 	// (plus headroom).
 	maxOrphanBlocks = 16384
+
+	// maxOrphanBlockBytes bounds the on-disk orphan/侧链 payload persisted by
+	// P2-1 (先存后选).  When eviction runs (addOrphanBlock 超限/过期路径,
+	// removeOrphanBlockWithData) the accounting ensures the persisted orphan
+	// bodies never exceed this cap, so a restart cannot resurrect unbounded
+	// orphan data (umami BLOCK_HAVE_DATA 语义的磁盘上限等价物)。
+	// maxOrphanBlockBytes 限制 P2-1 落盘的孤儿块体磁盘占用上限;驱逐时按此
+	// 账本扣减,保证落盘孤儿数据有界。
+	maxOrphanBlockBytes = 1 << 30 // 1 GiB
 )
 
 // BlockLocator is used to help locate a specific block.  The algorithm for
@@ -220,6 +229,13 @@ type BlockChain struct {
 	orphans      map[chainhash.Hash]*orphanBlock
 	prevOrphans  map[chainhash.Hash][]*orphanBlock
 	oldestOrphan *orphanBlock
+
+	// orphanDiskBytes accounts the bytes of orphan bodies persisted by P2-1
+	// (先存后选), bounded by maxOrphanBlockBytes.  Protected by the chain
+	// lock (written on the ProcessBlock orphan path and on eviction).
+	// orphanDiskBytes 统计 P2-1 落盘孤儿块体的累计字节数,受
+	// maxOrphanBlockBytes 上限约束;由链锁保护。
+	orphanDiskBytes int64
 
 	// These fields are related to checkpoint handling.  They are protected
 	// by the chain lock.
@@ -455,6 +471,33 @@ func (b *BlockChain) removeOrphanBlock(orphan *orphanBlock) {
 	}
 }
 
+// removeOrphanBlockWithData removes an orphan from the pool and, for the
+// eviction/expiry paths only, deletes its persisted body from the database so
+// the on-disk orphan data cannot grow without bound (P2-1 事件驱动清理触发点②:
+// 驱逐/过期即清理)。It is NOT used by processOrphans -- the parent has just
+// arrived there and the body is about to be connected, so its disk data must
+// stay.
+// removeOrphanBlockWithData 从池中移除孤儿,并仅在驱逐/过期路径删除其落盘
+// 块体,使磁盘孤儿数据不会无界增长(P2-1 事件驱动清理触发点②)。processOrphans
+// 不调用它——父块刚到位、块体即将连接,磁盘数据必须保留。
+func (b *BlockChain) removeOrphanBlockWithData(orphan *orphanBlock) {
+	block := orphan.block
+	b.removeOrphanBlock(orphan)
+
+	err := b.db.Update(func(dbTx database.Tx) error {
+		return dbRemoveOrphanBlockData(dbTx, block)
+	})
+	if err != nil {
+		log.Warnf("P2-1: failed to remove orphan block data %v: %v",
+			block.Hash(), err)
+		return
+	}
+	b.orphanDiskBytes -= int64(block.MsgBlock().SerializeSize())
+	if b.orphanDiskBytes < 0 {
+		b.orphanDiskBytes = 0
+	}
+}
+
 // addOrphanBlock adds the passed block (which is already determined to be
 // an orphan prior calling this function) to the orphan pool.  It lazily cleans
 // up any expired blocks so a separate cleanup poller doesn't need to be run.
@@ -465,7 +508,7 @@ func (b *BlockChain) addOrphanBlock(block *btcutil.Block) {
 	// Remove expired orphan blocks.
 	for _, oBlock := range b.orphans {
 		if time.Now().After(oBlock.expiration) {
-			b.removeOrphanBlock(oBlock)
+			b.removeOrphanBlockWithData(oBlock)
 			continue
 		}
 
@@ -479,7 +522,7 @@ func (b *BlockChain) addOrphanBlock(block *btcutil.Block) {
 	// Limit orphan blocks to prevent memory exhaustion.
 	if len(b.orphans)+1 > maxOrphanBlocks {
 		// Remove the oldest orphan to make room for the new one.
-		b.removeOrphanBlock(b.oldestOrphan)
+		b.removeOrphanBlockWithData(b.oldestOrphan)
 		b.oldestOrphan = nil
 	}
 

@@ -139,6 +139,20 @@ func (b *BlockChain) processOrphans(hash *chainhash.Hash, flags BehaviorFlags) e
 			// Potentially accept the block into the block chain.
 			_, err := b.maybeAcceptBlock(orphan.block, flags)
 			if err != nil {
+				// P2-1 事件驱动清理触发点①:竞争失败的孤儿块清理其落盘
+				// 数据(父块已到位却仍连接失败,数据不再有用)。P2-2 在此
+				// 一并持久化失败标记(见 P2-2 实施)。
+				// P2-1 event-driven cleanup trigger ①: a block that failed
+				// to connect once its parent arrived has no further use --
+				// drop its persisted body.  P2-2 additionally persists the
+				// failed marker here (see P2-2 implementation).
+				derr := b.db.Update(func(dbTx database.Tx) error {
+					return dbRemoveOrphanBlockData(dbTx, orphan.block)
+				})
+				if derr != nil {
+					log.Warnf("P2-1: failed to remove failed-orphan data %v: %v",
+						orphan.block.Hash(), derr)
+				}
 				return err
 			}
 
@@ -209,6 +223,25 @@ func (b *BlockChain) ProcessBlock(block *btcutil.Block, flags BehaviorFlags) (bo
 			log.Tracef("checkBlockSanity-fail(orphan) hash=%s err=%v",
 				blockHash, err)
 			return false, false, err
+		}
+
+		// P2-1 先存后选:父块未知的块体先落盘,重启不丢(umami
+		// SaveBlockToDisk 语义)。落盘失败仅回退为纯内存孤儿,不阻断
+		// 正常孤儿处理。
+		// P2-1 store-then-select: persist the body before buffering so a
+		// restart does not lose data received while its parent was unknown.
+		// A disk error only degrades to an in-memory orphan; it never blocks
+		// the normal orphan path.
+		err = b.db.Update(func(dbTx database.Tx) error {
+			return dbPutOrphanBlock(dbTx, block)
+		})
+		if err != nil {
+			log.Warnf("P2-1: failed to persist orphan block %v: %v "+
+				"(falling back to in-memory orphan)", blockHash, err)
+		} else {
+			// Account the persisted bytes so eviction can enforce
+			// maxOrphanBlockBytes (P2-1 磁盘上限账本)。
+			b.orphanDiskBytes += int64(block.MsgBlock().SerializeSize())
 		}
 
 		log.Infof("Adding orphan block %v with parent %v", blockHash, prevHash)
