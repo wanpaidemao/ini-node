@@ -101,6 +101,22 @@ const (
 	// 的 headers/inv 流量更新后重新武装 fetchHeaders。
 	headerProbeInterval = 30 * time.Second
 
+	// headerRunawayThreshold caps how far the header tip may outrun the
+	// connected block tip before new header fetching pauses.  On a ~5s/block
+	// network a header wave (e.g. a forked/polluted chain every header-first
+	// wallet swallowed at once) can outrun block supply by hundreds of
+	// heights; blocks can only be served up to the peers' block tip, so
+	// letting headers run free just deepens the unserviceable gap.  While
+	// the gap exceeds the threshold, fetchHeaders declines to start a new
+	// round: blocks catch up, the gap shrinks (A/B keep the block pipeline
+	// moving), and fetching re-arms automatically below the threshold.
+	// headerRunawayThreshold 限制 header tip 领先已连接块 tip 的最大距离,
+	// 超过后暂停新一轮 header 拉取。~5 秒/块的网络上 header 波(例如全网
+	// 钱包同时吞下的分叉/污染链)可能领先块供给数百高度;块只能供给到
+	// peer 的块 tip 为止,放任 header 狂奔只会加深不可服务缺口。缺口超过
+	// 阈值时 fetchHeaders 拒绝开始新一轮:块先行追平、缺口收窄(A/B 保持
+	// 块管道流动),回落到阈值以下后自动重新武装。
+	headerRunawayThreshold = 100
 	// blockSliceStallTimeout is the amount of time an in-flight block slice
 	// is allowed to remain without any of its blocks being requested by the
 	// peer before it is re-issued to a different peer.  It is longer than
@@ -893,6 +909,26 @@ func (sm *SyncManager) fetchHigherPeers(height int32) []*peerpkg.Peer {
 	return higherPeers
 }
 
+// maxPeerServeHeight returns the highest block height any sync-candidate
+// peer can actually serve right now (its advertised LastBlock), or 0 when
+// there are no candidates.  Used by buildBlockRequest to keep the block
+// request window inside the serviceable frontier (A fix).
+// maxPeerServeHeight 返回当前所有候选 peer 实际能供块的最高高度
+// (其通告的 LastBlock),无候选 peer 时返回 0。供 buildBlockRequest
+// 将块请求窗口保持在可服务边界之内(A 修复)。
+func (sm *SyncManager) maxPeerServeHeight() int32 {
+	var maxServe int32
+	for peer, state := range sm.peerStates {
+		if !state.syncCandidate {
+			continue
+		}
+		if h := peer.LastBlock(); h > maxServe {
+			maxServe = h
+		}
+	}
+	return maxServe
+}
+
 // isInIBDMode returns true if there's more blocks needed to be downloaded to
 // catch up to the latest chain tip.
 func (sm *SyncManager) isInIBDMode() bool {
@@ -923,6 +959,28 @@ func peerHost(p *peerpkg.Peer) string {
 // number of peers is capped by maxHeaderSyncPeers.
 func (sm *SyncManager) fetchHeaders() {
 	_, height := sm.chain.BestHeader()
+
+	// C fix (header runaway brake): if the header tip has already outrun the
+	// connected block tip by more than headerRunawayThreshold, decline to
+	// start a new header round.  Blocks can only be served up to the peers'
+	// block tip, so letting headers run further just deepens the
+	// unserviceable gap that deadlocked the block pipeline before (A/B fix
+	// its consequences).  The brake is self-releasing: once blocks catch up
+	// and the gap falls back under the threshold, the next fetchHeaders call
+	// runs normally.
+	// C 修复(header 失控刹车):header tip 已领先已连接块 tip 超过
+	// headerRunawayThreshold 时,拒绝开始新一轮 header 拉取。块只能供给到
+	// peer 的块 tip 为止,放任 header 继续狂奔只会加深不可服务缺口——
+	// 正是此前死锁块管道的缺口(A/B 修的是它的后果)。刹车自解除:块追平、
+	// 缺口回落到阈值以下后,下一次 fetchHeaders 正常执行。
+	bestHeight := sm.chain.BestSnapshot().Height
+	if height-bestHeight > headerRunawayThreshold {
+		log.Debugf("Header fetch paused: header tip %d outruns block tip %d "+
+			"by more than %d -- letting blocks catch up first",
+			height, bestHeight, headerRunawayThreshold)
+		return
+	}
+
 	higherPeers := sm.fetchHigherPeers(height)
 	if len(higherPeers) == 0 {
 		// B fix: connection-time LastBlock snapshots can freeze below the
@@ -1760,10 +1818,39 @@ func (sm *SyncManager) handleStallSample() {
 			sm.blockMissingHeight = best
 			sm.blockMissingSince = time.Now()
 		} else if time.Since(sm.blockMissingSince) > blockUnavailableTimeout {
-			log.Warnf("Block download stuck at height %d for %v -- suspected "+
-				"fabricated/forked header chain, rolling back",
-				best, blockUnavailableTimeout)
-			sm.rollbackFabricatedHeaderChain()
+			// B fix (window reset): when no peer can serve anything above the
+			// best height, the stuck front is beyond the serviceable
+			// frontier -- the header chain outran block supply (observed: a
+			// forked/polluted header wave that every header-first wallet
+			// swallowed at once, leaving headers ~500 above every peer's
+			// block tip).  A chain rollback would be wrong here, and the
+			// D-fix guard skips it anyway.  Instead reset the download
+			// window: in-flight state is dropped and the block download
+			// restarts from the connected tip, with buildBlockRequest's
+			// serviceable-frontier clamp (A fix) keeping the new window
+			// inside what peers can actually serve.  The stall-rotate path
+			// below is unaffected: it stays the remedy for a single bad
+			// sync peer.
+			// B 修复(窗口重置):没有 peer 能供 best 之上任何块时,卡住的
+			// front 在可服务边界之外——header 链冲过了块供给(实测:全网
+			// 分叉/污染 header 波,所有 header-first 钱包同时吞下,headers
+			// 高出所有 peer 块 tip 约 500)。此时回滚链既不正确,D 修复
+			// 护栏也会跳过它。改为重置下载窗口:丢弃在途状态,从已连接
+			// tip 重启块下载,buildBlockRequest 的可服务边界钳制(A 修复)
+			// 保证新窗口落在 peer 实际能供的范围内。下方的 stall 轮换
+			// 路径不受影响:它仍是针对单个坏 sync peer 的补救。
+			if maxServe := sm.maxPeerServeHeight(); maxServe <= best {
+				log.Warnf("Block download stuck at height %d for %v with no "+
+					"peer serving above %d -- resetting download window "+
+					"(frontier clamp keeps it serviceable)",
+					best, blockUnavailableTimeout, maxServe)
+				sm.resetDownloadState()
+			} else {
+				log.Warnf("Block download stuck at height %d for %v -- "+
+					"suspected fabricated/forked header chain, rolling back",
+					best, blockUnavailableTimeout)
+				sm.rollbackFabricatedHeaderChain()
+			}
 		}
 	}
 
@@ -2604,6 +2691,26 @@ func (sm *SyncManager) buildBlockRequest(peer *peerpkg.Peer) *wire.MsgGetData {
 	requestEnd := bestHeight + maxBlockRequestWindow
 	if requestEnd > bestHeaderHeight {
 		requestEnd = bestHeaderHeight
+	}
+
+	// A fix (serviceable frontier): clamp the request horizon to the highest
+	// height any peer can actually serve.  The header download can outrun
+	// every peer's advertised height (headers grow every ~5s while block
+	// supply is peer-bound); a window parked beyond that frontier deadlocks
+	// the block pipeline -- no peer can fill the front, no block arrives to
+	// re-trigger blkDownload, and the stall timers only rotate peers that
+	// are equally unable to serve the unserviceable range.  Requesting only
+	// up to the serviceable frontier keeps the pipeline moving; the horizon
+	// re-extends as peers announce higher heights (LastBlock updates).
+	// A 修复(可服务边界):请求上限钳制到所有 peer 实际能供块的最高高度。
+	// header 下载可能冲到所有 peer 通告高度之上(网络 5 秒/块,header 持续
+	// 增长,块供给受 peer 限制);窗口停在可服务边界之外时块下载管道死锁
+	// ——没有 peer 能填 front,没有块到达去重新触发 blkDownload,stall
+	// 定时器只会轮换到同样无法供块该区间的 peer。只请求可服务边界以内
+	// 的块让管道保持流动;peer 通告更高高度(LastBlock 更新)后边界自动
+	// 重新延伸。
+	if maxServe := sm.maxPeerServeHeight(); maxServe > bestHeight && requestEnd > maxServe {
+		requestEnd = maxServe
 	}
 
 	length := requestEnd - forkHeight
