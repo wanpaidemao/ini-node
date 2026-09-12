@@ -926,6 +926,11 @@ onDestroy(() => clearInterval(timer));
               <div class="peer-q-row" style:--pc={`var(--peer${((peerNumOf(p.addr) ?? 1) - 1) % 16 + 1})`}>
                 <span class="mono peer-num" title={p.addr}>#{peerNumOf(p.addr) ?? "?"}</span>
                 <span class="mono peer-ip" translate="no" title={p.addr}>{p.addr}{#if p.syncNode}<span class="lane-star" title="sync node"> ★</span>{/if}</span>
+                <!-- B-fix additions: direction + protocol version, so the
+                     quality card carries the same info as the peers page. -->
+                <!-- B 修复新增:方向 + 协议版本,质量卡与节点连接页信息对齐 -->
+                <span class="mono dim" title={t("con.col_dir")}>{p.inbound ? "↓in" : "↑out"}</span>
+                <span class="mono dim" title={t("con.col_version")} translate="no">{p.version > 0 ? p.version : "—"}</span>
                 <span class="mono" title={t("int.peer_uptime")}>{fmtUptime(p.connTime)}</span>
                 <span class="mono" title={t("int.peer_recv")}>↓{fmtBytes(p.bytesRecv)}</span>
                 <span class="mono" title={t("int.peer_sent")}>↑{fmtBytes(p.bytesSent)}</span>

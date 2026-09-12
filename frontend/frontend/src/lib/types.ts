@@ -4,6 +4,7 @@
 export type Route =
   | "dashboard"
   | "internals"
+  | "peers"
   | "wallet"
   | "wallet-settings"
   | "send"
@@ -159,6 +160,7 @@ export interface NodeInternals {
     currentHeight: number;
     syncNode: boolean;
     inbound: boolean;
+    version: number; // peer protocol version
   }[];
 }
 

@@ -1972,14 +1972,59 @@ func (s *server) handleAddPeerMsg(state *peerState, sp *serverPeer) bool {
 		}
 	}
 
+	// B-fix (dynamic inbound yield): enforce the per-direction split here
+	// instead of a statically reserved inbound slice.
+	// Inbound peers may only use the capacity that the outbound pool
+	// (automatic + persistent) is not currently using; the outbound pool
+	// always keeps priority.  When the automatic outbound pool wants to
+	// refill (a reconnecting outbound peer arriving while the total budget
+	// is full of inbound peers), evict one non-whitelisted inbound peer to
+	// reclaim the slot.
+	// B 修复(入站动态让渡):按方向的分配在此动态执行,替代静态预留的
+	// 入站切片。入站 peer 只能占用出站池(自动+持久)当前未使用的额度,
+	// 出站池始终优先。当自动出站池需要回填(重连的出站 peer 到达而总
+	// 预算被入站占满)时,驱逐一个非白名单入站 peer 收回槽位。
+	outboundCount := len(state.outboundPeers) + len(state.persistentPeers)
+	if sp.Inbound() {
+		inboundBudget := cfg.MaxPeers - outboundCount
+		if len(state.inboundPeers) >= inboundBudget {
+			srvrLog.Infof("Inbound peer %s rejected - outbound pool "+
+				"priority: outbound=%d+%d persistent, inbound budget=%d",
+				sp, len(state.outboundPeers), len(state.persistentPeers),
+				inboundBudget)
+			sp.Disconnect()
+			return false
+		}
+	}
+
 	// Limit max number of total peers.
 	if state.Count() >= cfg.MaxPeers {
-		srvrLog.Infof("Max peers reached [%d] - disconnecting peer %s",
-			cfg.MaxPeers, sp)
-		sp.Disconnect()
-		// TODO: how to handle permanent peers here?
-		// they should be rescheduled.
-		return false
+		// Outbound priority: an arriving outbound peer may evict a
+		// non-whitelisted inbound peer to reclaim its slot; whitelisted
+		// inbound peers are never evicted.
+		// 出站优先:到达的出站 peer 可驱逐一个非白名单入站 peer 收回
+		// 槽位;白名单入站 peer 永不驱逐。
+		evicted := false
+		if !sp.Inbound() {
+			for _, ip := range state.inboundPeers {
+				if !ip.isWhitelisted {
+					srvrLog.Infof("Evicting inbound peer %s for "+
+						"outbound peer %s (outbound priority)",
+						ip, sp)
+					ip.Disconnect()
+					evicted = true
+					break
+				}
+			}
+		}
+		if !evicted {
+			srvrLog.Infof("Max peers reached [%d] - disconnecting peer %s",
+				cfg.MaxPeers, sp)
+			sp.Disconnect()
+			// TODO: how to handle permanent peers here?
+			// they should be rescheduled.
+			return false
+		}
 	}
 
 	// Add the new peer and start it.
@@ -2892,6 +2937,7 @@ func (s *server) Stop() error {
 	close(s.quit)
 	return nil
 }
+
 // Asher_Mod_End_20260910_112851
 
 // WaitForShutdown blocks until the main listener and peer handlers are stopped.
@@ -3523,10 +3569,27 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 		cfg.MaxPeers, targetOutbound, permanentPeerCount,
 		automaticOutbound,
 	)
-	maxInbound := maxInboundPeers(cfg.MaxPeers, reservedOutbound)
-	if maxInbound == 0 && len(listeners) > 0 {
-		srvrLog.Infof("Inbound connections disabled: maxpeers=%d, "+
-			"reserved-outbound=%d", cfg.MaxPeers, reservedOutbound)
+	// B-fix (dynamic inbound yield): the connmgr-level cap becomes the hard
+	// upper bound (the total peer budget).  The per-direction split is
+	// enforced dynamically in handleAddPeerMsg: inbound may use whatever
+	// outbound capacity is actually unused, instead of a statically
+	// reserved slice.  With maxpeers=8 and a full automatic-outbound pool
+	// the behavior is identical to the old reserved-outbound formula
+	// (inbound disabled); when outbound has spare room the leftover is
+	// yielded to inbound peers (e.g. a remote node dialing in succeeds
+	// while only 7 of 8 outbound slots are filled).
+	// B 修复(入站动态让渡):connmgr 层上限改为总 peer 预算(硬上限)。
+	// 按方向的分配改为在 handleAddPeerMsg 中动态执行:入站可使用出站
+	// 实际未占用的额度,而非静态预留切片。maxpeers=8 且自动出站满额时
+	// 行为与旧的 reserved-outbound 公式一致(入站禁用);出站有空位时
+	// 多余额度让渡给入站(例如出站仅 7/8 时,远端节点拨入可成功)。
+	maxInbound := uint32(cfg.MaxPeers)
+	if len(listeners) > 0 && reservedOutbound >= cfg.MaxPeers {
+		srvrLog.Infof("Inbound connections are yielded dynamically: "+
+			"maxpeers=%d, reserved-outbound=%d (inbound accepted only while "+
+			"outbound has spare room; a reconnecting outbound peer evicts a "+
+			"non-whitelisted inbound peer to reclaim its slot)",
+			cfg.MaxPeers, reservedOutbound)
 	}
 	cmgr, err := connmgr.New(&connmgr.Config{
 		Listeners:      listeners,

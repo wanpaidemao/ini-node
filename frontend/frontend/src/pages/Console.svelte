@@ -2,23 +2,40 @@
   import { onMount } from "svelte";
   import { fmt, t } from "../lib/i18n";
   import { Services } from "../lib/services";
-  import { navigate } from "../lib/store.svelte";
-  import type { Peer, RpcResult } from "../lib/types";
+  import type { RpcResult } from "../lib/types";
 
   let cmd = $state("");
-  let argsRaw = $state("");
   let history = $state<RpcResult[]>([]);
   let connected = $state(true);
-  let peers = $state<Peer[]>([]);
   let busy = $state(false);
   let format = $state(true);
   let copied = $state(false);
+  // Command history for ↑/↓ recall (most recent last). / 命令历史(↑/↓ 回溯,最新在末尾)。
+  let cmdHistory = $state<string[]>([]);
+  let histIdx = $state(-1);
 
+  // Full RPC method list for the console.  Grouped by area; includes the
+  // node-control methods (addnode / node / debuglevel) that were previously
+  // missing, so peer management is possible from the console.
+  // 控制台完整 RPC 方法清单,按域分组;补全此前缺失的节点控制方法
+  // (addnode / node / debuglevel),使控制台可以进行 peer 管理。
   const methods = [
-    "getblockchaininfo", "getblockcount", "getbestblockhash", "getblock", "getblockhash",
-    "getrawtransaction", "gettxout", "getconnectioncount", "getnetworkinfo", "getpeerinfo",
-    "getnettotals", "getmempoolinfo", "getrawmempool", "getblocktemplate", "getdifficulty",
-    "getmininginfo", "uptime", "ping",
+    // blockchain
+    "getblockchaininfo", "getblockcount", "getbestblockhash", "getblock",
+    "getblockhash", "getchaintips", "getdifficulty", "invalidateblock",
+    "getrawtransaction", "gettxout", "gettxoutsetinfo",
+    "decoderawtransaction", "validateaddress", "createrawtransaction",
+    "signrawtransactionwithwallet", "sendrawtransaction",
+    // network / peers
+    "getconnectioncount", "getnettotals", "getnetworkinfo", "getpeerinfo",
+    "addnode", "node", "disconnectnode",
+    // mining / templates
+    "getblocktemplate", "submitblock", "getmininginfo", "getgenerate",
+    "setgenerate", "gethashespersec",
+    // mempool
+    "getmempoolinfo", "getrawmempool", "estimatefee", "estimatepriority",
+    // node control
+    "debuglevel", "uptime", "ping", "stop",
   ];
 
   const suites: { label: string; cmd: string }[] = [
@@ -28,18 +45,7 @@
     { label: "con.mining", cmd: "getmininginfo" },
   ];
 
-  onMount(() => {
-    refreshPeers();
-  });
-
-  async function refreshPeers() {
-    try {
-      peers = await Services.getPeers();
-      connected = true;
-    } catch {
-      connected = false;
-    }
-  }
+  onMount(() => {});
 
   async function copyOutput() {
     const text = history.map((r) => r.output).join("\n\n");
@@ -50,40 +56,72 @@
   }
 
   function matchedMethods() {
-    if (!cmd.trim()) return methods.slice(0, 5);
-    return methods.filter((m) => m.startsWith(cmd.trim().toLowerCase())).slice(0, 6);
+    // Suggest by the first token only, so "addnode 1.2.3.4:34230 add"
+    // still suggests node-control methods as you type the verb.
+    // 按第一个 token 匹配建议,输入 "addnode 1.2.3.4:34230 add" 时
+    // 仍按动词部分给出节点控制方法提示。
+    const verb = cmd.trim().split(/\s+/)[0] ?? "";
+    if (!verb) return methods.slice(0, 5);
+    return methods.filter((m) => m.startsWith(verb.toLowerCase())).slice(0, 6);
   }
 
   async function run(custom?: string) {
-    const method = (custom ?? cmd).trim();
-    if (!method || busy) return;
+    // Single terminal-style line: the whole input is one command —
+    // "getblockchaininfo" or "addnode 1.2.3.4:34230 add".  The first
+    // token is the method; the rest become params (each token JSON-parsed
+    // when possible, else passed as a string).  This replaces the old
+    // two-box (cmd + params) layout where a second argument was
+    // effectively unreachable from the keyboard.
+    // 终端式单行:整个输入即一条命令——"getblockchaininfo" 或
+    // "addnode 1.2.3.4:34230 add"。第一个 token 是方法名,其余作为
+    // 参数(能 JSON 解析则解析,否则按字符串传入)。取代旧的
+    // 双输入框(命令+params)布局——旧布局下第二个参数实际无法
+    // 通过键盘输入。
+    const line = (custom ?? cmd).trim();
+    if (!line || busy) return;
     busy = true;
     try {
-      let params: unknown[] = [];
-      if (argsRaw.trim()) {
+      const parts = line.split(/\s+/);
+      const method = parts[0];
+      const params: unknown[] = [];
+      for (const p of parts.slice(1)) {
         try {
-          const parsed = JSON.parse(argsRaw.trim());
-          params = Array.isArray(parsed) ? parsed : [parsed];
+          params.push(JSON.parse(p));
         } catch {
-          params = argsRaw.trim().split(/\s+/);
+          params.push(p);
         }
       }
       const res = await Services.rpcCall(method, params);
-      history = [res, ...history].slice(0, 50);
+      history = [{ ...res, method }, ...history].slice(0, 50);
+      if (!custom) {
+        cmdHistory = [...cmdHistory.filter((c) => c !== line), line].slice(-50);
+        histIdx = -1;
+        cmd = "";
+      }
     } finally {
       busy = false;
     }
   }
 
-  const sumOutbound = () => peers.filter((p) => p.dir === "outbound").length;
-  const sumInbound = () => peers.filter((p) => p.dir === "inbound").length;
-  const syncing = () => peers.filter((p) => p.syncBlPerSec != null).length;
-  const medianLatency = () => {
-    if (peers.length === 0) return 0;
-    const lats = peers.map((p) => p.latencyMs).sort((a, b) => a - b);
-    const mid = Math.floor(lats.length / 2);
-    return lats.length % 2 ? lats[mid] : Math.round((lats[mid - 1] + lats[mid]) / 2);
-  };
+  function onCmdKey(e: KeyboardEvent) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      run();
+      return;
+    }
+    // ↑/↓ walk the command history like a real terminal.
+    // ↑/↓ 像真终端一样回溯命令历史。
+    if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+      e.preventDefault();
+      if (cmdHistory.length === 0) return;
+      if (e.key === "ArrowUp") {
+        histIdx = histIdx < 0 ? cmdHistory.length - 1 : Math.max(0, histIdx - 1);
+      } else {
+        histIdx = histIdx < 0 ? -1 : (histIdx + 1 >= cmdHistory.length ? -1 : histIdx + 1);
+      }
+      cmd = histIdx < 0 ? "" : cmdHistory[histIdx];
+    }
+  }
 </script>
 
 <section class="con">
@@ -112,24 +150,16 @@
         class="cmd mono"
         list="method-list"
         bind:value={cmd}
-        placeholder="getblockchaininfo"
+        placeholder="getblockchaininfo | addnode 1.2.3.4:34230 add"
         autocomplete="off"
         spellcheck="false"
         disabled={!connected}
         aria-describedby="cmd-hint"
+        onkeydown={onCmdKey}
       />
       <datalist id="method-list">
         {#each methods as m}<option value={m}></option>{/each}
       </datalist>
-      <input
-        class="args mono"
-        placeholder="params"
-        bind:value={argsRaw}
-        autocomplete="off"
-        spellcheck="false"
-        disabled={!connected}
-        aria-label="params"
-      />
       <button class="btn btn-primary" onclick={() => run()} disabled={!connected || busy || !cmd.trim()}>
         {#if busy}<span class="spin" aria-hidden="true"></span>{/if}
         ⏎ {t("con.execute")}
@@ -179,75 +209,10 @@
     {/if}
   </div>
 
-  <!-- node connection -->
-  <div class="card">
-    <div class="card-head">
-      <span class="h-card">{t("con.conn_state")}</span>
-      <span class="chip" class:offline={!connected}>
-        <span class="dot mint" aria-hidden="true"></span> {connected ? t("g.connected") : t("con.not_connected")}
-      </span>
-    </div>
-    <div class="conn-metrics">
-      <span class="metric">{t("con.dynamic_peers", { used: peers.length, cap: 8 })}</span>
-      <span class="metric">{t("dash.outbound", { n: sumOutbound() })}</span>
-      <span class="metric">{t("dash.inbound", { n: sumInbound() })}</span>
-      <span class="metric mono">{t("con.net_eq", { n: 8, m: 8 })}</span>
-      <span class="metric mono">{t("con.latency_median", { n: medianLatency() })}</span>
-    </div>
-    <table class="peer-t">
-      <thead>
-        <tr>
-          <th scope="col">{t("con.col_id")}</th>
-          <th scope="col">{t("con.col_dir")}</th>
-          <th scope="col">{t("con.col_addr")}</th>
-          <th scope="col">{t("con.col_version")}</th>
-          <th scope="col">{t("con.col_height")}</th>
-          <th scope="col">{t("con.col_sync")}</th>
-          <th scope="col">{t("con.col_action")}</th>
-        </tr>
-      </thead>
-      <tbody>
-        {#each peers as p}
-          <tr>
-            <td class="mono" translate="no">{p.id}</td>
-            <td>{p.dir === "outbound" ? "出" : "入"}</td>
-            <td class="mono addr" translate="no">{p.addr}</td>
-            <td class="mono" translate="no">{p.version}</td>
-            <td class="mono" translate="no">{fmt(p.height)}</td>
-            <td class="mono" class:sync={p.syncBlPerSec != null} translate="no">{p.syncBlPerSec != null ? `+${p.syncBlPerSec}` : "—"}</td>
-            <td>
-              <button
-                class="mini danger"
-                onclick={() => { peers = peers.filter((x) => x.id !== p.id); Services.disconnectPeer(p.id); }}
-                aria-label={`${t("con.disconnect")} ${p.id}`}
-              >
-                {t("con.disconnect")}
-              </button>
-            </td>
-          </tr>
-        {/each}
-      </tbody>
-    </table>
-    <div class="conn-actions">
-      <button
-        class="btn btn-danger"
-        onclick={() => {
-          if (confirm(t("con.confirm_disconnect_all"))) {
-            peers = [];
-            Services.resetPeers();
-            connected = true;
-          }
-        }}
-      >
-        {t("con.disconnect_all")}
-      </button>
-      <button class="btn" onclick={() => { Services.resetPeers(); Services.getPeers().then((p) => (peers = p)); }}>
-        {t("con.reset_peers")}
-      </button>
-      <span class="spacer"></span>
-      <button class="btn btn-ghost" onclick={() => navigate("internals")}>{t("nav.internals")} →</button>
-    </div>
-  </div>
+  <!-- node connection card moved to the dedicated Peers page (nav: 节点连接),
+       which carries the full metrics, per-peer latency, addnode and actions. -->
+  <!-- 节点连接卡片已移至独立的「节点连接」页(含完整指标、每 peer 延迟、
+       addnode 与操作);控制台只保留 RPC 功能。 -->
 </section>
 
 <style>

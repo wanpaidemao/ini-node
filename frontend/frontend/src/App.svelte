@@ -13,6 +13,7 @@
   import Create from "./pages/Create.svelte";
   import Settings from "./pages/Settings.svelte";
   import Console from "./pages/Console.svelte";
+  import PeerStatus from "./pages/PeerStatus.svelte";
   import ControlCenter from "./pages/ControlCenter.svelte";
   // Step 10 Explorer: chain / block / tx three-level drill-down views.
   // 第 10 步浏览器:链/区块/交易三级下钻视图。
@@ -63,6 +64,7 @@
       items: [
         { route: "settings", label: "nav.settings", kind: "wails" },
         { route: "console", label: "nav.console", kind: "wails" },
+        { route: "peers", label: "nav.peers", kind: "wails" },
       ],
     },
   ];
@@ -79,6 +81,7 @@
     create: "create.title",
     settings: "nav.settings",
     console: "nav.console",
+    peers: "nav.peers",
   };
 
   const menus = sections.map((s) => ({
@@ -332,6 +335,8 @@
         <Settings />
       {:else if app.route === "console"}
         <Console />
+      {:else if app.route === "peers"}
+        <PeerStatus />
       {:else if app.route === "control"}
         <ControlCenter />
       {:else if app.route === "explorer"}

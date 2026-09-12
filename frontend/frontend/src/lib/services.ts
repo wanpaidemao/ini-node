@@ -306,7 +306,11 @@ export const Services = {
       version: p.version,
       height: p.currentheight ?? p.startingheight,
       syncBlPerSec: p.syncnode ? Math.max(0, lastRate) : null,
-      latencyMs: Math.round(p.pingtime ?? 0),
+      // btcd reports pingtime in microseconds (LastPingMicros); convert to
+      // milliseconds.  0 = no completed ping yet (peers ping every 2 min).
+      // btcd 的 pingtime 是微秒(LastPingMicros),换算为毫秒显示;
+      // 0 表示尚未完成一次 ping(peer 每 2 分钟 ping 一次)。
+      latencyMs: Math.round((p.pingtime ?? 0) / 1000),
     }));
   },
 
@@ -389,6 +393,7 @@ export const Services = {
           currentheight: number;
           syncnode: boolean;
           inbound: boolean;
+          version: number;
         }>
       >("getpeerinfo"),
     ]);
@@ -485,6 +490,7 @@ export const Services = {
       currentheight: number;
       syncnode: boolean;
       inbound: boolean;
+      version: number;
     }>();
     for (const p of peers ?? []) {
       const cur = peerByAddr.get(p.addr);
@@ -570,6 +576,7 @@ export const Services = {
         currentHeight: p.currentheight ?? 0,
         syncNode: p.syncnode ?? false,
         inbound: p.inbound ?? false,
+        version: p.version ?? 0,
       })),
       // A6 unified atomic metrics from the node (see the performance plan):
       // node-native block rate, average chain-lock wait, UTXO flush stats,

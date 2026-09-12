@@ -2071,7 +2071,23 @@ func handleGetBlockTemplateRequest(s *rpcServer, request *btcjson.TemplateReques
 	if err := state.updateBlockTemplate(s, useCoinbaseValue); err != nil {
 		return nil, err
 	}
-	return state.blockTemplateResult(useCoinbaseValue, nil)
+
+	// B fix: report whether the returned template is still current (its prev
+	// is still the best-chain tip) via the standard BIP22 submitold field,
+	// so a miner that does not long-poll can detect a stale template when it
+	// re-checks and drop the work before wasting hash power.  On the
+	// 3-5s-per-block Sugarchain mainnet the template can go stale between
+	// two plain getblocktemplate calls; without this the miner only learns
+	// about the stale template after mining a block that gets rejected or
+	// orphaned.
+	// B 修复:通过标准 BIP22 submitold 字段报告返回模板是否仍为最新(其
+	// prev 是否仍是 best-chain tip),让不做 long-poll 的矿工复查时能发现
+	// 模板过期并提前丢弃,避免浪费算力。Sugarchain 主网 3-5 秒出块,
+	// 两次普通 getblocktemplate 之间模板就可能过期;没有该字段时矿工
+	// 只有在挖出被拒/成孤儿的块后才知道模板已过期。
+	latestHash := &s.cfg.Chain.BestSnapshot().Hash
+	submitOld := state.template.Block.Header.PrevBlock.IsEqual(latestHash)
+	return state.blockTemplateResult(useCoinbaseValue, &submitOld)
 }
 
 // chainErrToGBTErrString converts an error returned from btcchain to a string
@@ -3800,10 +3816,55 @@ func handleSubmitBlock(s *rpcServer, cmd interface{}, closeChan <-chan struct{})
 	// nodes.  This will in turn relay it to the network like normal.
 	hdr := block.MsgBlock().Header
 	rpcsLog.Tracef("submitblock received hash=%s prev=%s time=%d bits=%08x", block.Hash(), hdr.PrevBlock, hdr.Timestamp.Unix(), hdr.Bits)
+
+	// ③ Fast-fail: reject obviously-invalid submissions before the full
+	// ProcessBlock path, whose expensive part is script verification.  Both
+	// checks below are consensus hard rules, so they can never reject a
+	// valid block.  When the parent is unknown locally (orphan/fork), skip
+	// and let ProcessBlock handle it as usual.
+	// ③ 快速失败:在完整 ProcessBlock(昂贵部分是脚本验证)之前拒绝明显
+	// 无效的提交。下面两项都是共识硬规则,绝不会误拒合法块;父块本地未知
+	// (孤儿/分叉)时跳过,交给 ProcessBlock 常规处理。
+	requiredBits, err := s.cfg.Chain.CalcNextRequiredDifficultyForPrev(
+		&hdr.PrevBlock, hdr.Timestamp)
+	if err == nil && hdr.Bits != requiredBits {
+		return fmt.Sprintf("rejected: block difficulty of %08x is not "+
+			"the expected value of %08x", hdr.Bits, requiredBits), nil
+	}
+	if blockchain.ShouldHaveSerializedBlockHeight(&hdr) {
+		if txs := block.Transactions(); len(txs) > 0 {
+			cbHeight, cbErr := blockchain.ExtractCoinbaseHeight(txs[0])
+			if cbErr == nil {
+				if prevHeight, hErr := s.cfg.Chain.BlockHeightByHash(
+					&hdr.PrevBlock); hErr == nil &&
+					cbHeight != prevHeight+1 {
+					return fmt.Sprintf("rejected: block height of %d "+
+						"is not the expected value of %d", cbHeight,
+						prevHeight+1), nil
+				}
+			}
+		}
+	}
+
 	isOrphan, err := s.cfg.SyncMgr.SubmitBlock(block, blockchain.BFMinerSubmit)
 	rpcsLog.Tracef("submitblock processed hash=%s orphan=%v err=%v", block.Hash(), isOrphan, err)
 	if err != nil {
 		return fmt.Sprintf("rejected: %s", err.Error()), nil
+	}
+	if isOrphan {
+		// A fix: an orphan submission entered the orphan pool but is NOT on
+		// the main chain.  Report it instead of returning success so the
+		// miner tool does not count it as a mined-and-confirmed block
+		// (observed: the tool reported "accepted 2/3" while only 1/3
+		// actually made it onto the chain -- the fork block was counted as
+		// accepted).  Uses the standard BIP22 "inconclusive" wording so
+		// standards-compliant miners handle it predictably.
+		// A 修复:孤儿提交已进入孤儿池但尚未在主链上。如实报告而非返回
+		// 成功,避免矿工工具把它计入"已挖到并上链"(实测:工具显示
+		// "accepted 2/3" 而实际仅 1/3 上链——fork 块被计为已接受)。
+		// 采用 BIP22 标准 "inconclusive" 措辞,兼容标准矿工。
+		return fmt.Sprintf("inconclusive, not mined or rolled back "+
+			"(orphan: parent %v not on main chain yet)", hdr.PrevBlock), nil
 	}
 
 	rpcsLog.Infof("Accepted block %s via submitblock", block.Hash())
