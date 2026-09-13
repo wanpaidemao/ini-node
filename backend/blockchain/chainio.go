@@ -520,8 +520,27 @@ func dbFetchSpendJournalEntry(dbTx database.Tx, block *btcutil.Block) ([]SpentTx
 	blockTxns := block.MsgBlock().Transactions[1:]
 	stxos, err := deserializeSpendJournalEntry(serialized, blockTxns)
 	if err != nil {
-		// Ensure any deserialization errors are returned as database
-		// corruption errors.
+		// A block that is stored on disk but has never been connected has no
+		// spend journal by design (the entry is written only on connect).
+		// Reading such a journal must not abort the caller with an assertion
+		// ("mismatched spend journal serialization - no serialization for
+		// expected N stxos", observed at height 44362628 during the EOF-era
+		// stall): report it as an explicit, skippable error so index rebuild
+		// / recovery paths can move on instead of taking the whole process
+		// down on a state that is entirely legitimate mid-download.
+		// 已存储但从未连接的块本就不应有 spend journal(条目只在连接时写入)。
+		// 读取此类 journal 时不得以断言中止调用方("mismatched spend journal
+		// serialization - no serialization for expected N stxos",44362628
+		// 停滞期曾实测):改为返回显式、可跳过的错误,使索引重建/恢复路径继续
+		// 推进,而不是在"下载中段的合法状态"上崩掉整个进程。
+		if _, hErr := dbFetchHeightByHash(dbTx, block.Hash()); isNotInMainChainErr(hErr) {
+			return nil, fmt.Errorf("spend journal not available: block %v "+
+				"is stored but not connected", block.Hash())
+		}
+
+		// The block is connected: a missing or corrupt journal now is a real
+		// consistency problem and keeps its original strict semantics.
+		// 块已连接:此时 journal 缺失或损坏才是真正的一致性问题,保留原有严格语义。
 		if isDeserializeErr(err) {
 			return nil, database.Error{
 				ErrorCode: database.ErrCorruption,

@@ -61,7 +61,52 @@ const (
 // This function is safe for concurrent access.
 func (b *BlockChain) blockExists(hash *chainhash.Hash) (bool, error) {
 	// Check block index first (could be main chain or side chain blocks).
-	if b.index.HaveBlock(hash) {
+	if node := b.index.LookupNode(hash); node != nil &&
+		b.index.NodeStatus(node).HaveData() {
+
+		// The index flag says the payload is on disk.  Verify the payload is
+		// really there: a block whose data was removed (RemoveBlockData,
+		// interrupted download, crash residue) but whose flag survived would
+		// otherwise be treated as "present" forever -- the resume path would
+		// fail with "block ... does not exist" and the downloader would never
+		// re-request it, deadlocking the sync at that height (observed at
+		// 44362629: statusDataStored persisted but FetchBlock reports the
+		// block missing).  Treat flag-without-payload as absent so both the
+		// resume loop and the downloader re-download the block.  The stale
+		// flag is cleared in memory; the durable row is corrected once the
+		// payload is re-stored on connect.
+		// 索引标志声称块体在盘上。进一步验证块体真实存在:若块体曾被删除
+		// (RemoveBlockData/中断下载/崩溃残留)但标志仍在,会被永远视为"已有"
+		// ——resume 路径报 "block ... does not exist"、下载器永不重新请求,
+		// 同步在该高度永久死锁(实测 44362629:statusDataStored 已持久化但
+		// FetchBlock 报块不存在)。将"有标志无块体"视为不存在,使 resume
+		// 循环与下载器都重新下载该块。陈旧标志先在内存清除,持久行在块体重
+		// 新存储连接时被修正。
+		var onDisk bool
+		err := b.db.View(func(dbTx database.Tx) error {
+			var err error
+			onDisk, err = dbTx.HasBlock(hash)
+			return err
+		})
+		if err != nil {
+			return false, err
+		}
+		if !onDisk {
+			// Stale flag: drop it (in memory now, persistently in the same
+			// write) so HaveBlock/BlockStored report absent and both the
+			// resume loop and the downloader re-download the block.  Flushing
+			// here also keeps the on-disk row honest across restarts, so the
+			// next session never re-imports the bogus "data stored" state.
+			// 陈旧标志:先在内存清除,并立即持久化,使 HaveBlock/BlockStored
+			// 报告不存在、resume 循环与下载器都重新下载该块。同时让盘上行在
+			// 重启后保持诚实,下次会话不再载入虚假的"已存储"状态。
+			b.index.UnsetStatusFlags(node, statusDataStored)
+			if flushErr := b.index.flushToDB(false); flushErr != nil {
+				log.Warnf("Failed to flush cleared data-stored flag for %v: %v",
+					hash, flushErr)
+			}
+			return false, nil
+		}
 		return true, nil
 	}
 

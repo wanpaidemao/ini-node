@@ -7,8 +7,10 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/blockchain/internal/testhelper"
+	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/btcsuite/btcd/database"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/stretchr/testify/require"
 )
@@ -180,4 +182,62 @@ func TestProcessBlockHeader(t *testing.T) {
 	// Check that the tip didn't change.
 	tipNode = chain.bestHeader.Tip()
 	require.Equal(t, lastSidechainHeaderHash, tipNode.hash)
+}
+
+// TestBlockExistsPayloadMissing covers the sync-stall regression at height
+// 44362629: a block whose payload was deleted (interrupted download, crash
+// residue) while its "data stored" index flag survived used to be reported as
+// present forever -- the resume path failed with "block ... does not exist"
+// and the downloader never re-requested the payload, deadlocking the sync at
+// that height.  blockExists now cross-checks the flag against the database,
+// treats flag-without-payload as absent and clears the stale flag.
+// 覆盖 44362629 高度同步停滞回归:块体被删除(中断下载/崩溃残留)但"已存储"
+// 索引标志仍在的块,过去会被永远视为"已有"——resume 路径报
+// "block ... does not exist"、下载器永不重新请求块体,同步在该高度永久死锁。
+// blockExists 现在把标志与数据库交叉校验,把"有标志无块体"视为不存在,并清除
+// 陈旧标志。
+func TestBlockExistsPayloadMissing(t *testing.T) {
+	chain, params, tearDown := utxoCacheTestChain("TestBlockExistsPayloadMissing")
+	defer tearDown()
+
+	// Build a 3-block chain so each block is on the main chain with its
+	// payload stored on disk.
+	tip := btcutil.NewBlock(params.GenesisBlock)
+	tip.SetHeight(0)
+	hashes, _, err := addBlocks(3, chain, tip, []*testhelper.SpendableOut{})
+	require.NoError(t, err)
+	require.Len(t, hashes, 3)
+
+	// Sanity check: block 2 is present and reported as such.
+	lostHash := hashes[1]
+	have, err := chain.HaveBlock(lostHash)
+	require.NoError(t, err)
+	require.True(t, have)
+
+	// Simulate the crash residue the resume path used to deadlock on: delete
+	// the block payload directly from the database WITHOUT clearing the
+	// block-index "data stored" flag.
+	err = chain.db.Update(func(dbTx database.Tx) error {
+		return dbTx.DeleteBlock(lostHash)
+	})
+	require.NoError(t, err)
+
+	// The block must now be reported absent (the deadlock fix), and its stale
+	// flag must be cleared.
+	have, err = chain.HaveBlock(lostHash)
+	require.NoError(t, err)
+	require.False(t, have, "HaveBlock after payload deletion must be false "+
+		"(stale flag must be detected)")
+	stored, err := chain.BlockStored(lostHash)
+	require.NoError(t, err)
+	require.False(t, stored)
+	if node := chain.index.LookupNode(lostHash); node != nil {
+		require.False(t, chain.index.NodeStatus(node).HaveData(),
+			"data-stored flag still set after payload deletion")
+	}
+
+	// Unrelated blocks on disk must not be affected.
+	have, err = chain.HaveBlock(hashes[2])
+	require.NoError(t, err)
+	require.True(t, have, "intact block must stay reported present")
 }

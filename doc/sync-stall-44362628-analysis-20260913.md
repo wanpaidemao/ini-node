@@ -166,3 +166,32 @@
 
 - 状态：代码已落地但**尚未编译验证、尚未提交**（`git status`: `M backend/netsync/manager.go`）
 - 两笔改动无文件交叠冲突：第一笔动 `server.go` 的入站连接逻辑（已提交），第二笔只动 `netsync/manager.go`（未提交）
+
+## 10. 本地层残留修复（2026-09-13 追加，与 A/B/C 互补）
+
+A/B/C 修的是**管道层**（header 越过 peer 可服务边界导致的网络级死锁）。复盘本地库时发现事件还留下**第二种、独立于网络的本地死锁**，不在 A/B/C 范围，本报告补充修复。
+
+### 10.1 残留形态（实测库状态）
+
+| 残留 | 实测证据 | 后果 |
+|---|---|---|
+| **缺失 payload 但 DataStored 标志仍在** | 停滞库中 44362629（f5920677）高度/块索引行存在、status=0x19 含 DataStored，但 `FetchBlock` 报块体不存在 | `reconnectStoredBlocks` 每 30s 报 "block ... does not exist" → 误判 "local data inconsistent" → 回滚被护栏拦下 → **30s 零进度死循环**；同时 `haveInventory` 按标志判"已有" → **下载器永不重新请求该块** |
+| **已存储未连接块无 spend journal** | 44362628（be12969b，2 笔交易/13 输入）在连接前被读 journal → `deserializeSpendJournalEntry` 断言 "no serialization for expected 13 stxos" | 索引重建/恢复路径读取"已存储未连接"块（journal 连接时才写入，属合法中间态）时以断言中止，**整段恢复失败** |
+
+> 产生机制：任何异常退出（强杀/断电/下载中断）都可能先落块索引的 DataStored 标志、随后块体删除或未写入，形成"标志与数据不一致"的持久残留。
+
+### 10.2 修复（一笔提交）
+
+| 修复 | 位置 | 内容 |
+|---|---|---|
+| **blockExists 盘上校验** | `backend/blockchain/process.go` | 索引标志声称"已存储"时用 `dbTx.HasBlock` 交叉校验；不一致 → 清除标志（内存+持久化，重启不再复现）并判不存在。resume 跳过该块、下载器自动重拉，自愈闭环 |
+| **journal 缺失兜底** | `backend/blockchain/chainio.go` `dbFetchSpendJournalEntry` | 未连接块（不在主链）读 journal 时返回显式可跳过错误，而非 AssertError；已连接块仍保留严格 corruption 语义 |
+| **回归单测** | `backend/blockchain/process_test.go` `TestBlockExistsPayloadMissing` | 构造"删 payload 不清标志"场景，断言 `HaveBlock/BlockStored=false`、标志被清、其它块不误伤 |
+| **诊断工具** | `backend/cmd/dev_utils/journalcheck` | 只读检查停滞高度段的 chainstate/水印、块索引 status、journal 字节数与 `HasBlock` 真实性 |
+
+### 10.3 验证
+
+- `go build ./...` 全后端通过；`go vet ./blockchain/` 通过
+- `TestSpendJournalErrors` / `TestBlockExistsPayloadMissing` 通过（4.9s）
+- 停滞实库（chainstate=44362628）验证：f5920677 判"不存在"，44362627/28/30–44 正常块不受影响
+- 效果：部署此版本后，当前停滞库无需手工修复——重启节点即自动重拉 44362629 自愈；今后任何"块体缺失"残留都会自动识别并重拉，不再死锁
