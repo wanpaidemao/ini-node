@@ -1,0 +1,7 @@
+# forklocate 是"不进主编译流程"的特殊诊断工具(build.bat 不产它),
+# exe 一旦丢失需现场 go build。入库保底,避免日后找不到。
+# 例外仅放行本工具;其余 *.exe 仍由上级 .gitignore 的 *.exe 规则忽略。
+!forklocate.exe
+
+# 生产机传递包(zip)不入库,需要时本地解压/拷贝。
+forklocate-prod.zip
