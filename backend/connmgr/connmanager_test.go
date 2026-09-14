@@ -986,3 +986,71 @@ func TestListenerInboundLimit(t *testing.T) {
 		t.Fatal("released inbound slot was not reused")
 	}
 }
+
+// TestDedupDuplicateAddress verifies that a second Connect for an address that
+// is already pending or connected is deduplicated instead of dialing again.
+// Regression: repeated addnode while a target address is unreachable used to
+// enqueue one connection request per call; once the target came back all those
+// requests connected, piling up duplicate connections to the same address.
+// 验证对"已 pending 或已连接"的同一地址再次 Connect 会被去重而不再拨号。
+// 回归:目标不可达期间多次 addnode,每次调用都入队一个连接请求;目标恢复后
+// 这些请求一起兑现,同一地址叠出多条连接。
+func TestDedupDuplicateAddress(t *testing.T) {
+	t.Parallel()
+
+	var dialCount atomic.Int32
+	connected := make(chan *ConnReq, 1)
+	cmgr, err := New(&Config{
+		TargetOutbound: 0,
+		Dial: func(addr net.Addr) (net.Conn, error) {
+			dialCount.Add(1)
+			l, _ := net.Pipe()
+			return l, nil
+		},
+		OnConnection: func(c *ConnReq, conn net.Conn) {
+			select {
+			case connected <- c:
+			default:
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("New error: %v", err)
+	}
+	cmgr.Start()
+	defer func() {
+		cmgr.Stop()
+		cmgr.Wait()
+	}()
+
+	addr := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 18777}
+	req1 := &ConnReq{Addr: addr}
+	req2 := &ConnReq{Addr: addr}
+
+	// First request dials and connects.
+	cmgr.Connect(req1)
+	select {
+	case <-connected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first connection was not established")
+	}
+
+	// Second request for the same address must be deduplicated: no new dial.
+	cmgr.Connect(req2)
+	deadline := time.After(2 * time.Second)
+	for req2.State() != ConnCanceled {
+		select {
+		case <-deadline:
+			t.Logf("req1 id=%d state=%v addr=%v", req1.ID(), req1.State(), req1.Addr)
+			t.Logf("req2 id=%d state=%v addr=%v dialCount=%d",
+				req2.ID(), req2.State(), req2.Addr, dialCount.Load())
+			t.Fatalf("duplicate request was not canceled (state=%v)", req2.State())
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	if got := dialCount.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 dial for the duplicated address, got %d", got)
+	}
+}

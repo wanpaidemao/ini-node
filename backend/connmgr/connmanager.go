@@ -323,6 +323,44 @@ out:
 
 			case registerPending:
 				connReq := msg.c
+
+				// Duplicate-address dedup: keep at most one connection request
+				// (pending or active) per address.  addnode / control-plane
+				// triggers can enqueue the same address many times while it is
+				// unreachable; all those requests eventually succeed once the
+				// target comes back, piling up duplicate connections (observed:
+				// 5 connections to one address after repeated addnode).
+				// 重复地址去重:同一地址(pending 或已连接)最多保留一个连接请求。
+				// addnode 等在目标不可达期间可能反复入队同一地址,目标恢复后
+				// 这些请求会一起兑现,叠出多条重复连接(实测:重复 addnode 后
+				// 同一地址出现 5 条)。这里丢弃后续重复注册,使同一地址始终
+				// 只有一个请求在重试。
+				if connReq.Addr != nil && connReq.Addr.String() != "" {
+					dup := false
+					addrStr := connReq.Addr.String()
+					for _, c := range pending {
+						if c.Addr != nil && c.Addr.String() == addrStr {
+							dup = true
+							break
+						}
+					}
+					if !dup {
+						for _, c := range conns {
+							if c.Addr != nil && c.Addr.String() == addrStr {
+								dup = true
+								break
+							}
+						}
+					}
+					if dup {
+						log.Debugf("Dropping duplicate connection request for %v "+
+							"(already pending/connected)", connReq.Addr)
+						connReq.updateState(ConnCanceled)
+						close(msg.done)
+						continue
+					}
+				}
+
 				connReq.updateState(ConnPending)
 				pending[msg.c.id] = connReq
 				close(msg.done)
@@ -515,6 +553,14 @@ func (cm *ConnManager) Connect(c *ConnReq) {
 		case <-cm.quit:
 			return
 		}
+	}
+
+	// The registration may have been deduplicated (a request for the same
+	// address is already pending or connected), which marks this request
+	// canceled; do not dial it.
+	// 注册可能被去重(同一地址已有 pending/已连接请求)而置为取消;此时不再拨号。
+	if c.State() == ConnCanceled {
+		return
 	}
 
 	log.Debugf("Attempting to connect to %v", c)

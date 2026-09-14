@@ -1972,6 +1972,31 @@ func (s *server) handleAddPeerMsg(state *peerState, sp *serverPeer) bool {
 		}
 	}
 
+	// Duplicate-address guard for outbound peers: keep at most one connection
+	// per address.  addnode (and repeated control-plane triggers such as
+	// "restore default peers") call ConnMgr.Connect unconditionally, and
+	// ConnMgr has no address-level dedup, so without this a single address can
+	// pile up many concurrent connections (observed: 5 connections to the
+	// node's own UPnP public IP, all /ini:0.0.1/).  Mc cut them at the door.
+	// 出站 peer 重复地址护栏:同一地址最多保留一条连接。addnode(以及控制台
+	// "恢复默认 peer"等)每次都会无条件调用 ConnMgr.Connect,而 ConnMgr 无
+	// 地址级去重,没有此护栏时同一地址会叠出多条并发连接(实测:节点自身
+	// UPnP 公网地址出现 5 条/ini:0.0.1/ 自连)。在此拦截重复者。
+	if !sp.Inbound() {
+		dup := false
+		state.forAllPeers(func(ep *serverPeer) {
+			if ep.Connected() && ep != sp && ep.Addr() == sp.Addr() {
+				dup = true
+			}
+		})
+		if dup {
+			srvrLog.Infof("Peer %s already connected (duplicate address) - "+
+				"disconnecting", sp)
+			sp.Disconnect()
+			return false
+		}
+	}
+
 	// B-fix (dynamic inbound yield): enforce the per-direction split here
 	// instead of a statically reserved inbound slice.
 	// Inbound peers may only use the capacity that the outbound pool
