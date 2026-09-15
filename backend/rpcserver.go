@@ -77,6 +77,23 @@ const (
 	// in the memory pool.
 	gbtRegenerateSeconds = 60
 
+	// miningSyncGuard is the maximum allowed lead of the network-confirmed
+	// header chain over the connected block chain while mining is allowed.
+	// A template built on a block tip that lags the header chain produces
+	// blocks whose height already carries a confirmed main-chain block on the
+	// header chain, so they are rejected on submit
+	// (ErrMinedBlockNotOnMainChain) -- the miner would burn hash on blocks
+	// that can never be accepted.  1 tolerates the normal one-block head start
+	// of the header download; 0 would pause mining the moment the header
+	// chain moves a single block ahead (frequent on a slow link).
+	// miningSyncGuard 是挖矿允许的"网络确认 header 链领先已连接 block 链"
+	// 的最大块数。基于落后 header 链的 block tip 出模板,挖出的块所在高度
+	// 在 header 链上已有确认的主链块,submit 时必被拒
+	// (ErrMinedBlockNotOnMainChain)——矿工把算力烧在永远无法被接受的块上。
+	// 取 1 容忍 header 下载正常的 1 块领先;取 0 会让 header 链每前进一块就
+	// 暂停挖矿(慢链上频繁触发)。
+	miningSyncGuard = 1
+
 	// maxProtocolVersion is the max protocol version the server supports.
 	maxProtocolVersion = 70002
 
@@ -1847,6 +1864,11 @@ func (state *gbtWorkState) blockTemplateResult(useCoinbaseValue bool, submitOld 
 		Mutable:      gbtMutableFields,
 		NonceRange:   gbtNonceRange,
 		Capabilities: gbtCapabilities,
+		// Sugarchain activates SegWit at genesis; miners (e.g. the C
+		// parity sugarmaker) key their merkle leaf selection off this
+		// field. / Sugarchain 创世即激活 SegWit;矿工(sugarmaker 的 C
+		// 对齐实现)依据该字段选择 merkle 叶子算法。
+		Rules: []string{"segwit"},
 	}
 	// If the generated block template includes transactions with witness
 	// data, then include the witness commitment in the GBT result.
@@ -2046,6 +2068,31 @@ func handleGetBlockTemplateRequest(s *rpcServer, request *btcjson.TemplateReques
 		return nil, &btcjson.RPCError{
 			Code:    btcjson.ErrRPCClientInInitialDownload,
 			Message: "Bitcoin is downloading blocks...",
+		}
+	}
+
+	// Mining sync guard: refuse new work while the connected block chain
+	// lags the network-confirmed header chain by more than miningSyncGuard.
+	// A template built on a lagging block tip yields blocks at a height the
+	// header chain already confirms with a competing main-chain block -- they
+	// are rejected on submit (ErrMinedBlockNotOnMainChain), so without this
+	// guard the miner keeps burning hash on un-acceptable blocks while the
+	// block download never catches up (observed 2026-09-15: local block tip
+	// 44398046 vs header tip 44398047; every mined block was rejected, GBT
+	// kept serving the stale tip).  The pause is short: blocks catch up and
+	// mining resumes on the current main-chain tip.
+	// 挖矿同步门控:已连接 block 链落后网络确认 header 链超过 miningSyncGuard
+	// 时拒绝下发新任务。基于落后 block tip 的模板挖出的块,所在高度在 header
+	// 链上已有竞争的主链块,submit 必被拒(ErrMinedBlockNotOnMainChain)。
+	// 没有此门控,矿工持续把算力烧在不可接受的块上,block 下载又永远追不上
+	// (实测 2026-09-15:本地 block tip 44398046 落后 header tip 44398047,
+	// 挖出的块全部被拒、GBT 一直下发陈旧 tip)。暂停很短:block 追平后挖矿
+	// 自动在新主链 tip 上恢复。
+	_, headerHeight := s.cfg.Chain.BestHeader()
+	if headerHeight-currentHeight > miningSyncGuard {
+		return nil, &btcjson.RPCError{
+			Code:    btcjson.ErrRPCClientInInitialDownload,
+			Message: "Block download catching up; mining paused briefly",
 		}
 	}
 
@@ -3816,6 +3863,68 @@ func handleSubmitBlock(s *rpcServer, cmd interface{}, closeChan <-chan struct{})
 	// nodes.  This will in turn relay it to the network like normal.
 	hdr := block.MsgBlock().Header
 	rpcsLog.Tracef("submitblock received hash=%s prev=%s time=%d bits=%08x", block.Hash(), hdr.PrevBlock, hdr.Timestamp.Unix(), hdr.Bits)
+
+	// Sugarchain: mirror umami's UpdateUncommittedBlockStructures
+	// (validation.cpp) applied in its submitblock RPC (rpc/mining.cpp): when
+	// the coinbase carries a witness commitment output but its input has no
+	// witness reserved value, the block is in the legacy serialization shape
+	// produced by the solo miners (C and Go sugarmaker).  umami fills in the
+	// 32-byte zero reserved value at submit time so the block passes the
+	// consensus witness checks; ini-node must do the same or the blocks it
+	// relays are rejected network-wide ("bad-witness-nonce-size").  The header
+	// merkle root is unaffected -- it commits to TXIDs, not wtxids.
+	// Sugarchain:对齐 umami 的 UpdateUncommittedBlockStructures(submitblock
+	// RPC 中调用,validation.cpp):当 coinbase 带 witness commitment 输出但其
+	// 输入没有 witness reserved value 时——这是 solo 矿工(C/Go sugarmaker)
+	// 产出的 legacy 序列化形态,umami 在提交时补上 32 字节零 reserved value
+	// 使块通过共识 witness 校验;ini-node 若不补,广播出去的块全网被拒
+	// ("bad-witness-nonce-size")。区块头 merkle 根不受影响——它承诺的是
+	// txid 而非 wtxid。
+	{
+		mtxs := block.MsgBlock().Transactions
+		if len(mtxs) > 0 && len(mtxs[0].TxIn) > 0 &&
+			len(mtxs[0].TxIn[0].Witness) == 0 {
+			if _, hasCommitment := blockchain.ExtractWitnessCommitment(
+				block.Transactions()[0]); hasCommitment {
+				// Fill in the 32-byte zero witness reserved value ON THE
+				// MESSAGE TRANSACTION, then SERIALIZE the whole block back to
+				// bytes and re-parse it.  btcutil.Tx hashes from rawBytes
+				// (tx.go): mutating the in-memory MsgTx alone leaves rawBytes
+				// stale (still a legacy serialization without marker/flag),
+				// so HasWitness() sees the mutation while the rawBytes-strip
+				// logic offsets by 2 bytes that do not exist there -- the
+				// coinbase TXID would be computed wrong and the header merkle
+				// root would mismatch ("block merkle root is invalid").
+				// Re-serializing makes rawBytes consistent with the mutated
+				// MsgTx: the would be segwit serialization (marker+flag +
+				// witness stack), rawBytes-based TXID stripping works, and
+				// the block is relayed in the standard segwit format the
+				// network expects.
+				// 在消息交易上填入 32 字节零 witness reserved value,然后把整个
+				// 块重新序列化成字节再解析一遍。btcutil.Tx 从 rawBytes 计算
+				// 哈希(tx.go):仅修改内存中的 MsgTx 会让 rawBytes 保持陈旧
+				// (仍是无 marker/flag 的 legacy 序列化),于是 HasWitness() 看到
+				// 修改、而 rawBytes 剥离逻辑却按不存在的 2 字节 marker 偏移——
+				// coinbase 的 txid 会被算错,区块头 merkle root 因此不匹配
+				// ("block merkle root is invalid")。重新序列化使 rawBytes 与
+				// 修改后的 MsgTx 一致:得到标准 segwit 序列化(marker+flag +
+				// witness 栈),基于 rawBytes 的 txid 剥离正确,块也以网络期望
+				// 的标准 segwit 格式广播。
+				mtxs[0].TxIn[0].Witness = wire.TxWitness{
+					make([]byte, blockchain.CoinbaseWitnessDataLen),
+				}
+				var buf bytes.Buffer
+				if err := block.MsgBlock().Serialize(&buf); err != nil {
+					rpcsLog.Warnf("submitblock: failed to re-serialize "+
+						"block %v after witness fill: %v",
+						block.Hash(), err)
+				} else if rebuilt, rerr := btcutil.NewBlockFromBytes(
+					buf.Bytes()); rerr == nil {
+					block = rebuilt
+				}
+			}
+		}
+	}
 
 	// ③ Fast-fail: reject obviously-invalid submissions before the full
 	// ProcessBlock path, whose expensive part is script verification.  Both

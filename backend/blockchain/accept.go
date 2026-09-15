@@ -290,6 +290,27 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
 	// the block is connected, advance the view when its work exceeds the
 	// current tip so the view tracks the connected chain and miner blocks are
 	// not wrongly rejected.
+	//
+	// The best-header view follows the best-chain tip regardless of who
+	// produced the block (miner-submitted or network).  A locally-mined block
+	// that becomes the best-chain tip IS the highest-work block locally, so
+	// the header view must point at it -- otherwise the very next
+	// miner-submitted block (whose parent is that locally-mined tip) fails the
+	// BFMinerSubmit parent-on-view guard ("parent above confirmed header
+	// view"), breaking consecutive mining on a 5s-target network.  The
+	// divergence protection does NOT need the view to lag the chain: a block
+	// that is not on the real main chain is displaced by
+	// connectBestChain's workSum comparison the moment a higher-work chain
+	// block arrives (view included), and the BFMinerSubmit guard above still
+	// requires every mined block's PARENT to sit on the confirmed view --
+	// mining on a fabricated parent stays rejected.
+	// bestHeader 视图跟随 bestChain tip,不问块来自矿工还是网络。本地挖的块若
+	// 成为 best-chain tip,它本地就是最大 work 块,视图必须指向它——否则下一个
+	// 矿工块(其父正是这个本地 tip)会因"父高于确认视图"被 BFMinerSubmit 守卫
+	// 拒,在 5 秒目标的网络下打断连续挖矿。防分叉不依赖视图滞后于链:不在真实
+	// 主链上的块,一旦更高 work 链的块到达就会被 connectBestChain 的 workSum
+	// 比较顶替(视图同步回滚);且上述 BFMinerSubmit 守卫仍要求每个矿工块的**
+	// 父**在确认视图上——在伪造父上挖依旧被拒。
 	if isMainChain {
 		hdrTip := b.bestHeader.Tip()
 		if newNode.workSum.Cmp(hdrTip.workSum) > 0 {

@@ -739,6 +739,47 @@ mempoolLoop:
 			}
 		}
 
+		// Sugarchain: skip a transaction whose outputs already exist unspent
+		// on the confirmed chain (BIP0030 duplicate-overwrite).  Such a tx
+		// passed CheckTransactionInputs (its inputs are valid and unspent) but
+		// would make the final CheckConnectBlockTemplate fail with
+		// "tried to overwrite transaction ... not fully spent", aborting the
+		// whole template and stalling mining whenever a mempool holds a
+		// confirmed-chain duplicate (e.g. re-broadcast after a reorg).
+		// Treating it as a skip keeps the template buildable.  This mirrors
+		// Bitcoin Core, which drops txs that cannot be included instead of
+		// failing the entire GBT.
+		// Sugarchain:跳过输出已在确认链上未花费的交易(BIP0030 重复覆盖)。
+		// 这类交易能通过 CheckTransactionInputs(输入有效且未花费),但会让
+		// 最后的 CheckConnectBlockTemplate 以 "tried to overwrite transaction
+		// ... not fully spent" 失败,使整个模板作废——mempool 里一旦混入
+		// 链上已确认的重复交易(如 reorg 后重广播)挖矿就停摆。改为跳过该笔
+		// 交易保持模板可构建,对齐 Core 的"剔除无法打包的交易而非整体失败"。
+		{
+			skip := false
+			for outIdx := range tx.MsgTx().TxOut {
+				outpoint := wire.OutPoint{Hash: *tx.Hash(), Index: uint32(outIdx)}
+				entry, uerr := g.chain.FetchUtxoEntry(outpoint)
+				if uerr != nil {
+					log.Tracef("Skipping tx %s: FetchUtxoEntry err %v",
+						tx.Hash(), uerr)
+					skip = true
+					break
+				}
+				if entry != nil && !entry.IsSpent() {
+					log.Warnf("Skipping tx %s: outputs already exist "+
+						"unspent on the confirmed chain (BIP0030 "+
+						"duplicate-overwrite)", tx.Hash())
+					skip = true
+					break
+				}
+			}
+			if skip {
+				logSkippedDeps(tx, deps)
+				continue
+			}
+		}
+
 		// Ensure the transaction inputs pass all of the necessary
 		// preconditions before allowing it to be added to the block.
 		_, err = blockchain.CheckTransactionInputs(tx, nextBlockHeight,

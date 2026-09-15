@@ -309,6 +309,12 @@ type GetBlockTemplateResult struct {
 	// Block proposal from BIP 0023.
 	Capabilities []string `json:"capabilities,omitempty"`
 	RejectReason string   `json:"reject-reason,omitempty"`
+
+	// Softfork deployment rules (Bitcoin Core parity).  Sugarchain
+	// activates SegWit at genesis, so this is always ["segwit"].
+	// 软分叉激活规则(与 Bitcoin Core 对齐)。Sugarchain 创世即激活
+	// SegWit,故恒为 ["segwit"]。
+	Rules []string `json:"rules,omitempty"`
 }
 
 // GetMempoolEntryResult models the data returned from the getmempoolentry's

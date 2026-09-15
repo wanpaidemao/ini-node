@@ -1082,10 +1082,27 @@ func (sm *SyncManager) fetchHeaders() {
 	}
 }
 
-// headerLocator returns a single-hash block locator rooted at the passed
-// height so that a getheaders request asks the peer for the headers immediately
-// after it.  A nil locator (request the whole chain) is only returned for a
-// negative height, which never happens during the normal initial block download.
+// headerLocator returns a block locator rooted at the passed height so that a
+// getheaders request asks the peer for the headers immediately after it.
+// A nil locator (request the whole chain) is only returned for a negative
+// height, which never happens during the normal initial block download.
+//
+// The locator is a full exponential-backoff chain (Bitcoin protocol standard),
+// not a single hash.  In the normal case the peer knows the root entry and the
+// response is identical to the single-hash form.  When the root is NOT known
+// to any peer (the local tip sits on a forked chain nobody serves -- observed
+// as the 44396723 front deadlock on 2026-09-14 where every peer answered with
+// a genesis continuation), the peer falls back to the deepest locator entry it
+// shares, so the response's first-header prev resolves INSIDE our index at the
+// fork point instead of at genesis -- fastCutOnDoNotExtend then reads the real
+// fork height out of the response and cuts to it on the first vote.
+// headerLocator 返回以指定高度为根的 block locator。locator 采用标准指数
+// 回退全链形式而非单哈希:正常情况下 peer 认识根条目,响应与单哈希形式
+// 一致;当根不被任何 peer 认识时(本地 tip 位于无人服务的分叉链上——即
+// 2026-09-14 44396723 front 死锁,所有 peer 都以创世续接响应),peer 会
+// 回退到它共享的最深 locator 条目,响应首个 header 的 prev 便落在本地
+// 索引内的分叉点而非创世块——fastCutOnDoNotExtend 从响应读出真实分叉
+// 高度,第一票即一步切到该点。
 //
 // O2: Requests the hash from the request-window cache first; a miss goes to
 // the chain and is filled into the cache.  This eliminates DB cold reads for
@@ -1095,15 +1112,23 @@ func (sm *SyncManager) headerLocator(height int32) blockchain.BlockLocator {
 	if height < 0 {
 		return nil
 	}
+	var hash *chainhash.Hash
 	if cached := sm.reqWindow.get(height); cached != nil {
-		return blockchain.BlockLocator([]*chainhash.Hash{cached})
+		hash = cached
+	} else {
+		h, err := sm.chain.HeaderHashByHeight(height)
+		if err != nil {
+			return nil
+		}
+		sm.reqWindow.put(height, h)
+		hash = h
 	}
-	hash, err := sm.chain.HeaderHashByHeight(height)
-	if err != nil {
-		return nil
-	}
-	sm.reqWindow.put(height, hash)
-	return blockchain.BlockLocator([]*chainhash.Hash{hash})
+	// Full exponential locator rooted at the request height: the first entry
+	// is the same hash the single-hash form sent, so a peer that knows it
+	// responds exactly as before.
+	// 以请求高度为根的指数回退全 locator:首条目与单哈希形式相同,认识该
+	// 块的 peer 响应与之前完全一致。
+	return sm.chain.BlockLocatorFromHash(hash)
 }
 
 // launchHeaderRange records a new per-peer header range and issues the
@@ -1673,31 +1698,17 @@ func (sm *SyncManager) handleStallSample() {
 	// forked.  Roll back immediately instead of waiting for the slow
 	// 10-minute block-side timer (P4), so a pollution cycle costs ~1-2
 	// minutes instead of 20+.
+	// Fast cut for an unreachable header front: the vote check and rollback
+	// live in maybeFastCutFront, which is also invoked in-place from the
+	// header receive paths the moment the second vote lands (all on this
+	// same blockHandler goroutine), so a doomed fork is abandoned within
+	// seconds instead of on the next 30s stall tick.
+	// front 不可达的快速切口:投票检查与回滚都在 maybeFastCutFront 中,它
+	// 同时被 header 接收路径在第二票落地的瞬间就地调用(全部位于本
+	// blockHandler goroutine),注定失败的分叉在数秒内被放弃,而不再等下一个
+	// 30s 的 stall tick。
 	if sm.headerSync != nil {
-		frontStart := sm.headerSync.nextHeight
-		// A peer that returns headers failing the prev-connection test at the
-		// front is a strong signal the local chain has forked below the front
-		// (e.g. a locally-mined block persisted as best-chain tip that no
-		// peer's main chain contains).  Every honest peer's header at
-		// frontStart links to the real main chain, which differs from the
-		// local fork.  Requiring at least two distinct do-not-extend votes
-		// filters the single lagging/forked peer false positive that a lone
-		// divergent peer would otherwise trigger; a sparse network that can
-		// never reach two votes still falls back to the P4 block-side timer,
-		// so the rollback cannot be skipped forever.
-		// 对等点返回的 header 在 front 处未通过 prev 连接校验,是本地链在
-		// front 之下已分叉的强信号(如本地挖出并持久化成 best-chain tip、
-		// 但对等点主链上没有的块)。诚实对等点在 frontStart 的 header 都
-		// 连向真实主链,与本地分叉不同。要求至少两个不同对等点的
-		// do-not-extend 票,过滤单个滞后/分叉对等点造成的误报;始终凑不齐
-		// 两票的稀疏网络仍会回退到 P4 块侧定时器,回滚不可能被永久跳过。
-		if peers := sm.frontUnreachable[frontStart]; len(peers) >= 2 {
-			log.Warnf("Front header range %d unreachable from %d distinct "+
-				"peers -- fabricated/forked header chain, rolling back early",
-				frontStart, len(peers))
-			delete(sm.frontUnreachable, frontStart)
-			sm.rollbackFabricatedHeaderChain()
-		}
+		sm.maybeFastCutFront(sm.headerSync.nextHeight)
 	}
 
 	// Detect a best-chain tip that is not the main-chain block at its own
@@ -3125,6 +3136,13 @@ func (sm *SyncManager) handleParallelHeadersMsg(peer *peerpkg.Peer,
 				sm.frontUnreachable[rng.start] = peers
 			}
 			peers[peer.Addr()] = time.Now()
+			// In-place fast cut: if this was the second distinct vote, roll
+			// back right now instead of waiting for the 30s stall tick --
+			// every stalled minute the miner appends another block to the
+			// doomed fork.
+			// 就地快切:若这已是第二个不同对等点的票,立刻回滚,不再等 30s 的
+			// stall tick——每拖延一分钟,矿工就往注定作废的分叉上多加一块。
+			sm.maybeFastCutFront(rng.start)
 			return
 		}
 		rng.headers = headers
@@ -3172,12 +3190,23 @@ func (sm *SyncManager) handleParallelHeadersMsg(peer *peerpkg.Peer,
 			"range starting at %d (or could not be verified) -- ignoring "+
 			"response", peer.Addr(), rng.start)
 
-		// Record that this peer could not extend the front.  When enough
-		// distinct peers all fail to extend the same front range, the header
-		// chain at that height is almost certainly fabricated or forked; the
-		// stall handler rolls the chain back early instead of waiting for the
-		// slow 10-minute block-side timer (P4).
+		// The response itself is the fork evidence: the peer's first header
+		// links back to a block in our chain, so on the FIRST vote we cut
+		// straight to that fork point -- no pairing, no 5-minute pruning, no
+		// waiting for the 30s stall tick.  Every stalled minute is another
+		// 5s-target block the miner appends to the doomed fork.
+		// 响应本身就是分叉证据:peer 首个 header 回指本地链上的块,因此第一票
+		// 就直接切到该分叉点——不配对、不剪枝、不等 30s stall tick。每拖延
+		// 一分钟,矿工就按 5s 目标往注定作废的分叉上多挖一块。
 		if hs := sm.headerSync; hs != nil && rng.start == hs.nextHeight {
+			if sm.fastCutOnDoNotExtend(headers, prevHeight) {
+				return
+			}
+			// No usable evidence in the response (prev unknown / locator
+			// miss): record the vote and keep the two-vote fallback so a lone
+			// lagging or forked peer cannot trigger a cut.
+			// 响应里没有可用证据(prev 未知 / locator 未命中):记录票,保留
+			// 2 票兜底,单个滞后/分叉对等点无法触发切口。
 			if sm.frontUnreachable == nil {
 				sm.frontUnreachable = make(map[int32]map[string]time.Time)
 			}
@@ -3193,6 +3222,12 @@ func (sm *SyncManager) handleParallelHeadersMsg(peer *peerpkg.Peer,
 					delete(peers, addr)
 				}
 			}
+			// In-place fast cut on the second distinct vote (see
+			// maybeFastCutFront): do not let the miner keep building on the
+			// fork for another stall interval.
+			// 第二个不同对等点的票落地时就地快切(见 maybeFastCutFront):
+			// 不让矿工在分叉上再撑一个 stall 周期。
+			sm.maybeFastCutFront(rng.start)
 		}
 		return
 	}
@@ -3228,12 +3263,18 @@ func (sm *SyncManager) handleParallelHeadersMsg(peer *peerpkg.Peer,
 		h := headers[0].BlockHash()
 		if h != *rng.firstHash {
 			// Second independent peer disagrees with the first: the front is
-			// likely misattributed.  Record the disagreement (C1: enough
-			// distinct disagreeing peers triggers a fast rollback) and keep
-			// the range unconfirmed.
+			// likely misattributed.  The response itself is fork evidence
+			// (see fastCutOnDoNotExtend) -- cut on the first disagreement
+			// instead of waiting for the stall tick.
 			log.Warnf("Front header range at height %d: peer %v disagrees "+
 				"with %v (hash %v vs %v) -- keeping unconfirmed",
 				rng.start, peer.Addr(), rng.firstPeer.Addr(), h, *rng.firstHash)
+			if sm.fastCutOnDoNotExtend(headers, prevHeight) {
+				return
+			}
+			// No usable evidence: record the disagreement (C1: enough distinct
+			// disagreeing peers triggers a fast rollback) and keep the range
+			// unconfirmed.
 			if sm.frontUnreachable == nil {
 				sm.frontUnreachable = make(map[int32]map[string]time.Time)
 			}
@@ -3243,6 +3284,10 @@ func (sm *SyncManager) handleParallelHeadersMsg(peer *peerpkg.Peer,
 				sm.frontUnreachable[rng.start] = peers
 			}
 			peers[peer.Addr()] = time.Now()
+			// In-place fast cut on the second distinct vote (see
+			// maybeFastCutFront).
+			// 第二个不同对等点的票落地时就地快切(见 maybeFastCutFront)。
+			sm.maybeFastCutFront(rng.start)
 			return
 		}
 		rng.headers = headers
@@ -3307,14 +3352,24 @@ func (sm *SyncManager) processReadyHeaderRanges() {
 				log.Warnf("Header range at height %d does not extend the "+
 					"applied chain at %d (or could not be verified) -- "+
 					"discarding and re-issuing", front.start, front.start-1)
-				// Record that this peer could not extend the front, exactly
-				// as handleParallelHeadersMsg does, so a front that keeps
-				// failing here (e.g. the local best chain has diverged from
-				// the peers' real main chain and the applied height maps to
-				// the wrong hash) accumulates enough votes to trigger the
-				// early rollback in handleStallSample.  Without this the
-				// range is discarded and re-issued forever and the header
-				// download deadlocks.
+				// The response itself is the fork evidence (see
+				// fastCutOnDoNotExtend): on the first failure, cut straight to
+				// the fork point the peer's first header links back to, and
+				// return immediately -- the cut reset all download state, so
+				// hs and its ranges are stale and MUST NOT be touched further.
+				// 响应本身就是分叉证据(见 fastCutOnDoNotExtend):第一票失败即
+				// 切到 peer 首个 header 回指的分叉点,并立即返回——切口已重置
+				// 全部下载状态,hs 及其 ranges 已过期,绝不能再碰。
+				if front.start == hs.nextHeight &&
+					sm.fastCutOnDoNotExtend(front.headers, prevHeight) {
+					return
+				}
+				// No usable evidence: record the vote (exactly as
+				// handleParallelHeadersMsg does) so a front that keeps failing
+				// here accumulates enough votes to trigger the early rollback
+				// in handleStallSample.
+				// 无可用证据:记录票(与 handleParallelHeadersMsg 一致),让持续
+				// 失败于此的 front 积累足额票数触发 handleStallSample 的提前回滚。
 				if front.start == hs.nextHeight {
 					if sm.frontUnreachable == nil {
 						sm.frontUnreachable = make(map[int32]map[string]time.Time)
@@ -3330,6 +3385,10 @@ func (sm *SyncManager) processReadyHeaderRanges() {
 							delete(peers, addr)
 						}
 					}
+					// In-place fast cut on the second distinct vote (see
+					// maybeFastCutFront).
+					// 第二个不同对等点的票落地时就地快切(见 maybeFastCutFront)。
+					sm.maybeFastCutFront(front.start)
 				}
 				delete(hs.ranges, front.start)
 				delete(hs.peerRange, front.peer)
@@ -3693,6 +3752,91 @@ func (sm *SyncManager) abortHeaderSync() {
 // froze the block download while headers kept advancing).  The bogus segment
 // is invalidated, all in-flight header/block state is discarded, and the sync
 // restarts from the confirmed height.
+// fastCutOnDoNotExtend cuts the header chain straight to the fork point carried
+// by a single do-not-extend response, with no vote ceremony: the peer's first
+// header links back to a block in our own chain, so the peer shares our chain
+// up to that block and competes above it -- the response itself IS the
+// evidence.  Waiting for a second agreeing vote only let the miner keep
+// appending 5s-target blocks to the doomed fork while the 5-minute vote
+// pruning ate the pairing (observed 2026-09-15: votes at 00:10:26 and
+// 00:16:17 never paired because the first was pruned at 00:15:26).
+//
+// fp <= prevHeight covers both the deep-fork case (fp < prevHeight) and the
+// same-height competing-block case (fp == prevHeight: our locally-mined block
+// at start vs the network's -- the peer's prev IS our start-1, so cutting
+// back to prevHeight lets the peer's chain connect exactly).  The previous
+// fp < prevHeight guard wrongly excluded the latter, the most common
+// competition shape after a mining resumption.
+//
+// fp == 0 (the peer knows no locator entry and answers from genesis) and a
+// prev that is not in our index are NOT usable evidence: those keep the
+// two-vote stall fallback so a lone lagging/forked peer cannot trigger a cut.
+// Returns true when a cut was actually performed.
+// fastCutOnDoNotExtend 用单个 do-not-extend 响应里携带的分叉点一步切链,无投票
+// 仪式:peer 首个 header 回指本地链上的块,说明 peer 与该块之前共享同一条链、
+// 之上才是竞争段——响应本身就是证据。等第二个一致票只会让矿工继续往注定
+// 作废的分叉上加 5s 目标块,而 5 分钟剪枝会吃掉配对(实测 2026-09-15:
+// 00:10:26 与 00:16:17 两票因 00:15:26 剪掉第一票而永远配不上)。
+//
+// fp <= prevHeight 同时覆盖深分叉(fp < prevHeight)与同高度竞争
+// (fp == prevHeight:本地在 start 挖出竞争块、peer 的 prev 就是我们的
+// start-1,切回 prevHeight 后 peer 的链恰好接上)。旧守卫 fp < prevHeight
+// 错误排除了后者——挖矿恢复后最常见的竞争形态。
+//
+// fp == 0(peer 不认识 locator 任何条目、按协议从创世续接)与 prev 不在本地
+// 索引都不是可用证据:它们保留 2 票 stall 兜底,单个滞后/分叉对等点无法触发
+// 切口。返回是否实际执行了切口。
+func (sm *SyncManager) fastCutOnDoNotExtend(headers []*wire.BlockHeader,
+	prevHeight int32) bool {
+
+	if len(headers) == 0 {
+		return false
+	}
+	fp, err := sm.chain.HeaderHeightByHash(headers[0].PrevBlock)
+	if err != nil || fp <= 0 || fp > prevHeight {
+		// Prev unknown to us, the genesis-miss fp=0 case, or an impossible
+		// above-front height: not usable evidence, keep the two-vote fallback.
+		// prev 不在本地索引、fp=0 的 locator 未命中,或不可能的越界高度:
+		// 非可用证据,保留 2 票兜底。
+		return false
+	}
+	log.Warnf("Do-not-extend response carries fork point at height %d "+
+		"(front prev height %d) -- cutting directly to fork point",
+		fp, prevHeight)
+	if err := sm.rollbackToForkPoint(fp); err != nil {
+		// The rollback point is not connected (rare: the fork height has no
+		// connected block yet).  Fall back to the two-vote path instead of
+		// silently returning as if the cut happened.
+		// 切点未连接(罕见:分叉高度还没有已连接块)。退回 2 票路径,而不是
+		// 假装切链已发生。
+		return false
+	}
+	return true
+}
+
+// maybeFastCutFront checks the do-not-extend vote count for the front range
+// starting at frontStart and, when two distinct peers have both failed to
+// extend it, cuts the header chain back one block (the two-vote fallback for
+// responses that carried no usable fork evidence).  It returns true when a cut
+// was performed.  Called in-place from the header receive paths (all on the
+// blockHandler goroutine) as soon as the second vote lands.
+// maybeFastCutFront 检查 front 起始高度的 do-not-extend 票数,两个不同对等点
+// 均未续接时单块回滚(对未携带可用分叉证据响应的 2 票兜底)。返回是否执行了
+// 切口。由 header 接收路径在第二票落地时就地调用(均在 blockHandler
+// goroutine)。
+func (sm *SyncManager) maybeFastCutFront(frontStart int32) bool {
+	peers := sm.frontUnreachable[frontStart]
+	if len(peers) < 2 {
+		return false
+	}
+	log.Warnf("Front header range %d unreachable from %d distinct "+
+		"peers -- fabricated/forked header chain, rolling back early",
+		frontStart, len(peers))
+	delete(sm.frontUnreachable, frontStart)
+	sm.rollbackFabricatedHeaderChain()
+	return true
+}
+
 func (sm *SyncManager) rollbackFabricatedHeaderChain() {
 	// D fix: when no peer advertises a height above the local header tip,
 	// a stalled block download is NOT a forged/forked chain -- it is the
@@ -3840,16 +3984,19 @@ func (sm *SyncManager) resetDownloadState() {
 // diverge from the (network-projected) header chain at forkHeight, so there is
 // no need to deepen the cut one block at a time through repeated stall timeouts.
 // It reuses InvalidateHeaderChain + the shared download-state reset, but jumps
-// straight to the fork instead of walking down from the tip.
-func (sm *SyncManager) rollbackToForkPoint(forkHeight int32) {
+// straight to the fork instead of walking down from the tip.  It returns an
+// error when the rollback point is not a connected block (callers fall back to
+// the generic rollback / two-vote path in that case).
+func (sm *SyncManager) rollbackToForkPoint(forkHeight int32) error {
 	if err := sm.chain.InvalidateHeaderChain(forkHeight); err != nil {
 		log.Errorf("Failed to roll back header chain to fork height %d: %v",
 			forkHeight, err)
-		return
+		return err
 	}
 	log.Warnf("Rolled back header chain to fork point %d -- "+
 		"restarting header/block download", forkHeight)
 	sm.resetDownloadState()
+	return nil
 }
 
 // reissueStaleHeaderRanges reassigns any in-flight header range that has not
